@@ -24,6 +24,25 @@ fn check(ret: c_int) -> PrimResult<()> {
     }
 }
 
+/// Read up to `buf.len()` bytes from a small file; returns bytes read (0 on any
+/// error). Used for sysfs queries; avoids `std` so it works in `no_std` too.
+fn read_small_file(path: &core::ffi::CStr, buf: &mut [u8]) -> usize {
+    // SAFETY: `path` is a valid C string; standard open/read/close sequence.
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
+        if fd < 0 {
+            return 0;
+        }
+        let n = libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+        libc::close(fd);
+        if n > 0 {
+            n as usize
+        } else {
+            0
+        }
+    }
+}
+
 impl Prim for Sys {
     fn mem_config() -> OsMemConfig {
         // SAFETY: `sysconf` is always safe to call with these queries.
@@ -75,12 +94,69 @@ impl Prim for Sys {
         if p == libc::MAP_FAILED {
             return Err(PrimError(errno()));
         }
-        // Large/huge OS pages (MAP_HUGETLB) are deferred to a later milestone.
+        // Encourage transparent huge pages for large, committed mappings (cuts
+        // TLB pressure for arenas). Best-effort: ignore failure.
+        if commit && size >= 2 * 1024 * 1024 {
+            // SAFETY: `p`/`size` is the mapping we just created.
+            unsafe {
+                let _ = libc::madvise(p, size, libc::MADV_HUGEPAGE);
+            }
+        }
+        // Explicit large OS pages (MAP_HUGETLB) remain follow-up work.
         Ok(PrimAlloc {
             addr: p as *mut u8,
             is_large: false,
             is_zero: true,
         })
+    }
+
+    fn numa_node() -> usize {
+        // `getcpu(2)` fills the NUMA node of the calling thread.
+        let mut cpu: u32 = 0;
+        let mut node: u32 = 0;
+        // SAFETY: both out-pointers are valid; third arg is unused (null).
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_getcpu,
+                &mut cpu as *mut u32,
+                &mut node as *mut u32,
+                core::ptr::null_mut::<c_void>(),
+            )
+        };
+        if r == 0 {
+            node as usize
+        } else {
+            0
+        }
+    }
+
+    fn numa_node_count() -> usize {
+        // Parse the highest node id from `/sys/devices/system/node/online`
+        // (e.g. "0-3" ⇒ 4). Best-effort; default 1 on any failure.
+        let mut buf = [0u8; 64];
+        let n = read_small_file(c"/sys/devices/system/node/online", &mut buf);
+        if n == 0 {
+            return 1;
+        }
+        let mut max_node = 0usize;
+        let mut cur = 0usize;
+        let mut have = false;
+        for &c in &buf[..n] {
+            if c.is_ascii_digit() {
+                cur = cur * 10 + (c - b'0') as usize;
+                have = true;
+            } else {
+                if have && cur > max_node {
+                    max_node = cur;
+                }
+                cur = 0;
+                have = false;
+            }
+        }
+        if have && cur > max_node {
+            max_node = cur;
+        }
+        max_node + 1
     }
 
     unsafe fn free(addr: *mut u8, size: usize) -> PrimResult<()> {
@@ -217,5 +293,20 @@ impl Prim for Sys {
         unsafe {
             let _ = libc::write(2, msg.as_ptr() as *const c_void, msg.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sys;
+    use crate::prim::Prim;
+
+    #[test]
+    fn numa_queries_are_sane() {
+        let count = Sys::numa_node_count();
+        assert!(count >= 1, "at least one NUMA node");
+        // numa_node() must not panic and returns a plausible id.
+        let node = Sys::numa_node();
+        assert!(node < 4096, "node id {node} implausible");
     }
 }
