@@ -17,11 +17,15 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=mimalloc");
             // Embed an rpath so the .so is found at run time without LD_LIBRARY_PATH.
             println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+            // Signal that the C library is actually linked, so the differential
+            // test compiles its `extern "C" mi_*` block (which would otherwise
+            // silently resolve to our own `capi` exports — a false oracle).
+            println!("cargo:rustc-cfg=have_c_mimalloc");
         }
         _ => {
             println!(
                 "cargo:warning=feature `differential` is on but MIMALLOC_C_LIB is unset; \
-                 set it to a directory containing libmimalloc.so to link the C library"
+                 the differential test is skipped (set it to a directory containing libmimalloc.so)"
             );
         }
     }

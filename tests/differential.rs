@@ -15,7 +15,12 @@
 //! agree on version and usable-size behavior. We drive our allocator through
 //! its **Rust** API (`mimalloc_rs::*`) so the C `mi_*` symbols don't clash with
 //! our optional `capi` exports.
-#![cfg(feature = "differential")]
+//!
+//! Gated on `have_c_mimalloc` (set by `build.rs` only when `MIMALLOC_C_LIB` is
+//! provided): without a real C library the `extern "C" mi_*` block would
+//! resolve to our own `capi` exports and silently test the allocator against
+//! itself, so the test compiles to nothing unless the C library is linked.
+#![cfg(all(feature = "differential", have_c_mimalloc))]
 
 use std::ptr::NonNull;
 
