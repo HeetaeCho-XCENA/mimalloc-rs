@@ -14,11 +14,13 @@
 //! Build a C-linkable library with, e.g.:
 //! `cargo rustc --release --features capi --crate-type cdylib`.
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_long, c_void};
 use core::ptr::NonNull;
 
-use crate::heap;
+use crate::heap::{self, Heap};
 use crate::init;
+use crate::options::{self, Opt};
+use crate::stats;
 
 #[inline]
 fn out(p: Option<NonNull<u8>>) -> *mut c_void {
@@ -433,6 +435,229 @@ pub extern "C" fn mi_good_size(size: usize) -> usize {
     heap::good_size(size)
 }
 
+// ---------------------------------------------------------------------------
+// First-class heaps (`mi_heap_t*` == `*mut Heap`)
+// ---------------------------------------------------------------------------
+
+/// `mi_heap_new`: create a first-class heap (null on OOM).
+#[no_mangle]
+pub extern "C" fn mi_heap_new() -> *mut Heap {
+    Heap::new_boxed(init::process_keys(), init::current_tid())
+        .map_or(core::ptr::null_mut(), |h| h.as_ptr())
+}
+
+/// `mi_heap_delete`: free the heap; outstanding blocks stay valid (abandoned).
+///
+/// # Safety
+/// `heap` is a live heap from [`mi_heap_new`], not used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_delete(heap: *mut Heap) {
+    if let Some(h) = NonNull::new(heap) {
+        // SAFETY: live heap per contract.
+        unsafe { Heap::delete(h) }
+    }
+}
+
+/// `mi_heap_destroy`: free the heap and **all** its blocks at once.
+///
+/// # Safety
+/// `heap` is live; no block of it may be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_destroy(heap: *mut Heap) {
+    if let Some(h) = NonNull::new(heap) {
+        // SAFETY: live heap; caller guarantees no outstanding use.
+        unsafe { Heap::destroy(h) }
+    }
+}
+
+/// `mi_heap_malloc`.
+///
+/// # Safety
+/// `heap` is a live heap from [`mi_heap_new`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_malloc(heap: *mut Heap, size: usize) -> *mut c_void {
+    match NonNull::new(heap) {
+        None => core::ptr::null_mut(),
+        // SAFETY: live heap per contract.
+        Some(h) => out(unsafe { h.as_ref() }.alloc(size)),
+    }
+}
+
+/// `mi_heap_zalloc`.
+///
+/// # Safety
+/// As [`mi_heap_malloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_zalloc(heap: *mut Heap, size: usize) -> *mut c_void {
+    // SAFETY: forwarded contract.
+    let p = unsafe { mi_heap_malloc(heap, size) };
+    if !p.is_null() {
+        // SAFETY: valid for `size` bytes.
+        unsafe { core::ptr::write_bytes(p as *mut u8, 0, size) };
+    }
+    p
+}
+
+/// `mi_heap_calloc` (overflow ⇒ null).
+///
+/// # Safety
+/// As [`mi_heap_malloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_calloc(heap: *mut Heap, count: usize, size: usize) -> *mut c_void {
+    match checked_total(count, size) {
+        // SAFETY: forwarded contract.
+        Some(total) => unsafe { mi_heap_zalloc(heap, total) },
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `mi_heap_malloc_aligned`.
+///
+/// # Safety
+/// As [`mi_heap_malloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_malloc_aligned(
+    heap: *mut Heap,
+    size: usize,
+    alignment: usize,
+) -> *mut c_void {
+    match NonNull::new(heap) {
+        None => core::ptr::null_mut(),
+        // SAFETY: live heap per contract.
+        Some(h) => out(unsafe { h.as_ref() }.alloc_aligned(size, alignment.max(1))),
+    }
+}
+
+/// `mi_heap_realloc`.
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_realloc(
+    heap: *mut Heap,
+    p: *mut c_void,
+    newsize: usize,
+) -> *mut c_void {
+    let Some(nn) = NonNull::new(p as *mut u8) else {
+        // SAFETY: forwarded contract.
+        return unsafe { mi_heap_malloc(heap, newsize) };
+    };
+    // SAFETY: live allocation.
+    let old = unsafe { heap::usable_size(nn) };
+    if newsize <= old {
+        return p;
+    }
+    // SAFETY: forwarded contract.
+    let np = unsafe { mi_heap_malloc(heap, newsize) };
+    if !np.is_null() {
+        // SAFETY: valid disjoint regions of `min(old, newsize)` bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(p as *const u8, np as *mut u8, old.min(newsize));
+            init::free(nn);
+        }
+    }
+    np
+}
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+// `c_int` is `i32` and (on the supported Linux target) `c_long` is `i64`, so
+// the option index/value pass through without casts.
+
+/// `mi_option_get`: current value of option `option` (0 for unknown).
+#[no_mangle]
+pub extern "C" fn mi_option_get(option: c_int) -> c_long {
+    Opt::from_index(option).map_or(0, options::get)
+}
+
+/// `mi_option_set`.
+#[no_mangle]
+pub extern "C" fn mi_option_set(option: c_int, value: c_long) {
+    if let Some(o) = Opt::from_index(option) {
+        options::set(o, value);
+    }
+}
+
+/// `mi_option_is_enabled` (non-zero).
+#[no_mangle]
+pub extern "C" fn mi_option_is_enabled(option: c_int) -> c_int {
+    Opt::from_index(option).is_some_and(options::is_enabled) as c_int
+}
+
+/// `mi_option_enable`.
+#[no_mangle]
+pub extern "C" fn mi_option_enable(option: c_int) {
+    if let Some(o) = Opt::from_index(option) {
+        options::enable(o);
+    }
+}
+
+/// `mi_option_disable`.
+#[no_mangle]
+pub extern "C" fn mi_option_disable(option: c_int) {
+    if let Some(o) = Opt::from_index(option) {
+        options::disable(o);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Statistics
+// ---------------------------------------------------------------------------
+
+/// `mi_stats_reset`.
+#[no_mangle]
+pub extern "C" fn mi_stats_reset() {
+    stats::reset();
+}
+
+/// `mi_stats_merge`: single global stats — nothing to merge.
+#[no_mangle]
+pub extern "C" fn mi_stats_merge() {}
+
+/// `mi_stats_print`: print process statistics to stderr (the `out` sink is
+/// ignored — custom output sinks are follow-up work).
+///
+/// # Safety
+/// Trivially safe; `_out` is ignored.
+#[no_mangle]
+pub unsafe extern "C" fn mi_stats_print(_out: *mut c_void) {
+    let s = stats::snapshot();
+    // Build a small message without heap allocation.
+    let mut buf = [0u8; 256];
+    let msg = format_stats(&s, &mut buf);
+    <crate::prim::DefaultPrim as crate::prim::Prim>::out_stderr(msg);
+}
+
+/// Format a stats line into `buf`, returning the written `&str` (no allocation).
+fn format_stats<'a>(s: &stats::Stats, buf: &'a mut [u8]) -> &'a str {
+    let mut w = Writer { buf, pos: 0 };
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        w,
+        "mimalloc-rs stats: allocs={} frees={} live={}B peak={}B pages={}",
+        s.allocations, s.frees, s.current_bytes, s.peak_bytes, s.pages_created
+    );
+    let pos = w.pos;
+    // SAFETY: only ASCII written by `write!` above.
+    core::str::from_utf8(&w.buf[..pos]).unwrap_or("mimalloc-rs stats\n")
+}
+
+struct Writer<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+impl core::fmt::Write for Writer<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        let n = b.len().min(self.buf.len() - self.pos);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&b[..n]);
+        self.pos += n;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +729,53 @@ mod tests {
         }
         assert_eq!(mi_version(), 30302);
         assert!(mi_good_size(1) >= 1);
+    }
+
+    #[test]
+    fn c_api_first_class_heap() {
+        // SAFETY: standard mi_heap_* usage on one thread.
+        unsafe {
+            let h = mi_heap_new();
+            assert!(!h.is_null());
+            let mut ptrs = std::vec::Vec::new();
+            for i in 0..500 {
+                let p = mi_heap_malloc(h, 64);
+                assert!(!p.is_null());
+                core::ptr::write_bytes(p as *mut u8, (i & 0xff) as u8, 64);
+                ptrs.push(p);
+            }
+            let z = mi_heap_zalloc(h, 128);
+            assert_eq!(*(z as *const u8), 0);
+            let a = mi_heap_malloc_aligned(h, 40, 64);
+            assert_eq!(a.addr() % 64, 0);
+            // destroy frees ALL blocks of the heap at once (no per-block free)
+            mi_heap_destroy(h);
+
+            // a second heap, deleted (blocks would stay valid if outstanding)
+            let h2 = mi_heap_new();
+            let q = mi_heap_malloc(h2, 32);
+            mi_free(q); // free before delete so nothing is abandoned
+            mi_heap_delete(h2);
+        }
+    }
+
+    #[test]
+    fn c_api_options() {
+        let opt = Opt::PurgeDelay as c_int;
+        let prev = mi_option_get(opt);
+        mi_option_set(opt, 1234);
+        assert_eq!(mi_option_get(opt), 1234);
+        mi_option_set(opt, prev);
+
+        let v = Opt::Verbose as c_int;
+        mi_option_disable(v);
+        assert_eq!(mi_option_is_enabled(v), 0);
+        mi_option_enable(v);
+        assert_eq!(mi_option_is_enabled(v), 1);
+        mi_option_disable(v);
+
+        mi_stats_reset();
+        // SAFETY: out sink ignored.
+        unsafe { mi_stats_print(core::ptr::null_mut()) };
     }
 }
