@@ -790,6 +790,28 @@ pub unsafe extern "C" fn mi_heap_realloc(
 }
 
 // ---------------------------------------------------------------------------
+// Collection
+// ---------------------------------------------------------------------------
+
+/// `mi_collect`: reclaim memory in the default heap; `force!=0` is aggressive.
+#[no_mangle]
+pub extern "C" fn mi_collect(force: bool) {
+    init::collect(force);
+}
+
+/// `mi_heap_collect`: reclaim memory in `heap`.
+///
+/// # Safety
+/// `heap` is a live heap from [`mi_heap_new`], used only from its owning thread.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_collect(heap: *mut Heap, force: bool) {
+    if let Some(h) = NonNull::new(heap) {
+        // SAFETY: live owner-thread heap per contract.
+        unsafe { h.as_ref() }.collect(force);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
 
@@ -992,6 +1014,43 @@ mod tests {
             let q = mi_heap_malloc(h2, 32);
             mi_free(q); // free before delete so nothing is abandoned
             mi_heap_delete(h2);
+        }
+    }
+
+    #[test]
+    fn c_api_collect() {
+        // SAFETY: standard C-style usage on one thread.
+        unsafe {
+            // Default-heap collect: alloc, free, then reclaim.
+            let mut ps = std::vec::Vec::new();
+            for _ in 0..500 {
+                ps.push(mi_malloc(64));
+            }
+            for p in ps.drain(..) {
+                mi_free(p);
+            }
+            mi_collect(true);
+
+            // First-class heap collect.
+            let h = mi_heap_new();
+            assert!(!h.is_null());
+            let mut hp = std::vec::Vec::new();
+            for _ in 0..500 {
+                hp.push(mi_heap_malloc(h, 48));
+            }
+            for p in hp.drain(..) {
+                mi_free(p);
+            }
+            mi_heap_collect(h, false);
+            mi_heap_delete(h);
+
+            // null heap is a no-op.
+            mi_heap_collect(core::ptr::null_mut(), true);
+
+            // Allocator still usable after collection.
+            let q = mi_malloc(100);
+            assert!(!q.is_null());
+            mi_free(q);
         }
     }
 

@@ -93,10 +93,16 @@ mod tls {
         }
         Some(p)
     }
+
+    /// Reclaim memory in the calling thread's default heap (`force` is more
+    /// aggressive — see [`crate::heap::Heap::collect`]).
+    pub fn collect(force: bool) {
+        DEFAULT_HEAP.with(|h| h.collect(force));
+    }
 }
 
 #[cfg(feature = "std")]
-pub use tls::{malloc, malloc_aligned, zalloc};
+pub use tls::{collect, malloc, malloc_aligned, zalloc};
 
 /// Grow/shrink an allocation, preserving its contents.
 ///
