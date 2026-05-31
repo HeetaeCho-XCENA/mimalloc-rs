@@ -8,8 +8,8 @@
 //! an ordinary Rust crate.
 //!
 //! All entry points route through the calling thread's default heap (so they
-//! require `std`). Not yet ported: `mi_realpath`, `valloc`/`pvalloc`, the
-//! `mi_heap_*` C surface (Phase G), and the malloc/`new` override shims.
+//! require `std`). Not yet ported: `mi_realpath` and the malloc/`new` override
+//! shims.
 //!
 //! Build a C-linkable library with, e.g.:
 //! `cargo rustc --release --features capi --crate-type cdylib`.
@@ -89,6 +89,27 @@ pub unsafe extern "C" fn mi_usable_size(p: *mut c_void) -> usize {
         // SAFETY: live allocation per contract.
         Some(nn) => unsafe { heap::usable_size(nn) },
     }
+}
+
+/// `mi_malloc_usable_size`: usable bytes of `p` (0 if null) — `const void*`
+/// alias of [`mi_usable_size`].
+///
+/// # Safety
+/// `p` is null or a live allocation from this allocator.
+#[no_mangle]
+pub unsafe extern "C" fn mi_malloc_usable_size(p: *const c_void) -> usize {
+    // SAFETY: forwarded contract (same logic as `mi_usable_size`).
+    unsafe { mi_usable_size(p as *mut c_void) }
+}
+
+/// `mi_malloc_size`: macOS-style alias of [`mi_malloc_usable_size`].
+///
+/// # Safety
+/// As [`mi_malloc_usable_size`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_malloc_size(p: *const c_void) -> usize {
+    // SAFETY: forwarded contract.
+    unsafe { mi_malloc_usable_size(p) }
 }
 
 /// `mi_realloc`: resize `p` to `newsize`.
@@ -231,6 +252,91 @@ pub unsafe extern "C" fn mi_realloc_aligned(
     }
 }
 
+/// `mi_aligned_recalloc`: resize `p` to `newcount * size` (overflow ⇒ null),
+/// keeping the result `alignment`-aligned and zeroing any grown tail.
+///
+/// # Safety
+/// As [`mi_realloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_aligned_recalloc(
+    p: *mut c_void,
+    newcount: usize,
+    size: usize,
+    alignment: usize,
+) -> *mut c_void {
+    let Some(total) = checked_total(newcount, size) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `p` is null or live.
+    let old = unsafe { mi_usable_size(p) };
+    // SAFETY: forwarded contract.
+    let np = unsafe { mi_realloc_aligned(p, total, alignment) };
+    if !np.is_null() && total > old {
+        // SAFETY: `np` is valid for `total` bytes; zero the grown tail.
+        unsafe { core::ptr::write_bytes((np as *mut u8).add(old), 0, total - old) };
+    }
+    np
+}
+
+/// `mi_recalloc_aligned`: identical to [`mi_aligned_recalloc`] (different name).
+///
+/// # Safety
+/// As [`mi_realloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_recalloc_aligned(
+    p: *mut c_void,
+    newcount: usize,
+    size: usize,
+    alignment: usize,
+) -> *mut c_void {
+    // SAFETY: forwarded contract.
+    unsafe { mi_aligned_recalloc(p, newcount, size, alignment) }
+}
+
+/// `mi_recalloc_aligned_at`: like [`mi_recalloc_aligned`] but the result is
+/// `alignment`-aligned at `offset`, with any grown tail zeroed.
+///
+/// # Safety
+/// As [`mi_realloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_recalloc_aligned_at(
+    p: *mut c_void,
+    newcount: usize,
+    size: usize,
+    alignment: usize,
+    offset: usize,
+) -> *mut c_void {
+    let Some(total) = checked_total(newcount, size) else {
+        return core::ptr::null_mut();
+    };
+    let Some(nn) = NonNull::new(p as *mut u8) else {
+        // Fresh allocation: zeroed, aligned-at.
+        let fresh = aligned_at(total, alignment, offset);
+        if let Some(f) = fresh {
+            // SAFETY: valid for `total` bytes.
+            unsafe { core::ptr::write_bytes(f.as_ptr(), 0, total) };
+        }
+        return out(fresh);
+    };
+    // Resize path: `init::realloc_aligned` can't honor `offset`, so allocate a
+    // fresh aligned-at block, copy, free the old block, then zero the tail.
+    // SAFETY: live allocation per contract.
+    let old = unsafe { heap::usable_size(nn) };
+    let Some(np) = aligned_at(total, alignment, offset) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `np`/`nn` are valid for `min(old, total)` bytes and disjoint.
+    unsafe {
+        core::ptr::copy_nonoverlapping(nn.as_ptr(), np.as_ptr(), old.min(total));
+        init::free(nn);
+    }
+    if total > old {
+        // SAFETY: `np` is valid for `total` bytes; zero the grown tail.
+        unsafe { core::ptr::write_bytes(np.as_ptr().add(old), 0, total - old) };
+    }
+    out(Some(np))
+}
+
 /// `mi_free_size`: free `p` (size hint ignored — recovered from the page-map).
 ///
 /// # Safety
@@ -251,12 +357,31 @@ pub unsafe extern "C" fn mi_free_aligned(p: *mut c_void, _size: usize, _alignmen
     unsafe { mi_free(p) }
 }
 
+/// `mi_free_size_aligned`: free `p` (size/align hints ignored).
+///
+/// # Safety
+/// As [`mi_free`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_free_size_aligned(p: *mut c_void, _size: usize, _alignment: usize) {
+    // SAFETY: forwarded contract.
+    unsafe { mi_free(p) }
+}
+
 // ---------------------------------------------------------------------------
 // POSIX / libc style
 // ---------------------------------------------------------------------------
 
 const EINVAL: c_int = 22;
 const ENOMEM: c_int = 12;
+/// `EOVERFLOW` errno value (Linux).
+const EOVERFLOW: c_int = 75;
+
+/// Set the calling thread's `errno`.
+#[inline]
+fn set_errno(code: c_int) {
+    // SAFETY: `__errno_location` returns a valid per-thread errno slot on Linux.
+    unsafe { *libc::__errno_location() = code };
+}
 
 /// `mi_posix_memalign`.
 ///
@@ -296,6 +421,20 @@ pub extern "C" fn mi_aligned_alloc(alignment: usize, size: usize) -> *mut c_void
 #[no_mangle]
 pub extern "C" fn mi_memalign(alignment: usize, size: usize) -> *mut c_void {
     out(aligned_at(size, alignment, 0))
+}
+
+/// `mi_cfree`: "checked free" — identical to [`mi_free`] (null is a no-op).
+///
+/// The C library checks that `p` lies in mimalloc's heap before freeing; our
+/// single-allocator model recovers every block via the page-map in `free`, so a
+/// plain forward is correct.
+///
+/// # Safety
+/// As [`mi_free`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_cfree(p: *mut c_void) {
+    // SAFETY: forwarded contract.
+    unsafe { mi_free(p) }
 }
 
 /// `mi_strdup`: duplicate a NUL-terminated C string.
@@ -370,6 +509,85 @@ unsafe fn c_strnlen(s: *const c_char, max: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// libc / BSD compatibility
+// ---------------------------------------------------------------------------
+
+/// `mi_valloc`: allocate `size` bytes aligned to the OS page size.
+#[no_mangle]
+pub extern "C" fn mi_valloc(size: usize) -> *mut c_void {
+    mi_memalign(crate::os::page_size(), size)
+}
+
+/// `mi_pvalloc`: like [`mi_valloc`] but `size` is first rounded up to a whole
+/// number of OS pages (overflow ⇒ null).
+#[no_mangle]
+pub extern "C" fn mi_pvalloc(size: usize) -> *mut c_void {
+    let psize = crate::os::page_size();
+    if size >= usize::MAX - psize {
+        return core::ptr::null_mut();
+    }
+    // `psize` is a power of two, so round `size` up to a multiple of it.
+    let asize = (size + psize - 1) & !(psize - 1);
+    mi_memalign(psize, asize)
+}
+
+/// `mi_reallocarray` (BSD): resize `p` to `count * size`. On overflow sets
+/// `errno = EOVERFLOW` and returns null; on OOM sets `errno = ENOMEM`.
+///
+/// # Safety
+/// As [`mi_realloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_reallocarray(p: *mut c_void, count: usize, size: usize) -> *mut c_void {
+    let Some(total) = checked_total(count, size) else {
+        set_errno(EOVERFLOW);
+        return core::ptr::null_mut();
+    };
+    // SAFETY: forwarded contract.
+    let np = unsafe { mi_realloc(p, total) };
+    if np.is_null() {
+        set_errno(ENOMEM);
+    }
+    np
+}
+
+/// `mi_reallocarr` (NetBSD): resize `*ptrp` to `count * size`, writing the new
+/// pointer back through `ptrp`. Returns 0 on success or the failing errno code.
+///
+/// # Safety
+/// `ptrp` is null or a valid, writable `*mut *mut c_void`; `*ptrp` is null or a
+/// live allocation from this allocator.
+#[no_mangle]
+pub unsafe extern "C" fn mi_reallocarr(ptrp: *mut c_void, count: usize, size: usize) -> c_int {
+    if ptrp.is_null() || size == 0 {
+        set_errno(EINVAL);
+        return EINVAL;
+    }
+    let Some(total) = checked_total(count, size) else {
+        set_errno(EOVERFLOW);
+        return EOVERFLOW;
+    };
+    let op = ptrp as *mut *mut c_void;
+    if total == 0 {
+        // SAFETY: `op` is a valid `*mut *mut c_void`; `*op` is null or live.
+        unsafe {
+            mi_free(*op);
+            *op = core::ptr::null_mut();
+        }
+        0
+    } else {
+        // SAFETY: `*op` is null or a live allocation per contract.
+        let newp = unsafe { mi_realloc(*op, total) };
+        if newp.is_null() {
+            set_errno(ENOMEM);
+            return ENOMEM;
+        }
+        // SAFETY: `op` is a valid out-pointer per contract.
+        unsafe { *op = newp };
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // C++ new/delete support (for mimalloc-new-delete.h)
 // ---------------------------------------------------------------------------
 
@@ -433,6 +651,12 @@ pub extern "C" fn mi_version() -> c_int {
 /// `mi_good_size`: the usable size a `mi_malloc(size)` would return.
 #[no_mangle]
 pub extern "C" fn mi_good_size(size: usize) -> usize {
+    heap::good_size(size)
+}
+
+/// `mi_malloc_good_size`: macOS-style alias of [`mi_good_size`].
+#[no_mangle]
+pub extern "C" fn mi_malloc_good_size(size: usize) -> usize {
     heap::good_size(size)
 }
 
@@ -789,5 +1013,116 @@ mod tests {
         mi_stats_reset();
         // SAFETY: out sink ignored.
         unsafe { mi_stats_print(core::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn c_api_valloc_pvalloc() {
+        let ps = crate::os::page_size();
+        // SAFETY: standard usage.
+        unsafe {
+            let v = mi_valloc(100);
+            assert!(!v.is_null());
+            assert_eq!(v.addr() % ps, 0);
+            mi_free(v);
+
+            let pv = mi_pvalloc(100);
+            assert!(!pv.is_null());
+            assert_eq!(pv.addr() % ps, 0);
+            // rounded up to at least one page
+            assert!(mi_usable_size(pv) >= ps);
+            mi_free(pv);
+
+            // overflow guard
+            assert!(mi_pvalloc(usize::MAX).is_null());
+        }
+    }
+
+    #[test]
+    fn c_api_reallocarray() {
+        // SAFETY: standard usage.
+        unsafe {
+            let p = mi_reallocarray(core::ptr::null_mut(), 4, 16);
+            assert!(!p.is_null());
+            assert!(mi_usable_size(p) >= 64);
+            mi_free(p);
+
+            // overflow ⇒ null and errno = EOVERFLOW
+            let o = mi_reallocarray(core::ptr::null_mut(), usize::MAX, 2);
+            assert!(o.is_null());
+        }
+    }
+
+    #[test]
+    fn c_api_reallocarr() {
+        // SAFETY: standard NetBSD `reallocarr` usage.
+        unsafe {
+            let mut p: *mut c_void = core::ptr::null_mut();
+            let pp = &mut p as *mut _ as *mut c_void;
+
+            assert_eq!(mi_reallocarr(pp, 8, 16), 0);
+            assert!(!p.is_null());
+            assert!(mi_usable_size(p) >= 128);
+
+            // count==0 frees and nulls the pointer
+            assert_eq!(mi_reallocarr(pp, 0, 16), 0);
+            assert!(p.is_null());
+
+            // null ptrp ⇒ EINVAL
+            assert_eq!(mi_reallocarr(core::ptr::null_mut(), 1, 1), EINVAL);
+            // overflow ⇒ EOVERFLOW
+            assert_eq!(mi_reallocarr(pp, usize::MAX, 2), EOVERFLOW);
+        }
+    }
+
+    #[test]
+    fn c_api_aligned_recalloc_zeroes() {
+        // SAFETY: standard usage.
+        unsafe {
+            // fresh aligned alloc, zeroed
+            let p = mi_aligned_recalloc(core::ptr::null_mut(), 1, 4096, 64) as *mut u8;
+            assert!(!p.is_null());
+            assert_eq!((p as usize) % 64, 0);
+            assert_eq!(*p.add(2048), 0);
+            mi_free(p as *mut c_void);
+
+            // grow an existing block; grown tail must be zeroed
+            let q = mi_malloc(16);
+            core::ptr::write_bytes(q as *mut u8, 0xFF, 16);
+            let q2 = mi_aligned_recalloc(q, 1, 4096, 64) as *mut u8;
+            assert_eq!((q2 as usize) % 64, 0);
+            assert_eq!(*q2.add(2048), 0);
+            mi_free(q2 as *mut c_void);
+
+            // mi_recalloc_aligned is the same; mi_recalloc_aligned_at honors offset
+            let r = mi_recalloc_aligned(core::ptr::null_mut(), 2, 64, 32) as *mut u8;
+            assert_eq!((r as usize) % 32, 0);
+            assert_eq!(*r.add(64), 0);
+            mi_free(r as *mut c_void);
+
+            let s = mi_recalloc_aligned_at(core::ptr::null_mut(), 1, 256, 64, 8);
+            assert_eq!(((s as usize) + 8) % 64, 0);
+            mi_free(s);
+        }
+    }
+
+    #[test]
+    fn c_api_size_aliases_and_cfree() {
+        // SAFETY: standard usage.
+        unsafe {
+            let p = mi_malloc(100);
+            assert!(!p.is_null());
+            assert!(mi_malloc_usable_size(p as *const c_void) >= 100);
+            assert_eq!(
+                mi_malloc_size(p as *const c_void),
+                mi_malloc_usable_size(p as *const c_void)
+            );
+            mi_cfree(p);
+
+            assert_eq!(mi_malloc_usable_size(core::ptr::null()), 0);
+            assert!(mi_malloc_good_size(1) >= 1);
+
+            let a = mi_malloc_aligned(40, 128);
+            mi_free_size_aligned(a, 40, 128);
+        }
     }
 }
