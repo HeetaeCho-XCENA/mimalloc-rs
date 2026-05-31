@@ -100,8 +100,12 @@ impl Heap {
     /// max-align). Returns `None` on OOM.
     pub fn alloc(&self, size: usize) -> Option<NonNull<u8>> {
         let r = self.alloc_impl(size);
-        if r.is_some() {
-            crate::stats::on_alloc();
+        // Account by block size (matches `free`); only compiled under `stats`.
+        #[cfg(feature = "stats")]
+        if let Some(p) = r {
+            // SAFETY: `p` is a block-start allocation we just made.
+            let sz = unsafe { usable_size(p) };
+            crate::stats::on_alloc(sz);
         }
         r
     }
@@ -189,7 +193,10 @@ impl Heap {
     /// register it in the page-map, and push it on the bin queue.
     fn new_page(&self, bin: usize, bs: usize, slices: usize) -> Option<*mut Page> {
         let tseq = self.next_tseq();
-        let (arena, idx, p) = self.subproc.alloc_slices(slices, true, tseq)?;
+        // `eager_commit` (option) controls whether a freshly reserved arena is
+        // committed up front or committed per-slice on demand (lower RSS).
+        let eager = crate::options::options().eager_commit;
+        let (arena, idx, p) = self.subproc.alloc_slices(slices, eager, tseq)?;
         // SAFETY: `p` is `slices` committed, slice-aligned slices owned by us.
         let page = unsafe { Page::init(p, idx, slices, bs, self.keys) };
         let page_ptr = page.as_ptr();
@@ -225,6 +232,7 @@ impl Heap {
             }
             self.pages[bin].push_front(page_ptr);
         }
+        crate::stats::on_page_created();
         Some(page_ptr)
     }
 
@@ -266,7 +274,7 @@ pub unsafe fn free(ptr: NonNull<u8>) {
     let block_start = pstart.wrapping_add((off / bs) * bs);
     // SAFETY: block_start is the start of a live block in this page.
     let block = unsafe { NonNull::new_unchecked(block_start) };
-    crate::stats::on_free();
+    crate::stats::on_free(bs);
 
     #[cfg(feature = "std")]
     {
@@ -532,6 +540,25 @@ mod tests {
             for p in ptrs {
                 free(p);
             }
+        }
+    }
+
+    #[cfg(feature = "stats")]
+    #[test]
+    fn stats_track_allocations() {
+        let h = test_heap();
+        let before = crate::stats::snapshot();
+        // SAFETY: pointer from this heap, freed on this thread.
+        unsafe {
+            let p = h.alloc(1000).unwrap();
+            let mid = crate::stats::snapshot();
+            assert!(
+                mid.allocations > before.allocations,
+                "alloc count must rise"
+            );
+            free(p);
+            let after = crate::stats::snapshot();
+            assert!(after.frees > before.frees, "free count must rise");
         }
     }
 
