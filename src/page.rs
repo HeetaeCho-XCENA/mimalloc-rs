@@ -9,10 +9,11 @@
 //! * `free` — blocks `malloc` hands out (owner-only),
 //! * `local_free` — blocks the owner freed, migrated to `free` on demand (keeps
 //!   a monotonic heartbeat),
-//! * `xthread_free` — blocks freed by *other* threads (atomic MPSC, wired in M6).
+//! * `xthread_free` — blocks freed by *other* threads (atomic Treiber stack).
 //!
-//! This milestone implements the single-threaded owner path; cross-thread free
-//! and the ownership protocol arrive in M6.
+//! The owner pops from `free`; other threads push to `xthread_free`; the owner
+//! collects both `local_free` and `xthread_free` on demand. Pages carry their
+//! owning heap/arena/bin so they can be retired or abandoned (thread exit).
 
 use core::cell::Cell;
 use core::ptr::NonNull;
