@@ -49,7 +49,15 @@ use allocator_api2::boxed::Box;
 let b = Box::new_in(42u64, MiMalloc);
 ```
 
-Or the C-style functions: `mimalloc_rs::api::mi::{mi_malloc, mi_free, ...}`.
+As a **C library** (`capi` feature): build a `cdylib`/`staticlib` exporting the
+mimalloc-compatible C ABI (`mi_malloc`/`mi_free`/`mi_calloc`/`mi_realloc`/aligned
+variants/`mi_posix_memalign`/`mi_new*`/`mi_heap_*`/`mi_option_*`/`mi_stats_*`/…):
+
+```sh
+cargo rustc --release --features capi --crate-type cdylib   # → libmimalloc_rs.so
+```
+
+First-class heaps from Rust: `Heap::new_boxed`, `Heap::{delete,destroy}`.
 
 ## Features
 
@@ -59,8 +67,10 @@ Or the C-style functions: `mimalloc_rs::api::mi::{mi_malloc, mi_free, ...}`.
 | `nightly` |         | also impl `core::alloc::Allocator`; `#[thread_local]` fast path |
 | `secure`  |         | encoded free lists + hardening (`MI_SECURE`)                  |
 | `debug`   |         | padding/canaries + extra checks (`MI_PADDING`/`MI_DEBUG`)     |
-| `stats`   |         | process-wide allocation counters                              |
+| `stats`   |         | process-wide allocation counters (`mi_stats_*`)              |
 | `track`   |         | Valgrind/ASan tracking hooks                                  |
+| `capi`    |         | export the C-ABI `mi_*` symbols (`#[no_mangle] extern "C"`)   |
+| `differential` |    | enable the `libmimalloc` FFI differential test (see below)   |
 
 ## Building & testing
 
@@ -81,8 +91,16 @@ cargo run --example global_allocator
 invariants any correct allocator must hold (alignment, zeroing, usable-size,
 **no overlap of live allocations**, realloc content preservation, no leak). This
 invariant oracle is exactly what a side-by-side comparison against the C original
-would check; the C v3 shared library can be built from the sibling worktree
-(`mimalloc-v3`) for performance comparison.
+would check.
+
+`tests/differential.rs` (the `differential` feature) links the **C
+`libmimalloc`** and runs the same workload through both the C reference and
+mimalloc-rs, asserting they uphold the identical observable contract and report
+the same version:
+
+```sh
+MIMALLOC_C_LIB=/path/to/mimalloc/out cargo test --features differential --test differential
+```
 
 ## License
 
