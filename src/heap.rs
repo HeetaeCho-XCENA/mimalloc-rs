@@ -6,16 +6,19 @@
 //! an arena via the [`crate::subproc`]), and pop a block. Freeing is heap
 //! independent — it finds the owning page through the [`crate::page_map`].
 //!
-//! v1 keeps the heap single-owner (per thread). The richer `mi_theap_t`/`tld`
-//! split, the `pages_free_direct` fast array, deferred-free heartbeat, and
-//! page retire/abandon are layered on in later milestones.
+//! The heap is single-owner (per thread). It has a `pages_free_direct` fast
+//! array (skip the bin-queue scan for small sizes), retires empty pages to the
+//! arena, and on thread exit abandons/releases its pages (see [`crate::page`]
+//! and [`crate::subproc`]). The `mi_theap_t`/`tld` split and deferred-free
+//! heartbeat remain follow-up work.
 
 use core::cell::Cell;
 use core::ptr::NonNull;
 
 use crate::bits::{
-    bin, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_HUGE, MI_INTPTR_SIZE, MI_LARGE_MAX_OBJ_SIZE,
-    MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_SMALL_MAX_OBJ_SIZE, MI_THREADID_ABANDONED,
+    bin, wsize_from_size, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_HUGE, MI_INTPTR_SIZE,
+    MI_LARGE_MAX_OBJ_SIZE, MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_PAGES_DIRECT,
+    MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED,
 };
 use crate::layout::align_up;
 use crate::page::Page;
@@ -74,6 +77,16 @@ pub struct Heap {
     tseq: Cell<usize>,
     /// One page queue per bin (`MI_BIN_COUNT` includes the full/huge queues).
     pages: [PageQueue; MI_BIN_COUNT],
+    /// Fast-path lookup (`mi_theap_t.pages_free_direct`): for each small word
+    /// size, the page that most recently served it. The malloc fast path tries
+    /// this page directly, skipping the bin-queue scan.
+    ///
+    /// Invariant: a non-null entry points at a live page owned by this heap.
+    /// Maintained because (a) the array is per-heap and only ever stores pages
+    /// this heap allocated from, (b) `retire_page` clears matching entries
+    /// before releasing slices, and (c) `Heap::drop` releases/abandons pages and
+    /// then the array itself is dropped — so an entry can never outlive its page.
+    pages_free_direct: [Cell<*mut Page>; MI_PAGES_DIRECT],
 }
 
 impl Heap {
@@ -86,6 +99,7 @@ impl Heap {
             tid,
             tseq: Cell::new(0),
             pages: [const { PageQueue::new() }; MI_BIN_COUNT],
+            pages_free_direct: [const { Cell::new(core::ptr::null_mut()) }; MI_PAGES_DIRECT],
         }
     }
 
@@ -112,34 +126,61 @@ impl Heap {
 
     fn alloc_impl(&self, size: usize) -> Option<NonNull<u8>> {
         let size = size.max(MI_INTPTR_SIZE);
+        let wsize = wsize_from_size(size);
+
+        // Fast path: the page that last served this word size (if any) usually
+        // still has a free block — skip the bin-queue scan.
+        if wsize <= MI_SMALL_WSIZE_MAX {
+            let p = self.pages_free_direct[wsize].get();
+            if !p.is_null() {
+                // SAFETY: a non-null direct entry always points at a live page
+                // (entries are cleared on retire).
+                if let Some(b) = unsafe { (*p).alloc() } {
+                    return Some(b);
+                }
+            }
+        }
+
         let b = bin(size);
         if b >= MI_BIN_HUGE {
             return self.alloc_huge(size);
         }
         let bs = bin_block_size(b);
-        // Find a page in the bin with a free block.
-        let q = &self.pages[b];
-        let mut cur = q.first();
-        while !cur.is_null() {
-            // SAFETY: queue holds valid page pointers owned by this heap.
-            let page = unsafe { &*cur };
-            if let Some(p) = page.alloc() {
-                return Some(p);
+        // Pick the page that will serve this request, then record it for the
+        // fast path. Scan the bin queue, else reclaim an abandoned page, else
+        // carve a fresh one.
+        let mut pg = {
+            let mut found = core::ptr::null_mut();
+            let mut cur = self.pages[b].first();
+            while !cur.is_null() {
+                // SAFETY: queue holds valid pages owned by this heap.
+                if !unsafe { (*cur).is_full() } {
+                    found = cur;
+                    break;
+                }
+                cur = unsafe { (*cur).next.get() };
             }
-            cur = page.next.get();
-        }
-        // Before carving a fresh page, try to adopt an abandoned page of this
-        // bin (left by an exited thread), reclaiming its memory.
-        if let Some(page) = self.try_reclaim(b) {
-            // SAFETY: just adopted; owned by this thread.
-            if let Some(p) = unsafe { (*page).alloc() } {
-                return Some(p);
+            if found.is_null() {
+                found = self.try_reclaim(b).unwrap_or(core::ptr::null_mut());
             }
+            if found.is_null() {
+                found = self.new_page(b, bs, page_slices_for(bs))?;
+            }
+            found
+        };
+        // SAFETY: `pg` is a live page owned by this heap.
+        let mut blk = unsafe { (*pg).alloc() };
+        if blk.is_none() {
+            // The chosen page had no free block (e.g. a reclaimed page whose
+            // blocks are all still live) — carve a fresh page instead.
+            pg = self.new_page(b, bs, page_slices_for(bs))?;
+            // SAFETY: freshly created, non-full page.
+            blk = unsafe { (*pg).alloc() };
         }
-        // No page had room: carve a new one.
-        let page = self.new_page(b, bs, page_slices_for(bs))?;
-        // SAFETY: freshly created, non-full page.
-        unsafe { (*page).alloc() }
+        if blk.is_some() && wsize <= MI_SMALL_WSIZE_MAX {
+            self.pages_free_direct[wsize].set(pg);
+        }
+        blk
     }
 
     /// Adopt an abandoned page of `bin` (left by an exited thread): claim
@@ -368,6 +409,13 @@ unsafe fn retire_page(page_ptr: *mut Page) {
     if bin != MI_BIN_HUGE && heap.pages[bin].len() <= 1 {
         return;
     }
+    // Clear any fast-path entries pointing at this page before its memory is
+    // released, so the direct lookup can never dangle.
+    for slot in heap.pages_free_direct.iter() {
+        if slot.get() == page_ptr {
+            slot.set(core::ptr::null_mut());
+        }
+    }
     // SAFETY: page is linked in this bin queue; range was registered for it.
     unsafe {
         heap.pages[bin].remove(page_ptr);
@@ -377,8 +425,22 @@ unsafe fn retire_page(page_ptr: *mut Page) {
 
 /// Return a page's slices to its arena and drop its address→page mappings.
 ///
+/// ## Cross-thread safety (why releasing an empty page cannot race a foreign free)
+/// A block freed by a non-owner thread is pushed onto `xthread_free` and stays
+/// counted in `Page::used` until the owner *collects* it; a cross-thread free
+/// never decrements `used`. Therefore `used == 0` (the precondition for getting
+/// here) implies every block — including any freed by other threads — has
+/// already been collected. Collection swaps `xthread_free` with `Acquire`, which
+/// synchronizes-with the foreign push's `Release` CAS; so every access a foreign
+/// freer makes to this page (page-map lookup, header reads, the block-link write,
+/// the CAS) *happens-before* the collect, hence before this release. A foreign
+/// freer performs no access to the page after its push returns. Thus when the
+/// slices are returned here, no other thread can still be touching the page.
+/// (Double frees are caller UB and are caught separately under `secure`/`debug`.)
+///
 /// # Safety
-/// `page_ptr` must be an empty page, already unlinked from any bin queue.
+/// `page_ptr` must be an empty page (`used == 0`), already unlinked from any
+/// bin queue, owned by the calling thread.
 unsafe fn release_page_slices(page_ptr: *mut Page) {
     // SAFETY: caller guarantees the page is empty and unlinked.
     let page = unsafe { &*page_ptr };
@@ -586,6 +648,50 @@ mod tests {
             let pages_after = h.pages[b].len();
             assert_eq!(pages_after, 1, "empty pages should retire to the kept page");
         }
+    }
+
+    #[test]
+    fn stress_owner_retire_vs_cross_thread_free() {
+        // Exercises the retire-vs-foreign-free window: a producer allocates and
+        // mostly frees on its own thread (driving pages empty → retire), while
+        // consumer threads free a fraction of the blocks cross-thread. Must run
+        // to completion without corruption (run under TSan/Miri for races).
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<usize>();
+        let rx = std::sync::Mutex::new(rx);
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| loop {
+                    let got = rx.lock().unwrap().recv();
+                    match got {
+                        Ok(addr) => {
+                            // SAFETY: addr is a live block handed off by the producer.
+                            unsafe { free(NonNull::new(addr as *mut u8).unwrap()) }
+                        }
+                        Err(_) => break, // channel closed
+                    }
+                });
+            }
+            s.spawn(move || {
+                let h = test_heap();
+                let mut x: u64 = 0x9e37_79b9;
+                // SAFETY: blocks come from `h`; freed here (owner) or by consumers.
+                unsafe {
+                    for _ in 0..60_000 {
+                        let p = h.alloc(64).unwrap();
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        if x & 7 == 0 {
+                            tx.send(p.addr().get()).unwrap(); // free cross-thread
+                        } else {
+                            free(p); // owner free → may retire the page
+                        }
+                    }
+                }
+                drop(tx); // close the channel so consumers exit
+            });
+        });
     }
 
     #[test]
