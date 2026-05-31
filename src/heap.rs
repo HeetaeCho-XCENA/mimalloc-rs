@@ -54,6 +54,18 @@ fn bin_block_size(b: usize) -> usize {
     bin_sizes()[b]
 }
 
+/// The usable size a `malloc(size)` would yield (`mi_good_size`): the block
+/// size of the bin the request maps to (huge requests round up to a slice).
+pub fn good_size(size: usize) -> usize {
+    let size = size.max(MI_INTPTR_SIZE);
+    let b = bin(size);
+    if b >= MI_BIN_HUGE {
+        align_up(size, MI_ARENA_SLICE_SIZE)
+    } else {
+        bin_block_size(b)
+    }
+}
+
 /// How many 64 KiB slices a page serving `block_size` blocks should span
 /// (small ⇒ 1, medium ⇒ 8, large ⇒ 64), mirroring `mi_page_kind_t`.
 fn page_slices_for(block_size: usize) -> usize {
