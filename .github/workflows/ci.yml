@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: MIT
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Build + test on stable and the pinned MSRV. The `nightly` feature is
+  # excluded here because it requires unstable compiler features.
+  test:
+    name: test (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.84.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Build (default)
+        run: cargo build
+      - name: Build (no_std core)
+        run: cargo build --no-default-features
+      - name: Test (default)
+        run: cargo test
+      - name: Test (secure + debug + stats + track)
+        run: cargo test --features secure,debug,stats,track
+
+  # Nightly-only paths: the `core::alloc::Allocator` impl and #[thread_local].
+  nightly:
+    name: nightly (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo build --all-features
+      - run: cargo test --features nightly
+
+  # Formatting + lints.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # Undefined-behavior / strict-provenance checks on the pure-logic modules
+  # (the OS-backed paths use real mmap and can't run under Miri).
+  miri:
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: -Zmiri-strict-provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri test --lib bitmap
+      - run: cargo miri test --lib free_list
+      - run: cargo miri test --lib layout
+      - run: cargo miri test --lib bits
+
+  # Concurrency model checking (bitmap CAS + xthread_free MPSC).
+  loom:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg loom
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --lib loom_tests

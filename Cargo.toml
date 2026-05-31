@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "mimalloc-rs"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.84"          # MSRV: strict-provenance ptr APIs (addr/with_addr) stabilized in 1.84
+license = "MIT"
+authors = ["Heetae Cho"]
+description = "A from-scratch Rust port of the mimalloc v3 general-purpose allocator (no_std core + std)."
+repository = "https://github.com/HeetaeCho-XCENA/mimalloc-rs"
+homepage = "https://github.com/HeetaeCho-XCENA/mimalloc-rs"
+keywords = ["allocator", "malloc", "mimalloc", "no_std", "memory"]
+categories = ["memory-management", "no-std"]
+publish = false                # not yet published to crates.io (name TBD); depend via git for now
+
+[features]
+default = ["std"]
+# Pull in `std` (thread_local!, OS threads). Core engine stays no_std-capable without it.
+std = []
+# Nightly-only: real `core::alloc::Allocator` + `#[thread_local]` fast path.
+nightly = []
+# Security hardening (encoded free lists + checks; mirrors MI_SECURE>=3).
+secure = []
+# Debug padding/canaries + extra invariant checks (mirrors MI_PADDING + MI_DEBUG).
+debug = []
+# Runtime statistics (mirrors mimalloc stats.c).
+stats = []
+# Valgrind/ASan tracking hooks (mirrors track.h); no-op when off.
+track = []
+
+[dependencies]
+# Stable `Allocator` trait. On nightly we additionally impl `core::alloc::Allocator`.
+# `alloc` feature provides allocator-api2's own Box/Vec (used in tests/examples).
+allocator-api2 = { version = "0.2", default-features = false, features = ["alloc"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", default-features = false }
+
+# Concurrency model checker — only linked when building with `--cfg loom`.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+# `--cfg loom` is set manually when running concurrency models.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[profile.release]
+lto = true
+codegen-units = 1
