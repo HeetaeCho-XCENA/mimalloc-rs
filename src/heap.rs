@@ -79,8 +79,13 @@ pub struct Heap {
     pages: [PageQueue; MI_BIN_COUNT],
     /// Fast-path lookup (`mi_theap_t.pages_free_direct`): for each small word
     /// size, the page that most recently served it. The malloc fast path tries
-    /// this page directly, skipping the bin-queue scan. Entries are cleared when
-    /// a page retires so they can never dangle.
+    /// this page directly, skipping the bin-queue scan.
+    ///
+    /// Invariant: a non-null entry points at a live page owned by this heap.
+    /// Maintained because (a) the array is per-heap and only ever stores pages
+    /// this heap allocated from, (b) `retire_page` clears matching entries
+    /// before releasing slices, and (c) `Heap::drop` releases/abandons pages and
+    /// then the array itself is dropped — so an entry can never outlive its page.
     pages_free_direct: [Cell<*mut Page>; MI_PAGES_DIRECT],
 }
 
@@ -420,8 +425,22 @@ unsafe fn retire_page(page_ptr: *mut Page) {
 
 /// Return a page's slices to its arena and drop its address→page mappings.
 ///
+/// ## Cross-thread safety (why releasing an empty page cannot race a foreign free)
+/// A block freed by a non-owner thread is pushed onto `xthread_free` and stays
+/// counted in `Page::used` until the owner *collects* it; a cross-thread free
+/// never decrements `used`. Therefore `used == 0` (the precondition for getting
+/// here) implies every block — including any freed by other threads — has
+/// already been collected. Collection swaps `xthread_free` with `Acquire`, which
+/// synchronizes-with the foreign push's `Release` CAS; so every access a foreign
+/// freer makes to this page (page-map lookup, header reads, the block-link write,
+/// the CAS) *happens-before* the collect, hence before this release. A foreign
+/// freer performs no access to the page after its push returns. Thus when the
+/// slices are returned here, no other thread can still be touching the page.
+/// (Double frees are caller UB and are caught separately under `secure`/`debug`.)
+///
 /// # Safety
-/// `page_ptr` must be an empty page, already unlinked from any bin queue.
+/// `page_ptr` must be an empty page (`used == 0`), already unlinked from any
+/// bin queue, owned by the calling thread.
 unsafe fn release_page_slices(page_ptr: *mut Page) {
     // SAFETY: caller guarantees the page is empty and unlinked.
     let page = unsafe { &*page_ptr };
@@ -629,6 +648,50 @@ mod tests {
             let pages_after = h.pages[b].len();
             assert_eq!(pages_after, 1, "empty pages should retire to the kept page");
         }
+    }
+
+    #[test]
+    fn stress_owner_retire_vs_cross_thread_free() {
+        // Exercises the retire-vs-foreign-free window: a producer allocates and
+        // mostly frees on its own thread (driving pages empty → retire), while
+        // consumer threads free a fraction of the blocks cross-thread. Must run
+        // to completion without corruption (run under TSan/Miri for races).
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<usize>();
+        let rx = std::sync::Mutex::new(rx);
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| loop {
+                    let got = rx.lock().unwrap().recv();
+                    match got {
+                        Ok(addr) => {
+                            // SAFETY: addr is a live block handed off by the producer.
+                            unsafe { free(NonNull::new(addr as *mut u8).unwrap()) }
+                        }
+                        Err(_) => break, // channel closed
+                    }
+                });
+            }
+            s.spawn(move || {
+                let h = test_heap();
+                let mut x: u64 = 0x9e37_79b9;
+                // SAFETY: blocks come from `h`; freed here (owner) or by consumers.
+                unsafe {
+                    for _ in 0..60_000 {
+                        let p = h.alloc(64).unwrap();
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        if x & 7 == 0 {
+                            tx.send(p.addr().get()).unwrap(); // free cross-thread
+                        } else {
+                            free(p); // owner free → may retire the page
+                        }
+                    }
+                }
+                drop(tx); // close the channel so consumers exit
+            });
+        });
     }
 
     #[test]
