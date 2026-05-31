@@ -47,6 +47,8 @@ pub mod arena_meta;
 pub mod atomic;
 pub mod bitmap;
 pub mod bits;
+#[cfg(feature = "capi")]
+pub mod capi;
 pub mod free_list;
 pub mod heap;
 pub mod init;
