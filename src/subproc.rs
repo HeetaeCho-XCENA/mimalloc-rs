@@ -7,10 +7,13 @@
 //! follow-up work. The main subproc is a `static`, which also serves as the
 //! bootstrap seed that terminates the metadata/arena allocation cycle.
 
+use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::arena::Arena;
+use crate::bits::MI_BIN_COUNT;
+use crate::page::Page;
 use crate::sync::SpinLock;
 
 /// Maximum arenas a subproc tracks (`mi_subproc_t.arenas`).
@@ -18,17 +21,40 @@ pub const MAX_ARENAS: usize = 160;
 /// Default slices reserved when growing the arena pool (256 MiB, committed on demand).
 pub const DEFAULT_ARENA_SLICES: usize = 4096;
 
+/// A per-bin stack of abandoned pages (left by exited threads), protected by a
+/// lock. The intrusive link lives in `Page::abandoned_next`.
+struct AbandonedBin {
+    lock: SpinLock,
+    head: UnsafeCell<*mut Page>,
+}
+
+// SAFETY: `head` and the pages' `abandoned_next` links are only ever touched
+// while holding `lock`, which serializes all access.
+unsafe impl Sync for AbandonedBin {}
+
+impl AbandonedBin {
+    const fn new() -> Self {
+        AbandonedBin {
+            lock: SpinLock::new(),
+            head: UnsafeCell::new(core::ptr::null_mut()),
+        }
+    }
+}
+
 /// A sub-process: the arena registry shared by all its heaps.
 pub struct Subproc {
     lock: SpinLock,
     arenas: [AtomicPtr<Arena>; MAX_ARENAS],
     arena_count: AtomicUsize,
+    /// Pages abandoned by exited threads, per size-class bin, awaiting reclaim.
+    abandoned: [AbandonedBin; MI_BIN_COUNT],
 }
 
 static MAIN: Subproc = Subproc {
     lock: SpinLock::new(),
     arenas: [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_ARENAS],
     arena_count: AtomicUsize::new(0),
+    abandoned: [const { AbandonedBin::new() }; MI_BIN_COUNT],
 };
 
 /// The process-global main sub-process.
@@ -99,6 +125,55 @@ impl Subproc {
         let a = unsafe { arena.as_ref() };
         let (idx, p) = a.alloc_slices(n, tseq)?;
         Some((arena, idx, p))
+    }
+
+    /// Push a non-empty page onto the abandoned stack for its `bin` so another
+    /// thread can reclaim it (called when the owning thread exits).
+    ///
+    /// # Safety
+    /// `page` is a valid, no-longer-owned page; `bin` is its size-class bin.
+    pub unsafe fn abandon_page(&self, page: *mut Page, bin: usize) {
+        let ab = &self.abandoned[bin];
+        let _g = ab.lock.lock();
+        // SAFETY: `head` and the link are only touched under `lock`.
+        unsafe {
+            let head = *ab.head.get();
+            (*page).set_abandoned_next(head);
+            *ab.head.get() = page;
+        }
+    }
+
+    /// Pop an abandoned page of `bin` to reclaim, or `None` if there are none.
+    pub fn reclaim_page(&self, bin: usize) -> Option<*mut Page> {
+        let ab = &self.abandoned[bin];
+        let _g = ab.lock.lock();
+        // SAFETY: under `lock`.
+        unsafe {
+            let head = *ab.head.get();
+            if head.is_null() {
+                return None;
+            }
+            *ab.head.get() = (*head).abandoned_next();
+            (*head).set_abandoned_next(core::ptr::null_mut());
+            Some(head)
+        }
+    }
+
+    /// Number of abandoned pages for a bin (test/diagnostics).
+    #[cfg(test)]
+    pub fn abandoned_len(&self, bin: usize) -> usize {
+        let ab = &self.abandoned[bin];
+        let _g = ab.lock.lock();
+        let mut n = 0;
+        // SAFETY: under `lock`.
+        unsafe {
+            let mut p = *ab.head.get();
+            while !p.is_null() {
+                n += 1;
+                p = (*p).abandoned_next();
+            }
+        }
+        n
     }
 }
 

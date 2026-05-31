@@ -53,6 +53,16 @@ pub struct Page {
     /// Provenance of the page within its arena.
     pub slice_index: usize,
     pub slice_count: usize,
+    /// Owning heap (set after init; owner-only access). Used to retire the page
+    /// to its bin queue when it empties.
+    heap: Cell<*mut crate::heap::Heap>,
+    /// Owning arena (set after init). Slices return here on retire.
+    arena: Cell<*mut crate::arena::Arena>,
+    /// Size-class bin index this page belongs to (set after init).
+    bin: Cell<u32>,
+    /// Intrusive link for a sub-process abandoned-page stack (manipulated only
+    /// under the per-bin abandoned lock; atomic so cross-thread access is sound).
+    abandoned_next: AtomicPtr<Page>,
 }
 
 impl Page {
@@ -99,6 +109,10 @@ impl Page {
                 prev: Cell::new(core::ptr::null_mut()),
                 slice_index,
                 slice_count,
+                heap: Cell::new(core::ptr::null_mut()),
+                arena: Cell::new(core::ptr::null_mut()),
+                bin: Cell::new(0),
+                abandoned_next: AtomicPtr::new(core::ptr::null_mut()),
             });
             let page = &*hdr;
             page.build_free_list();
@@ -273,6 +287,60 @@ impl Page {
         // free or a foreign pointer (caller-contract violation).
         debug_assert!(self.used.get() > 0, "free of non-live block (double free?)");
         self.used.set(self.used.get().saturating_sub(1));
+    }
+
+    /// Record the owning heap, arena, and bin (called once after init, on the
+    /// owner thread). Enables retiring the page when it empties.
+    #[inline]
+    pub fn set_provenance(
+        &self,
+        heap: *mut crate::heap::Heap,
+        arena: *mut crate::arena::Arena,
+        bin: u32,
+    ) {
+        self.heap.set(heap);
+        self.arena.set(arena);
+        self.bin.set(bin);
+    }
+
+    /// Owning heap pointer (owner-only).
+    #[inline]
+    pub fn owning_heap(&self) -> *mut crate::heap::Heap {
+        self.heap.get()
+    }
+
+    /// Owning arena pointer.
+    #[inline]
+    pub fn owning_arena(&self) -> *mut crate::arena::Arena {
+        self.arena.get()
+    }
+
+    /// Size-class bin index.
+    #[inline]
+    pub fn bin(&self) -> u32 {
+        self.bin.get()
+    }
+
+    /// Migrate cross-thread + local frees into the `free` list (owner path).
+    /// Called when adopting an abandoned page or before checking emptiness.
+    ///
+    /// # Safety
+    /// Caller must own the page (no other thread runs the owner path).
+    #[inline]
+    pub unsafe fn collect_free(&self) {
+        // SAFETY: forwarded owner-only contract.
+        unsafe { self.collect() }
+    }
+
+    /// Abandoned-stack link accessors (manipulated under the per-bin lock).
+    #[inline]
+    pub fn abandoned_next(&self) -> *mut Page {
+        self.abandoned_next.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn set_abandoned_next(&self, p: *mut Page) {
+        self.abandoned_next.store(p, Ordering::Relaxed);
     }
 
     /// Block size served by this page.

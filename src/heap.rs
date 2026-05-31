@@ -15,7 +15,7 @@ use core::ptr::NonNull;
 
 use crate::bits::{
     bin, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_HUGE, MI_INTPTR_SIZE, MI_LARGE_MAX_OBJ_SIZE,
-    MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_SMALL_MAX_OBJ_SIZE,
+    MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_SMALL_MAX_OBJ_SIZE, MI_THREADID_ABANDONED,
 };
 use crate::layout::align_up;
 use crate::page::Page;
@@ -124,10 +124,35 @@ impl Heap {
             }
             cur = page.next.get();
         }
+        // Before carving a fresh page, try to adopt an abandoned page of this
+        // bin (left by an exited thread), reclaiming its memory.
+        if let Some(page) = self.try_reclaim(b) {
+            // SAFETY: just adopted; owned by this thread.
+            if let Some(p) = unsafe { (*page).alloc() } {
+                return Some(p);
+            }
+        }
         // No page had room: carve a new one.
         let page = self.new_page(b, bs, page_slices_for(bs))?;
         // SAFETY: freshly created, non-full page.
         unsafe { (*page).alloc() }
+    }
+
+    /// Adopt an abandoned page of `bin` (left by an exited thread): claim
+    /// ownership, drain the cross-thread frees that accumulated while it was
+    /// abandoned, re-home it into this heap, and return it.
+    fn try_reclaim(&self, bin: usize) -> Option<*mut Page> {
+        let page = self.subproc.reclaim_page(bin)?;
+        // SAFETY: popped from the abandoned stack — exclusively ours now.
+        unsafe {
+            let arena = (*page).owning_arena();
+            (*page).set_owner(self.tid);
+            (*page).set_provenance(self as *const Heap as *mut Heap, arena, bin as u32);
+            // Collect blocks freed cross-thread while the page was abandoned.
+            (*page).collect_free();
+            self.pages[bin].push_front(page);
+        }
+        Some(page)
     }
 
     /// Allocate `size` bytes aligned to `align` (a power of two).
@@ -168,9 +193,17 @@ impl Heap {
         // SAFETY: `p` is `slices` committed, slice-aligned slices owned by us.
         let page = unsafe { Page::init(p, idx, slices, bs, self.keys) };
         let page_ptr = page.as_ptr();
-        // Stamp ownership so cross-thread frees route to `xthread_free`.
+        // Stamp ownership so cross-thread frees route to `xthread_free`, and
+        // record heap/arena/bin so the page can be retired when it empties.
         // SAFETY: page just created and owned by this thread.
-        unsafe { page.as_ref().set_owner(self.tid) };
+        unsafe {
+            page.as_ref().set_owner(self.tid);
+            page.as_ref().set_provenance(
+                self as *const Heap as *mut Heap,
+                arena.as_ptr(),
+                bin as u32,
+            );
+        }
         // Map every slice of the page back to its header.
         // Debug guard: a freshly carved slice run must not already be mapped to
         // another page (would indicate an arena double-allocation).
@@ -236,7 +269,13 @@ pub unsafe fn free(ptr: NonNull<u8>) {
         if owner == crate::init::current_tid() {
             // Owner path: deferred local free (touches owner-only `Cell`s).
             // SAFETY: this thread owns the page.
-            unsafe { (*page_ptr).free_local(block) };
+            unsafe {
+                (*page_ptr).free_local(block);
+                // If the page is now fully free, retire it (return its slices).
+                if (*page_ptr).is_all_free() {
+                    retire_page(page_ptr);
+                }
+            }
         } else {
             // Cross-thread: atomic Treiber push (touches only the atomic + block).
             // SAFETY: live page and block.
@@ -248,7 +287,89 @@ pub unsafe fn free(ptr: NonNull<u8>) {
         // Without std TLS we assume single-owner frees; embedders that share
         // heaps across tasks must route cross-task frees themselves.
         // SAFETY: single-owner assumption.
-        unsafe { (*page_ptr).free_local(block) };
+        unsafe {
+            (*page_ptr).free_local(block);
+            if (*page_ptr).is_all_free() {
+                retire_page(page_ptr);
+            }
+        }
+    }
+}
+
+/// Retire a now-empty page: return its slices to the owning arena and clear its
+/// page-map entries, so memory footprint tracks the live set rather than the
+/// peak. To avoid alloc/free churn on the common single-page case, the sole
+/// remaining page of a (non-huge) bin is kept for reuse.
+///
+/// # Safety
+/// `page_ptr` is a live, fully-free page owned by the calling (owner) thread,
+/// with provenance set via [`Page::set_provenance`].
+unsafe fn retire_page(page_ptr: *mut Page) {
+    // SAFETY: owner thread holds the page; provenance was set at creation.
+    let page = unsafe { &*page_ptr };
+    let heap = page.owning_heap();
+    let bin = page.bin() as usize;
+    if heap.is_null() || page.owning_arena().is_null() {
+        return; // not a heap-managed page (e.g. a synthetic test page)
+    }
+    // SAFETY: heap is this thread's heap (owner-only access is safe here).
+    let heap = unsafe { &*heap };
+    // Keep the last page of a normal bin to avoid rebuild churn; always retire
+    // huge pages (each is a distinct large mapping) and surplus pages.
+    if bin != MI_BIN_HUGE && heap.pages[bin].len() <= 1 {
+        return;
+    }
+    // SAFETY: page is linked in this bin queue; range was registered for it.
+    unsafe {
+        heap.pages[bin].remove(page_ptr);
+        release_page_slices(page_ptr);
+    }
+}
+
+/// Return a page's slices to its arena and drop its address→page mappings.
+///
+/// # Safety
+/// `page_ptr` must be an empty page, already unlinked from any bin queue.
+unsafe fn release_page_slices(page_ptr: *mut Page) {
+    // SAFETY: caller guarantees the page is empty and unlinked.
+    let page = unsafe { &*page_ptr };
+    let arena = page.owning_arena();
+    if arena.is_null() {
+        return;
+    }
+    let base = (page_ptr as *mut u8).addr();
+    // SAFETY: range was registered for this page; arena owns the slices.
+    unsafe {
+        page_map::unregister(base, page.slice_count);
+        (*arena).free_slices(page.slice_index, page.slice_count);
+    }
+}
+
+impl Drop for Heap {
+    /// On thread exit, hand off this heap's pages so their memory is not
+    /// stranded: empty pages are released to the arena; pages with live blocks
+    /// (still held by the application, to be freed cross-thread later) are
+    /// abandoned for another thread to reclaim.
+    fn drop(&mut self) {
+        for b in 0..MI_BIN_COUNT {
+            let mut cur = self.pages[b].first();
+            while !cur.is_null() {
+                // SAFETY: the bin queue holds valid pages owned by this heap.
+                let next = unsafe { (*cur).next.get() };
+                // SAFETY: owner thread; draining our own queue.
+                unsafe {
+                    self.pages[b].remove(cur);
+                    (*cur).collect_free();
+                    if (*cur).is_all_free() {
+                        release_page_slices(cur);
+                    } else {
+                        (*cur).set_owner(MI_THREADID_ABANDONED);
+                        self.subproc.abandon_page(cur, b);
+                    }
+                }
+                cur = next;
+            }
+        }
     }
 }
 
@@ -368,6 +489,82 @@ mod tests {
                 ptrs.push(h.alloc(64).unwrap());
             }
             for p in ptrs {
+                free(p);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_pages_are_retired() {
+        // Allocating a burst spanning several pages then freeing it all must
+        // retire the now-empty pages (return their slices), leaving only the
+        // sole kept page in the bin queue — footprint tracks the live set.
+        let h = test_heap();
+        let b = bin(200);
+        // SAFETY: pointers come from this heap and are freed on this thread.
+        unsafe {
+            let mut ptrs = alloc::vec::Vec::new();
+            for _ in 0..2000 {
+                ptrs.push(h.alloc(200).unwrap());
+            }
+            let pages_at_peak = h.pages[b].len();
+            assert!(
+                pages_at_peak >= 3,
+                "expected several pages, got {pages_at_peak}"
+            );
+            for p in ptrs {
+                free(p);
+            }
+            let pages_after = h.pages[b].len();
+            assert_eq!(pages_after, 1, "empty pages should retire to the kept page");
+        }
+    }
+
+    #[test]
+    fn abandoned_pages_reclaimed_across_threads() {
+        // A worker allocates a batch and exits while the blocks are still live;
+        // its non-empty pages are abandoned. Another thread frees the blocks
+        // (cross-thread) and then reclaims the abandoned pages on allocation.
+        let b = bin(300);
+        let addrs = std::thread::spawn(|| {
+            let mut v = alloc::vec::Vec::new();
+            for _ in 0..500 {
+                v.push(crate::init::malloc(300).unwrap().addr().get());
+            }
+            v // pages remain non-empty when this thread exits → abandoned
+        })
+        .join()
+        .unwrap();
+
+        let sp = crate::subproc::subproc_main();
+        let ab_before = sp.abandoned_len(b);
+        assert!(
+            ab_before > 0,
+            "exited thread must abandon its non-empty pages"
+        );
+
+        // Free the leaked blocks cross-thread (routed to the pages' xthread_free).
+        // SAFETY: addresses are live allocations from the worker.
+        unsafe {
+            for a in &addrs {
+                free(NonNull::new(*a as *mut u8).unwrap());
+            }
+        }
+
+        // Allocating the same size now reclaims the abandoned pages.
+        let h = test_heap();
+        let mut reclaimed = alloc::vec::Vec::new();
+        for _ in 0..500 {
+            reclaimed.push(h.alloc(300).unwrap());
+        }
+        let ab_after = sp.abandoned_len(b);
+        assert!(
+            ab_after < ab_before,
+            "allocation should reclaim abandoned pages ({ab_before} -> {ab_after})"
+        );
+        // SAFETY: reclaimed blocks are owned by this thread's heap now.
+        unsafe {
+            for p in reclaimed {
                 free(p);
             }
         }
