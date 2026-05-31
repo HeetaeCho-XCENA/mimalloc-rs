@@ -278,7 +278,10 @@ impl Heap {
         if align <= MI_INTPTR_SIZE {
             return self.alloc(size);
         }
-        let p = self.alloc(size + align - 1)?;
+        // Guard the over-allocation against overflow (e.g. a huge `size` with a
+        // large alignment) — return null rather than wrapping to a tiny block.
+        let total = size.checked_add(align - 1)?;
+        let p = self.alloc(total)?;
         let aligned = align_up(p.addr().get(), align);
         // SAFETY: `aligned - block_start < align <= block_size`, so the aligned
         // pointer stays within the same block.

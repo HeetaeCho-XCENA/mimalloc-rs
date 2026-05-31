@@ -170,7 +170,8 @@ fn aligned_at(size: usize, align: usize, offset: usize) -> Option<NonNull<u8>> {
     }
     // Over-allocate so an interior pointer `r` with `(r+offset) % align == 0`
     // fits in one block; `free` recovers the block start via the page-map.
-    let p = init::malloc(size + align)?;
+    // Guard against `size + align` overflow (return null rather than wrap).
+    let p = init::malloc(size.checked_add(align)?)?;
     let base = p.addr().get();
     let r = base + ((align - ((base + offset) & (align - 1))) & (align - 1));
     // SAFETY: `r` is within `[base, base+align)` and the block is ≥ size+align.
@@ -437,6 +438,11 @@ pub extern "C" fn mi_good_size(size: usize) -> usize {
 
 // ---------------------------------------------------------------------------
 // First-class heaps (`mi_heap_t*` == `*mut Heap`)
+//
+// Contract (matching mimalloc): a heap is owned by the thread that created it
+// via `mi_heap_new`; `mi_heap_*` allocation calls must be made only from that
+// thread (or under external synchronization). Blocks may be freed from any
+// thread (`mi_free` is heap-independent and routes owner-vs-cross-thread).
 // ---------------------------------------------------------------------------
 
 /// `mi_heap_new`: create a first-class heap (null on OOM).
@@ -701,6 +707,12 @@ mod tests {
             mi_free(pp);
             // invalid alignment (not power of two)
             assert_eq!(mi_posix_memalign(&mut pp, 24, 100), EINVAL);
+
+            // overflow guard: `size + align` must not wrap to a tiny block.
+            assert!(mi_malloc_aligned(usize::MAX, 16).is_null());
+            assert!(mi_malloc_aligned_at(usize::MAX, 64, 8).is_null());
+            assert!(mi_aligned_alloc(64, usize::MAX).is_null());
+            assert_eq!(mi_posix_memalign(&mut pp, 16, usize::MAX), ENOMEM);
         }
     }
 
