@@ -352,6 +352,70 @@ impl Heap {
     pub fn keys(&self) -> [usize; 2] {
         self.keys
     }
+
+    /// Reclaim memory held by this heap (mirrors `mi_heap_collect`): walk every
+    /// bin queue, drain each page's pending cross-thread + local frees, and
+    /// return now-empty pages to the arena so footprint tracks the live set.
+    ///
+    /// When `force` is set, collection is more aggressive: even the sole kept
+    /// page of a bin (normally retained to avoid rebuild churn — see
+    /// [`retire_page`]) is released. Otherwise the keep-sole rule is honored.
+    ///
+    /// This is a safe `&self` method but internally relies on owner-only access
+    /// to each page's local free lists and bin queues, exactly like
+    /// [`Page::collect_free`]. Per the documented `mi_heap_*` single-thread
+    /// contract it must be called from the heap's owning thread; calling it from
+    /// any other thread is a logic error (the blocks freed cross-thread are still
+    /// reclaimed safely, but the owner-only `Cell` accesses are not synchronized).
+    ///
+    /// Unlike the C `mi_heap_collect`, this does not (yet) purge empty arena
+    /// ranges back to the OS or merge per-thread statistics — `force` is more
+    /// aggressive only about releasing pages, not about driving down RSS. Those
+    /// are tracked as follow-up work (see the module header).
+    pub fn collect(&self, force: bool) {
+        // Owner-only contract: fail fast in hardened/test builds if a non-owning
+        // thread calls in (matches the C reference's owner-tid guard).
+        #[cfg(all(feature = "std", any(debug_assertions, feature = "secure")))]
+        debug_assert_eq!(
+            self.tid,
+            crate::init::current_tid(),
+            "Heap::collect called from a non-owning thread (mi_heap_* is owner-thread-only)"
+        );
+        for b in 0..MI_BIN_COUNT {
+            let mut cur = self.pages[b].first();
+            while !cur.is_null() {
+                // SAFETY: the bin queue holds valid pages owned by this heap.
+                let next = unsafe { (*cur).next.get() };
+                // SAFETY: owner thread; draining our own page's free lists.
+                unsafe { (*cur).collect_free() };
+                // SAFETY: owner thread; reading our own page's used count.
+                if unsafe { (*cur).is_all_free() } {
+                    if force {
+                        // Aggressive: release even the sole kept page. Clear any
+                        // fast-path entries pointing at it first so the direct
+                        // lookup can never dangle (the same guard `retire_page`
+                        // applies). Every page in `self.pages[b]` is heap-managed.
+                        for slot in self.pages_free_direct.iter() {
+                            if slot.get() == cur {
+                                slot.set(core::ptr::null_mut());
+                            }
+                        }
+                        // SAFETY: page is linked in this bin queue and empty;
+                        // its slice range was registered for it at creation.
+                        unsafe {
+                            self.pages[b].remove(cur);
+                            release_page_slices(cur);
+                        }
+                    } else {
+                        // SAFETY: empty, owner-held page with provenance set;
+                        // honors the keep-sole rule.
+                        unsafe { retire_page(cur) };
+                    }
+                }
+                cur = next;
+            }
+        }
+    }
 }
 
 /// Free a block previously returned by [`Heap::alloc`] (heap-independent).
@@ -717,6 +781,81 @@ mod tests {
             }
             let pages_after = h.pages[b].len();
             assert_eq!(pages_after, 1, "empty pages should retire to the kept page");
+        }
+    }
+
+    #[test]
+    fn collect_drains_and_retires() {
+        // Allocate a burst spanning several pages, free it all, then force a
+        // collect. `force` retires even the sole kept page, so every bin we
+        // exercised should drain to zero pages and the heap stays usable.
+        let h = test_heap();
+        let b = bin(200);
+        // SAFETY: pointers come from this heap and are freed on this thread.
+        unsafe {
+            let mut ptrs = alloc::vec::Vec::new();
+            for _ in 0..2000 {
+                ptrs.push(h.alloc(200).unwrap());
+            }
+            assert!(h.pages[b].len() >= 3, "expected several pages");
+            for p in ptrs {
+                free(p);
+            }
+            // Non-forced collect honors the keep-sole rule: one page remains.
+            h.collect(false);
+            assert_eq!(h.pages[b].len(), 1, "non-forced keeps the sole page");
+            // Forced collect releases even that page.
+            h.collect(true);
+            assert_eq!(h.pages[b].len(), 0, "force retires the sole page too");
+            // Heap is still usable after collection.
+            let q = h.alloc(200).unwrap();
+            core::ptr::write_bytes(q.as_ptr(), 0x33, 200);
+            free(q);
+        }
+    }
+
+    #[test]
+    fn collect_reclaims_cross_thread_frees() {
+        // The owner allocates N blocks; a worker thread frees them all
+        // cross-thread (pushed to xthread_free, NOT yet reclaimed — `used`
+        // stays elevated). After the worker joins, the owner runs `collect`,
+        // which drains the cross-thread frees and retires the emptied pages.
+        let h = test_heap();
+        let b = bin(64);
+        // SAFETY: pointers come from this heap; the worker only pushes to the
+        // atomic cross-thread stack (never touching owner-only state).
+        unsafe {
+            let n = 4000usize;
+            let mut ptrs = alloc::vec::Vec::new();
+            for _ in 0..n {
+                ptrs.push(h.alloc(64).unwrap());
+            }
+            let pages_at_peak = h.pages[b].len();
+            assert!(pages_at_peak >= 3, "expected several pages");
+            let addrs: alloc::vec::Vec<usize> = ptrs.iter().map(|p| p.addr().get()).collect();
+
+            // Free everything from another thread (cross-thread frees).
+            std::thread::spawn(move || {
+                for a in addrs {
+                    // free() only uses the address for the page-map lookup.
+                    free(NonNull::new(a as *mut u8).unwrap());
+                }
+            })
+            .join()
+            .unwrap();
+
+            // Cross-thread frees have not been collected yet, so the pages are
+            // still resident. Force a collect on the OWNER thread: it drains
+            // xthread_free and retires the now-empty pages.
+            h.collect(true);
+            assert_eq!(
+                h.pages[b].len(),
+                0,
+                "owner collect must reclaim cross-thread-freed pages"
+            );
+            // Heap remains usable.
+            let q = h.alloc(64).unwrap();
+            free(q);
         }
     }
 
