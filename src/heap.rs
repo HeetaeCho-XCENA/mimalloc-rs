@@ -245,6 +245,12 @@ impl Heap {
 pub unsafe fn free(ptr: NonNull<u8>) {
     let page_ptr = page_map::lookup(ptr.addr().get()) as *mut Page;
     if page_ptr.is_null() {
+        // Freeing a pointer this allocator never handed out.
+        #[cfg(any(feature = "secure", feature = "debug"))]
+        report_corruption_and_abort(
+            "mimalloc-rs: invalid free (pointer not owned by this allocator)\n",
+        );
+        #[cfg(not(any(feature = "secure", feature = "debug")))]
         return;
     }
     // Normalize to the block start (supports interior pointers) using only the
@@ -270,6 +276,20 @@ pub unsafe fn free(ptr: NonNull<u8>) {
             // Owner path: deferred local free (touches owner-only `Cell`s).
             // SAFETY: this thread owns the page.
             unsafe {
+                // Hardened builds: detect frees of pointers outside the block
+                // area and double frees before mutating the free list.
+                #[cfg(any(feature = "secure", feature = "debug"))]
+                {
+                    let page = &*page_ptr;
+                    if !page.contains(block.as_ptr()) {
+                        report_corruption_and_abort(
+                            "mimalloc-rs: invalid free (pointer outside page block area)\n",
+                        );
+                    }
+                    if page.owner_lists_contain(block.as_ptr() as *mut crate::free_list::Block) {
+                        report_corruption_and_abort("mimalloc-rs: double free detected\n");
+                    }
+                }
                 (*page_ptr).free_local(block);
                 // If the page is now fully free, retire it (return its slices).
                 if (*page_ptr).is_all_free() {
@@ -292,6 +312,27 @@ pub unsafe fn free(ptr: NonNull<u8>) {
             if (*page_ptr).is_all_free() {
                 retire_page(page_ptr);
             }
+        }
+    }
+}
+
+/// Report memory corruption (invalid/double free) and abort. Hardened builds
+/// only (`secure`/`debug`); mirrors mimalloc's fail-fast on detected misuse.
+#[cfg(any(feature = "secure", feature = "debug"))]
+#[cold]
+#[inline(never)]
+fn report_corruption_and_abort(msg: &str) -> ! {
+    <crate::prim::DefaultPrim as crate::prim::Prim>::out_stderr(msg);
+    #[cfg(feature = "std")]
+    {
+        std::process::abort()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        // No portable abort without std; halt this thread so the corruption
+        // cannot propagate (embedders may install their own panic/abort hook).
+        loop {
+            core::hint::spin_loop();
         }
     }
 }

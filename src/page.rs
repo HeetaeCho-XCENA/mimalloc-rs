@@ -153,9 +153,10 @@ impl Page {
             .xthread_free
             .swap(core::ptr::null_mut(), Ordering::Acquire);
         while !tf.is_null() {
-            // SAFETY: `tf` blocks were published by freeing threads; the raw next
-            // link was stored in the block's first word (a `*mut Block`).
-            let next = unsafe { core::ptr::read(tf as *const *mut Block) };
+            // SAFETY: `tf` blocks were published by freeing threads via
+            // `set_next`, so the link is decoded the same way (encoded under
+            // `secure`/`debug`).
+            let next = unsafe { (*tf).next(self.keys) };
             // SAFETY: `tf` is a valid block slot owned by this page.
             unsafe {
                 (*tf).set_next(self.free.get(), self.keys);
@@ -226,22 +227,53 @@ impl Page {
     /// `page` is a live page header; `block` is a live block of that page no
     /// longer used by the caller.
     pub unsafe fn thread_free_push(page: *mut Page, block: NonNull<u8>) {
-        // SAFETY: project to the atomic head only.
+        // SAFETY: project to the atomic head and read the const keys only.
         let head = unsafe { &*core::ptr::addr_of!((*page).xthread_free) };
+        let keys = unsafe { Page::raw_keys(page) };
         let bp = block.as_ptr() as *mut Block;
+        // The next link is written through `Block::set_next`, so it shares the
+        // owner free list's (optionally encoded) representation — under `secure`/
+        // `debug` the cross-thread links are encoded too, not stored in the clear.
+        // SAFETY: the block is exclusively ours until the CAS publishes it.
+        let b = unsafe { &*(bp as *const Block) };
         loop {
             let cur = head.load(Ordering::Acquire);
-            // Store the previous head as this block's raw next link. The block is
-            // exclusively ours until the CAS publishes it.
             // SAFETY: `block` is writable and at least pointer-sized.
             unsafe {
-                core::ptr::write(block.as_ptr() as *mut *mut Block, cur);
+                b.set_next(cur, keys);
             }
             match head.compare_exchange_weak(cur, bp, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return,
                 Err(_) => core::hint::spin_loop(),
             }
         }
+    }
+
+    /// Const free-list keys, read via raw projection (immutable after init).
+    ///
+    /// # Safety
+    /// `page` must point at a live page header.
+    #[inline]
+    pub unsafe fn raw_keys(page: *mut Page) -> [usize; 2] {
+        // SAFETY: `keys` is set once at init and never mutated.
+        unsafe { core::ptr::read(core::ptr::addr_of!((*page).keys)) }
+    }
+
+    /// (hardened builds) Is `block` already on this page's owner free lists?
+    /// Used by [`crate::heap::free`] to detect double frees. Owner-only;
+    /// `O(|free| + |local_free|)`, acceptable under `secure`/`debug`.
+    #[cfg(any(feature = "secure", feature = "debug"))]
+    pub fn owner_lists_contain(&self, block: *mut Block) -> bool {
+        for mut p in [self.free.get(), self.local_free.get()] {
+            while !p.is_null() {
+                if core::ptr::eq(p, block) {
+                    return true;
+                }
+                // SAFETY: `p` is a valid free block on an owner list.
+                p = unsafe { (*p).next(self.keys) };
+            }
+        }
+        false
     }
 
     /// Allocate one block, or `None` if the page is full.
@@ -490,6 +522,30 @@ mod tests {
                 // writing p1 must not have touched p0
                 assert_eq!(*p0.as_ptr(), 0x11);
                 assert_eq!(*p1.as_ptr(), 0x22);
+            }
+        });
+    }
+
+    /// Hardened-build double-free detection primitive: a freed block must be
+    /// discoverable on the owner free lists (which is how `free` rejects a
+    /// second free of the same pointer).
+    #[cfg(any(feature = "secure", feature = "debug"))]
+    #[test]
+    fn detects_freed_block_for_double_free_guard() {
+        with_page(64, |page| {
+            // SAFETY: block comes from this page.
+            unsafe {
+                let a = page.alloc().unwrap();
+                let ab = a.as_ptr() as *mut crate::free_list::Block;
+                assert!(
+                    !page.owner_lists_contain(ab),
+                    "a live block is not on a free list"
+                );
+                page.free_local(a);
+                assert!(
+                    page.owner_lists_contain(ab),
+                    "a freed block must be detectable (double-free guard)"
+                );
             }
         });
     }
