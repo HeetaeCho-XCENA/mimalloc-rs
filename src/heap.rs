@@ -15,6 +15,7 @@
 use core::cell::Cell;
 use core::ptr::NonNull;
 
+use crate::arena_meta::{meta_free, meta_zalloc};
 use crate::bits::{
     bin, wsize_from_size, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_HUGE, MI_INTPTR_SIZE,
     MI_LARGE_MAX_OBJ_SIZE, MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_PAGES_DIRECT,
@@ -113,6 +114,60 @@ impl Heap {
             pages: [const { PageQueue::new() }; MI_BIN_COUNT],
             pages_free_direct: [const { Cell::new(core::ptr::null_mut()) }; MI_PAGES_DIRECT],
         }
+    }
+
+    /// Allocate a first-class heap from metadata memory (mirrors `mi_heap_new`).
+    /// The returned heap is owned by `tid` and must be released with
+    /// [`Heap::delete`] (keeps live blocks valid) or [`Heap::destroy`] (frees
+    /// all its blocks at once). Returns `None` on metadata OOM.
+    pub fn new_boxed(keys: [usize; 2], tid: usize) -> Option<NonNull<Heap>> {
+        let mem = meta_zalloc(core::mem::size_of::<Heap>())?;
+        let p = mem.as_ptr() as *mut Heap;
+        // SAFETY: `mem` is a zeroed, suitably sized/aligned metadata block.
+        unsafe { p.write(Heap::new(keys, tid)) };
+        NonNull::new(p)
+    }
+
+    /// Delete a first-class heap (mirrors `mi_heap_delete`): hands off its pages
+    /// via the normal drop path (empty pages released, non-empty abandoned so
+    /// outstanding blocks stay valid and reclaimable), then frees the heap.
+    ///
+    /// # Safety
+    /// `heap` must come from [`Heap::new_boxed`] and not be used afterwards.
+    pub unsafe fn delete(heap: NonNull<Heap>) {
+        // SAFETY: runs Heap::drop (abandon/release), then frees the struct.
+        unsafe {
+            core::ptr::drop_in_place(heap.as_ptr());
+            meta_free(heap.cast::<u8>(), core::mem::size_of::<Heap>());
+        }
+    }
+
+    /// Destroy a first-class heap (mirrors `mi_heap_destroy`): free **all** of
+    /// its pages and their blocks in bulk, then free the heap. All pointers
+    /// allocated from this heap become invalid.
+    ///
+    /// # Safety
+    /// `heap` must come from [`Heap::new_boxed`], no block of it may be used
+    /// afterwards, and no other thread may touch it.
+    pub unsafe fn destroy(heap: NonNull<Heap>) {
+        // SAFETY: caller guarantees exclusive, final access.
+        let h = unsafe { heap.as_ref() };
+        for b in 0..MI_BIN_COUNT {
+            let mut cur = h.pages[b].first();
+            while !cur.is_null() {
+                // SAFETY: queue holds valid pages owned by this heap.
+                let next = unsafe { (*cur).next.get() };
+                // SAFETY: bulk free — return the slices regardless of `used`.
+                unsafe {
+                    h.pages[b].remove(cur);
+                    release_page_slices(cur);
+                }
+                cur = next;
+            }
+        }
+        // Free the heap struct itself (no Drop: its pages are already released).
+        // SAFETY: heap memory is a metadata block no longer referenced.
+        unsafe { meta_free(heap.cast::<u8>(), core::mem::size_of::<Heap>()) };
     }
 
     #[inline]
@@ -248,7 +303,7 @@ impl Heap {
         let tseq = self.next_tseq();
         // `eager_commit` (option) controls whether a freshly reserved arena is
         // committed up front or committed per-slice on demand (lower RSS).
-        let eager = crate::options::options().eager_commit;
+        let eager = crate::options::eager_commit();
         let (arena, idx, p) = self.subproc.alloc_slices(slices, eager, tseq)?;
         // SAFETY: `p` is `slices` committed, slice-aligned slices owned by us.
         let page = unsafe { Page::init(p, idx, slices, bs, self.keys) };

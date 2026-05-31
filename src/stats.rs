@@ -75,6 +75,18 @@ pub struct Stats {
     pub pages_created: u64,
 }
 
+/// Reset all process counters to zero (no-op unless `stats`).
+pub fn reset() {
+    #[cfg(feature = "stats")]
+    {
+        ALLOC_COUNT.store(0, Ordering::Relaxed);
+        FREE_COUNT.store(0, Ordering::Relaxed);
+        CURRENT_BYTES.store(0, Ordering::Relaxed);
+        PEAK_BYTES.store(0, Ordering::Relaxed);
+        PAGES_CREATED.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Read the current statistics (zeros unless `stats`).
 pub fn snapshot() -> Stats {
     #[cfg(feature = "stats")]

@@ -1,38 +1,80 @@
 // SPDX-License-Identifier: MIT
 //! Runtime options (ports a subset of `src/options.c`).
 //!
-//! mimalloc exposes ~30 `MIMALLOC_*` environment options. This port wires the
-//! mechanism (parsed once at startup) and a representative set of options;
-//! `eager_commit` is connected to arena reservation behavior, the rest are
-//! parsed and exposed for callers/diagnostics. The full table is follow-up work.
+//! Options are seeded once from `MIMALLOC_*` environment variables and are
+//! **runtime-settable** (atomic), backing the `mi_option_*` C API. A
+//! representative set is wired to behavior (`eager_commit` → arena reservation);
+//! the rest are stored and exposed. The full ~30-option table is follow-up work.
+
+use core::sync::atomic::{AtomicI64, Ordering};
 
 use crate::prim::{DefaultPrim, Prim};
 use crate::sync::OnceBox;
 
-/// Parse a boolean env option (`1/y/t` ⇒ true), defaulting to `default`.
-fn env_bool(name: &str, default: bool) -> bool {
-    let mut buf = [0u8; 64];
-    match DefaultPrim::getenv(name, &mut buf) {
-        Some(n) if n > 0 => matches!(buf[0], b'1' | b'y' | b'Y' | b't' | b'T'),
-        _ => default,
+/// Option identifiers (a subset of `mi_option_t`; values are the C API indices).
+#[repr(i32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Opt {
+    /// `MIMALLOC_VERBOSE`: emit diagnostics.
+    Verbose = 0,
+    /// `MIMALLOC_SHOW_STATS`: print stats at exit.
+    ShowStats = 1,
+    /// `MIMALLOC_EAGER_COMMIT`: commit new arenas up front (wired).
+    EagerCommit = 2,
+    /// `MIMALLOC_PURGE_DECOMMITS`: purge by decommit vs reset.
+    PurgeDecommits = 3,
+    /// `MIMALLOC_PURGE_DELAY`: ms before purging freed memory (`-1` disables).
+    PurgeDelay = 4,
+    /// `MIMALLOC_ARENA_RESERVE`: slices reserved when growing the pool.
+    ArenaReserve = 5,
+}
+
+/// Number of options.
+pub const OPT_COUNT: usize = 6;
+
+impl Opt {
+    /// Map a C API option index to an `Opt`.
+    pub fn from_index(i: i32) -> Option<Opt> {
+        match i {
+            0 => Some(Opt::Verbose),
+            1 => Some(Opt::ShowStats),
+            2 => Some(Opt::EagerCommit),
+            3 => Some(Opt::PurgeDecommits),
+            4 => Some(Opt::PurgeDelay),
+            5 => Some(Opt::ArenaReserve),
+            _ => None,
+        }
+    }
+
+    fn env_name(self) -> &'static str {
+        match self {
+            Opt::Verbose => "MIMALLOC_VERBOSE",
+            Opt::ShowStats => "MIMALLOC_SHOW_STATS",
+            Opt::EagerCommit => "MIMALLOC_EAGER_COMMIT",
+            Opt::PurgeDecommits => "MIMALLOC_PURGE_DECOMMITS",
+            Opt::PurgeDelay => "MIMALLOC_PURGE_DELAY",
+            Opt::ArenaReserve => "MIMALLOC_ARENA_RESERVE",
+        }
+    }
+
+    fn default_value(self) -> i64 {
+        match self {
+            Opt::EagerCommit => 1,
+            Opt::PurgeDelay => 10,
+            _ => 0,
+        }
     }
 }
 
-/// Parse a signed-integer env option, defaulting to `default`.
-fn env_long(name: &str, default: i64) -> i64 {
-    let mut buf = [0u8; 64];
-    match DefaultPrim::getenv(name, &mut buf) {
-        Some(n) if n > 0 => parse_i64(&buf[..n]).unwrap_or(default),
-        _ => default,
-    }
-}
+static VALUES: [AtomicI64; OPT_COUNT] = [const { AtomicI64::new(0) }; OPT_COUNT];
+static INIT: OnceBox<()> = OnceBox::new();
 
 fn parse_i64(b: &[u8]) -> Option<i64> {
     let (neg, digits) = match b.first() {
         Some(b'-') => (true, &b[1..]),
         _ => (false, b),
     };
-    if digits.is_empty() {
+    if digits.is_empty() || !digits[0].is_ascii_digit() {
         return None;
     }
     let mut v: i64 = 0;
@@ -45,36 +87,65 @@ fn parse_i64(b: &[u8]) -> Option<i64> {
     Some(if neg { -v } else { v })
 }
 
-/// The (lazily initialized) process options (mirrors `mi_option_t`).
-#[derive(Clone, Copy, Debug)]
-pub struct Options {
-    /// `MIMALLOC_VERBOSE`: emit diagnostics to stderr.
-    pub verbose: bool,
-    /// `MIMALLOC_SHOW_STATS`: print stats at exit.
-    pub show_stats: bool,
-    /// `MIMALLOC_EAGER_COMMIT`: commit new arenas up front (vs commit-on-demand).
-    /// Wired into arena reservation.
-    pub eager_commit: bool,
-    /// `MIMALLOC_PURGE_DECOMMITS`: purge by decommit (return RSS) vs reset.
-    pub purge_decommits: bool,
-    /// `MIMALLOC_PURGE_DELAY`: delay in ms before purging freed memory
-    /// (`-1` disables purging). Parsed; delay-timer purging is follow-up.
-    pub purge_delay: i64,
-    /// `MIMALLOC_ARENA_RESERVE`: slices reserved when growing the arena pool.
-    pub arena_reserve: i64,
+/// Read an option's value from the environment, or its default.
+fn env_value(opt: Opt) -> i64 {
+    let mut buf = [0u8; 64];
+    match DefaultPrim::getenv(opt.env_name(), &mut buf) {
+        Some(n) if n > 0 => {
+            let b = &buf[..n];
+            if b[0].is_ascii_digit() || b[0] == b'-' {
+                parse_i64(b).unwrap_or_else(|| opt.default_value())
+            } else if matches!(b[0], b'y' | b'Y' | b't' | b'T') {
+                1
+            } else {
+                0
+            }
+        }
+        _ => opt.default_value(),
+    }
 }
 
-/// Read the process options (parsed once from the environment).
-pub fn options() -> &'static Options {
-    static OPTS: OnceBox<Options> = OnceBox::new();
-    OPTS.get_or_init(|| Options {
-        verbose: env_bool("MIMALLOC_VERBOSE", false),
-        show_stats: env_bool("MIMALLOC_SHOW_STATS", false),
-        eager_commit: env_bool("MIMALLOC_EAGER_COMMIT", true),
-        purge_decommits: env_bool("MIMALLOC_PURGE_DECOMMITS", false),
-        purge_delay: env_long("MIMALLOC_PURGE_DELAY", 10),
-        arena_reserve: env_long("MIMALLOC_ARENA_RESERVE", 0),
-    })
+fn ensure_init() {
+    INIT.get_or_init(|| {
+        for (i, slot) in VALUES.iter().enumerate() {
+            if let Some(opt) = Opt::from_index(i as i32) {
+                slot.store(env_value(opt), Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+/// Get an option's current value.
+pub fn get(opt: Opt) -> i64 {
+    ensure_init();
+    VALUES[opt as usize].load(Ordering::Relaxed)
+}
+
+/// Set an option's value at runtime.
+pub fn set(opt: Opt, value: i64) {
+    ensure_init();
+    VALUES[opt as usize].store(value, Ordering::Relaxed);
+}
+
+/// Is a (boolean) option enabled (non-zero)?
+pub fn is_enabled(opt: Opt) -> bool {
+    get(opt) != 0
+}
+
+/// Enable a boolean option.
+pub fn enable(opt: Opt) {
+    set(opt, 1);
+}
+
+/// Disable a boolean option.
+pub fn disable(opt: Opt) {
+    set(opt, 0);
+}
+
+/// Convenience: whether new arenas are committed eagerly (wired into arenas).
+#[inline]
+pub fn eager_commit() -> bool {
+    is_enabled(Opt::EagerCommit)
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -82,18 +153,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn options_stable_and_defaulted() {
-        let a = options();
-        let b = options();
-        assert_eq!(a.verbose, b.verbose);
-        assert!(a.eager_commit); // default true
+    fn defaults_and_runtime_set() {
+        assert!(is_enabled(Opt::EagerCommit)); // default on
+        let prev = get(Opt::PurgeDelay);
+        set(Opt::PurgeDelay, 42);
+        assert_eq!(get(Opt::PurgeDelay), 42);
+        set(Opt::PurgeDelay, prev); // restore (shared global)
+
+        disable(Opt::Verbose);
+        assert!(!is_enabled(Opt::Verbose));
+        enable(Opt::Verbose);
+        assert!(is_enabled(Opt::Verbose));
+        disable(Opt::Verbose);
+
+        assert_eq!(Opt::from_index(2), Some(Opt::EagerCommit));
+        assert_eq!(Opt::from_index(99), None);
     }
 
     #[test]
     fn parse_ints() {
         assert_eq!(parse_i64(b"42"), Some(42));
         assert_eq!(parse_i64(b"-7"), Some(-7));
-        assert_eq!(parse_i64(b"10abc"), Some(10));
+        assert_eq!(parse_i64(b"y"), None);
         assert_eq!(parse_i64(b""), None);
     }
 }
