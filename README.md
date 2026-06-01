@@ -75,6 +75,25 @@ Pointers allocated before interposition (or by paths we don't intercept) are
 detected by arena-membership and forwarded to the real system allocator, so
 mixing is safe.
 
+#### Verifying
+
+`scripts/preload-check.sh` is the end-to-end proof: it builds the override
+cdylib (into an isolated `target/preload`), compiles an unmodified C probe, and
+asserts that under `LD_PRELOAD` **every** `malloc` is served by this allocator
+(`mi_is_in_heap_region(p) == true` for all of them — `ours == total`). It also
+smoke-tests a real system binary (`/bin/ls`) under preload to confirm
+transparent replacement doesn't crash it. It exits non-zero on any failure, and
+is a clean no-op (exit 0, "SKIP") on machines without a C compiler.
+
+```sh
+bash scripts/preload-check.sh   # → PRELOAD CHECK: PASS
+```
+
+The `preload` CI job runs this on every push, so transparent override is
+validated continuously. (A `#[ignore]`d `tests/preload.rs` wraps the same
+script for local convenience — run with
+`cargo test --features override --test preload -- --ignored`.)
+
 ## Features
 
 | feature   | default | effect                                                        |
