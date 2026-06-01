@@ -7,3 +7,9 @@
 # OMC orchestration working state
 /.omc
 /.omx
+
+# Profiling artifacts (perf record / cargo-flamegraph)
+perf.data
+perf.data.old
+*.perf
+flamegraph.svg
