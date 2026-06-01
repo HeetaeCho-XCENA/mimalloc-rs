@@ -62,6 +62,11 @@ pub struct Page {
     /// Bin-queue links (owned by the heap).
     pub next: Cell<*mut Page>,
     pub prev: Cell<*mut Page>,
+    /// Whether this page currently lives in its heap's `MI_BIN_FULL` queue
+    /// (full, evicted from the per-bin search queue) rather than `pages[bin]`.
+    /// Owner-only; lets a local free move it back (`unfull`). The page is in
+    /// exactly one of the two queues at all times.
+    in_full: Cell<bool>,
     /// Provenance of the page within its arena.
     pub slice_index: usize,
     pub slice_count: usize,
@@ -122,6 +127,7 @@ impl Page {
                 keys,
                 next: Cell::new(core::ptr::null_mut()),
                 prev: Cell::new(core::ptr::null_mut()),
+                in_full: Cell::new(false),
                 slice_index,
                 slice_count,
                 heap: Cell::new(core::ptr::null_mut()),
@@ -393,6 +399,19 @@ impl Page {
     #[inline]
     pub fn bin(&self) -> u32 {
         self.bin.get()
+    }
+
+    /// Whether the page is in its heap's `MI_BIN_FULL` queue (owner-only).
+    #[inline]
+    pub fn in_full(&self) -> bool {
+        self.in_full.get()
+    }
+
+    /// Record whether the page is in the `MI_BIN_FULL` queue (owner-only; set
+    /// in the same step as the queue move so the flag and membership never drift).
+    #[inline]
+    pub fn set_in_full(&self, v: bool) {
+        self.in_full.set(v);
     }
 
     /// Migrate cross-thread + local frees into the `free` list (owner path).

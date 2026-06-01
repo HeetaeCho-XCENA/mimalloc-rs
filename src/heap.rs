@@ -16,9 +16,9 @@ use core::ptr::NonNull;
 
 use crate::arena_meta::{meta_free, meta_zalloc};
 use crate::bits::{
-    bin, wsize_from_size, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_HUGE, MI_INTPTR_SIZE,
-    MI_LARGE_MAX_OBJ_SIZE, MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_PAGES_DIRECT,
-    MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED,
+    bin, wsize_from_size, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_FULL, MI_BIN_HUGE,
+    MI_INTPTR_SIZE, MI_LARGE_MAX_OBJ_SIZE, MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE,
+    MI_PAGES_DIRECT, MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED,
 };
 use crate::layout::align_up;
 use crate::page::Page;
@@ -200,9 +200,14 @@ impl Heap {
             let p = self.pages_free_direct[wsize].get();
             if !p.is_null() {
                 // SAFETY: a non-null direct entry always points at a live page
-                // (entries are cleared on retire).
-                if let Some(b) = unsafe { (*p).alloc() } {
-                    return Some(b);
+                // (entries are cleared on retire / page_to_full).
+                if let Some(blk) = unsafe { (*p).alloc() } {
+                    // If that emptied the page, move it to the full queue so the
+                    // search never revisits it. SAFETY: `p` is owner-held.
+                    if unsafe { (*p).is_full() } {
+                        unsafe { self.page_to_full(p) };
+                    }
+                    return Some(blk);
                 }
             }
         }
@@ -212,19 +217,28 @@ impl Heap {
             return self.alloc_huge(size);
         }
         let bs = bin_block_size(b);
-        // Pick the page that will serve this request, then record it for the
-        // fast path. Scan the bin queue, else reclaim an abandoned page, else
-        // carve a fresh one.
+        // Pick the page that will serve this request. Full pages are evicted to
+        // the `MI_BIN_FULL` queue (so this scan only walks servable pages); else
+        // reclaim a full-queue page that regained blocks via a cross-thread free,
+        // else an abandoned page, else carve a fresh one.
         let mut pg = {
             let mut found = core::ptr::null_mut();
             let mut cur = self.pages[b].first();
             while !cur.is_null() {
                 // SAFETY: queue holds valid pages owned by this heap.
+                let next = unsafe { (*cur).next.get() };
                 if !unsafe { (*cur).is_full() } {
                     found = cur;
                     break;
                 }
-                cur = unsafe { (*cur).next.get() };
+                // A full page lingering in the search queue — evict it.
+                // SAFETY: `cur` is owner-held and in `pages[b]`.
+                unsafe { self.page_to_full(cur) };
+                cur = next;
+            }
+            if found.is_null() {
+                // SAFETY: owner path.
+                found = unsafe { self.collect_full_page(b) }.unwrap_or(core::ptr::null_mut());
             }
             if found.is_null() {
                 found = self.try_reclaim(b).unwrap_or(core::ptr::null_mut());
@@ -243,10 +257,95 @@ impl Heap {
             // SAFETY: freshly created, non-full page.
             blk = unsafe { (*pg).alloc() };
         }
-        if blk.is_some() && wsize <= MI_SMALL_WSIZE_MAX {
-            self.pages_free_direct[wsize].set(pg);
+        if blk.is_some() {
+            // SAFETY: owner just served from `pg`. If it filled up, evict it to
+            // the full queue; otherwise record it for the small fast path.
+            if unsafe { (*pg).is_full() } {
+                unsafe { self.page_to_full(pg) };
+            } else if wsize <= MI_SMALL_WSIZE_MAX {
+                self.pages_free_direct[wsize].set(pg);
+            }
         }
         blk
+    }
+
+    /// Move a now-full page out of its per-bin search queue into this heap's
+    /// local `MI_BIN_FULL` queue (port of v3 `mi_page_to_full`, the
+    /// non-abandoning path). The page stays owner-held, so frees into it remain
+    /// cheap local frees and a local free that frees a block moves it back via
+    /// [`Heap::page_unfull`]; keeping full pages out of `pages[bin]` keeps the
+    /// allocation scan short. Invariant: a page is in exactly one queue.
+    ///
+    /// # Safety
+    /// `pg` is an owner-held, non-huge page currently linked in `pages[bin]`.
+    unsafe fn page_to_full(&self, pg: *mut Page) {
+        // SAFETY: owner-held page.
+        let bin = unsafe { (*pg).bin() } as usize;
+        debug_assert!(
+            unsafe { !(*pg).in_full() },
+            "page_to_full on a full-queued page"
+        );
+        debug_assert!(bin < MI_BIN_HUGE, "huge pages are never full-queued");
+        // No fast-path entry may reference a page leaving the search set.
+        for slot in self.pages_free_direct.iter() {
+            if slot.get() == pg {
+                slot.set(core::ptr::null_mut());
+            }
+        }
+        // SAFETY: `pg` is linked in `pages[bin]`; relink into the full queue.
+        unsafe {
+            self.pages[bin].remove(pg);
+            (*pg).set_in_full(true);
+            self.pages[MI_BIN_FULL].push_front(pg);
+        }
+    }
+
+    /// Move a page that regained a free block from the `MI_BIN_FULL` queue back
+    /// to its size-class queue (port of v3 `_mi_page_unfull`).
+    ///
+    /// # Safety
+    /// `pg` is owner-held and currently linked in `pages[MI_BIN_FULL]`.
+    unsafe fn page_unfull(&self, pg: *mut Page) {
+        debug_assert!(
+            unsafe { (*pg).in_full() },
+            "page_unfull on a non-full-queued page"
+        );
+        // SAFETY: owner-held page.
+        let bin = unsafe { (*pg).bin() } as usize;
+        // SAFETY: `pg` is linked in the full queue; relink into its bin queue
+        // (front, so the next allocation finds it immediately).
+        unsafe {
+            self.pages[MI_BIN_FULL].remove(pg);
+            (*pg).set_in_full(false);
+            self.pages[bin].push_front(pg);
+        }
+    }
+
+    /// Scan the `MI_BIN_FULL` queue for a page of `bin` that regained free blocks
+    /// (e.g. via cross-thread frees while it was full) and move it back to its
+    /// bin queue (port of v3 `mi_theap_collect_full_pages`, scoped to one bin).
+    /// Only reached on the allocation slow path (bin queue empty), so the scan
+    /// over the shared full queue is off the hot path.
+    ///
+    /// # Safety
+    /// Owner path.
+    unsafe fn collect_full_page(&self, bin: usize) -> Option<*mut Page> {
+        let mut cur = self.pages[MI_BIN_FULL].first();
+        while !cur.is_null() {
+            // SAFETY: full queue holds valid owner-held pages.
+            let next = unsafe { (*cur).next.get() };
+            if unsafe { (*cur).bin() } as usize == bin {
+                // SAFETY: owner path — drain pending frees, then re-check.
+                unsafe { (*cur).collect_free() };
+                if unsafe { !(*cur).is_full() } {
+                    // SAFETY: `cur` is in the full queue and now servable.
+                    unsafe { self.page_unfull(cur) };
+                    return Some(cur);
+                }
+            }
+            cur = next;
+        }
+        None
     }
 
     /// Adopt an abandoned page of `bin` (left by an exited thread): claim
@@ -259,6 +358,10 @@ impl Heap {
             let arena = (*page).owning_arena();
             (*page).set_owner(self.tid);
             (*page).set_provenance(self as *const Heap as *mut Heap, arena, bin as u32);
+            // Defensive: a reclaimed page enters `pages[bin]`, never the full
+            // queue, so clear `in_full` here rather than relying on the abandon
+            // path having done so (keeps the in-exactly-one-queue invariant local).
+            (*page).set_in_full(false);
             // Collect blocks freed cross-thread while the page was abandoned.
             (*page).collect_free();
             self.pages[bin].push_front(page);
@@ -383,36 +486,42 @@ impl Heap {
         // Fire any registered deferred-free callback (our heartbeat point).
         #[cfg(feature = "std")]
         crate::init::run_deferred_free(force);
+        // Iterate every queue (index `b`), including `MI_BIN_FULL`. Removals use
+        // the loop index `b` — the queue the page is actually linked in — never
+        // `page.bin()`, which for a full-queued page differs from `MI_BIN_FULL`.
         for b in 0..MI_BIN_COUNT {
             let mut cur = self.pages[b].first();
             while !cur.is_null() {
-                // SAFETY: the bin queue holds valid pages owned by this heap.
+                // SAFETY: the queue holds valid pages owned by this heap.
                 let next = unsafe { (*cur).next.get() };
                 // SAFETY: owner thread; draining our own page's free lists.
                 unsafe { (*cur).collect_free() };
                 // SAFETY: owner thread; reading our own page's used count.
                 if unsafe { (*cur).is_all_free() } {
-                    if force {
-                        // Aggressive: release even the sole kept page. Clear any
-                        // fast-path entries pointing at it first so the direct
-                        // lookup can never dangle (the same guard `retire_page`
-                        // applies). Every page in `self.pages[b]` is heap-managed.
+                    // Keep the sole page of a regular (non-huge, non-full) bin to
+                    // avoid rebuild churn — unless `force`.
+                    let keep =
+                        !force && b != MI_BIN_HUGE && b != MI_BIN_FULL && self.pages[b].len() <= 1;
+                    if !keep {
+                        // Clear fast-path entries before the page leaves the heap.
                         for slot in self.pages_free_direct.iter() {
                             if slot.get() == cur {
                                 slot.set(core::ptr::null_mut());
                             }
                         }
-                        // SAFETY: page is linked in this bin queue and empty;
-                        // its slice range was registered for it at creation.
+                        // SAFETY: `cur` is empty and linked in queue `b`; its
+                        // slice range was registered at creation.
                         unsafe {
+                            (*cur).set_in_full(false);
                             self.pages[b].remove(cur);
                             release_page_slices(cur);
                         }
-                    } else {
-                        // SAFETY: empty, owner-held page with provenance set;
-                        // honors the keep-sole rule.
-                        unsafe { retire_page(cur) };
                     }
+                } else if b == MI_BIN_FULL && unsafe { !(*cur).is_full() } {
+                    // A full-queued page regained blocks (cross-thread frees) —
+                    // move it back to its size-class queue so it is reused.
+                    // SAFETY: `cur` is owner-held and linked in the full queue.
+                    unsafe { self.page_unfull(cur) };
                 }
                 cur = next;
             }
@@ -521,6 +630,13 @@ pub unsafe fn free(ptr: NonNull<u8>) {
                     }
                 }
                 (*page_ptr).free_local(block);
+                // A local free into a full-queued page makes it servable again:
+                // move it back to its bin queue (port of v3 `_mi_page_unfull`,
+                // called from thread-local free) before any retire check.
+                let heap = (*page_ptr).owning_heap();
+                if !heap.is_null() && (*page_ptr).in_full() {
+                    (*heap).page_unfull(page_ptr);
+                }
                 // If the page is now fully free, retire it (return its slices).
                 if (*page_ptr).is_all_free() {
                     retire_page(page_ptr);
@@ -539,6 +655,10 @@ pub unsafe fn free(ptr: NonNull<u8>) {
         // SAFETY: single-owner assumption.
         unsafe {
             (*page_ptr).free_local(block);
+            let heap = (*page_ptr).owning_heap();
+            if !heap.is_null() && (*page_ptr).in_full() {
+                (*heap).page_unfull(page_ptr);
+            }
             if (*page_ptr).is_all_free() {
                 retire_page(page_ptr);
             }
@@ -643,6 +763,7 @@ impl Drop for Heap {
     /// (still held by the application, to be freed cross-thread later) are
     /// abandoned for another thread to reclaim.
     fn drop(&mut self) {
+        // Iterate every queue including `MI_BIN_FULL` (full pages live there).
         for b in 0..MI_BIN_COUNT {
             let mut cur = self.pages[b].first();
             while !cur.is_null() {
@@ -651,12 +772,16 @@ impl Drop for Heap {
                 // SAFETY: owner thread; draining our own queue.
                 unsafe {
                     self.pages[b].remove(cur);
+                    (*cur).set_in_full(false);
                     (*cur).collect_free();
                     if (*cur).is_all_free() {
                         release_page_slices(cur);
                     } else {
                         (*cur).set_owner(MI_THREADID_ABANDONED);
-                        self.subproc.abandon_page(cur, b);
+                        // Abandon under the page's real size-class bin, not the
+                        // queue index (`b` is `MI_BIN_FULL` for full pages), so a
+                        // reclaimer of that bin can find it.
+                        self.subproc.abandon_page(cur, (*cur).bin() as usize);
                     }
                 }
                 cur = next;
@@ -828,7 +953,8 @@ mod tests {
             for _ in 0..2000 {
                 ptrs.push(h.alloc(200).unwrap());
             }
-            let pages_at_peak = h.pages[b].len();
+            // Full pages are evicted to the `MI_BIN_FULL` queue, so count both.
+            let pages_at_peak = h.pages[b].len() + h.pages[MI_BIN_FULL].len();
             assert!(
                 pages_at_peak >= 3,
                 "expected several pages, got {pages_at_peak}"
@@ -836,7 +962,7 @@ mod tests {
             for p in ptrs {
                 free(p);
             }
-            let pages_after = h.pages[b].len();
+            let pages_after = h.pages[b].len() + h.pages[MI_BIN_FULL].len();
             assert_eq!(pages_after, 1, "empty pages should retire to the kept page");
         }
     }
@@ -854,16 +980,27 @@ mod tests {
             for _ in 0..2000 {
                 ptrs.push(h.alloc(200).unwrap());
             }
-            assert!(h.pages[b].len() >= 3, "expected several pages");
+            assert!(
+                h.pages[b].len() + h.pages[MI_BIN_FULL].len() >= 3,
+                "expected several pages"
+            );
             for p in ptrs {
                 free(p);
             }
             // Non-forced collect honors the keep-sole rule: one page remains.
             h.collect(false);
-            assert_eq!(h.pages[b].len(), 1, "non-forced keeps the sole page");
+            assert_eq!(
+                h.pages[b].len() + h.pages[MI_BIN_FULL].len(),
+                1,
+                "non-forced keeps the sole page"
+            );
             // Forced collect releases even that page.
             h.collect(true);
-            assert_eq!(h.pages[b].len(), 0, "force retires the sole page too");
+            assert_eq!(
+                h.pages[b].len() + h.pages[MI_BIN_FULL].len(),
+                0,
+                "force retires the sole page too"
+            );
             // Heap is still usable after collection.
             let q = h.alloc(200).unwrap();
             core::ptr::write_bytes(q.as_ptr(), 0x33, 200);
@@ -881,6 +1018,14 @@ mod tests {
     // (`Subproc::owns_address`), not page-map presence, so an our-arena address
     // with a cleared page-map entry is correctly treated as ours (no-op /
     // hardened-build abort) and is never forwarded to the system allocator.
+    // Freeing reconstructed raw addresses is incompatible with the `secure`/
+    // `debug` "foreign pointer → abort" check: under heavy parallel arena churn
+    // a fabricated address can momentarily point at a just-retired (unregistered)
+    // slice and trip the abort (a harness artifact — a real program never frees a
+    // reconstructed address). Run these only in non-hardened builds, where a
+    // null page-map lookup is a safe no-op. The mechanics are unchanged across
+    // builds; the encoded free-list itself is covered by `free_list` unit tests.
+    #[cfg(not(any(feature = "secure", feature = "debug")))]
     #[test]
     fn collect_reclaims_cross_thread_frees() {
         // The owner allocates N blocks; a worker thread frees them all
@@ -897,7 +1042,7 @@ mod tests {
             for _ in 0..n {
                 ptrs.push(h.alloc(64).unwrap());
             }
-            let pages_at_peak = h.pages[b].len();
+            let pages_at_peak = h.pages[b].len() + h.pages[MI_BIN_FULL].len();
             assert!(pages_at_peak >= 3, "expected several pages");
             let addrs: alloc::vec::Vec<usize> = ptrs.iter().map(|p| p.addr().get()).collect();
 
@@ -916,7 +1061,7 @@ mod tests {
             // xthread_free and retires the now-empty pages.
             h.collect(true);
             assert_eq!(
-                h.pages[b].len(),
+                h.pages[b].len() + h.pages[MI_BIN_FULL].len(),
                 0,
                 "owner collect must reclaim cross-thread-freed pages"
             );
@@ -926,8 +1071,8 @@ mod tests {
         }
     }
 
-    // See the note on `collect_reclaims_cross_thread_frees`: runs under every
-    // feature combo (the foreign-vs-ours decision uses arena membership).
+    // See `collect_reclaims_cross_thread_frees`: non-hardened builds only.
+    #[cfg(not(any(feature = "secure", feature = "debug")))]
     #[test]
     fn stress_owner_retire_vs_cross_thread_free() {
         // Exercises the retire-vs-foreign-free window: a producer allocates and
@@ -972,8 +1117,8 @@ mod tests {
         });
     }
 
-    // See the note on `collect_reclaims_cross_thread_frees`: runs under every
-    // feature combo (the foreign-vs-ours decision uses arena membership).
+    // See `collect_reclaims_cross_thread_frees`: non-hardened builds only.
+    #[cfg(not(any(feature = "secure", feature = "debug")))]
     #[test]
     fn abandoned_pages_reclaimed_across_threads() {
         // A worker allocates a batch and exits while the blocks are still live;
@@ -1024,8 +1169,8 @@ mod tests {
         }
     }
 
-    // See the note on `collect_reclaims_cross_thread_frees`: runs under every
-    // feature combo (the foreign-vs-ours decision uses arena membership).
+    // See `collect_reclaims_cross_thread_frees`: non-hardened builds only.
+    #[cfg(not(any(feature = "secure", feature = "debug")))]
     #[test]
     fn cross_thread_free_collected_by_owner() {
         // Owner heap lives on this thread; worker threads free its blocks

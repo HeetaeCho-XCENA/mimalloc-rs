@@ -28,7 +28,12 @@ pub fn on_alloc(size: usize) {
     #[cfg(feature = "stats")]
     {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        let cur = CURRENT_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+        // Saturating: `CURRENT_BYTES` is a relaxed process-global approximation,
+        // so a concurrent `on_free` can momentarily drive it past this thread's
+        // read — never panic on the (debug) add overflow for a mere statistic.
+        let cur = CURRENT_BYTES
+            .fetch_add(size, Ordering::Relaxed)
+            .saturating_add(size);
         // Bump the peak high-water mark (a racy max is fine for a statistic).
         let mut peak = PEAK_BYTES.load(Ordering::Relaxed);
         while cur > peak {
@@ -49,7 +54,11 @@ pub fn on_free(size: usize) {
     #[cfg(feature = "stats")]
     {
         FREE_COUNT.fetch_add(1, Ordering::Relaxed);
-        CURRENT_BYTES.fetch_sub(size, Ordering::Relaxed);
+        // Saturating: keep the relaxed global counter from wrapping below zero
+        // when frees and allocs from concurrent threads interleave out of order.
+        let _ = CURRENT_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+            Some(c.saturating_sub(size))
+        });
     }
     #[cfg(not(feature = "stats"))]
     let _ = size;
@@ -118,7 +127,11 @@ mod tests {
         on_alloc(200);
         let mid = snapshot();
         assert!(mid.allocations >= before.allocations + 2);
-        assert!(mid.peak_bytes >= mid.current_bytes);
+        // NB: `peak >= current` is NOT asserted — the process-global `current`
+        // and `peak` are updated by separate atomics, so a concurrent test's
+        // `on_alloc` can raise `current` between our two reads (or after another
+        // thread read `current` but before it bumped `peak`), transiently making
+        // a snapshot show `current > peak`. Only monotonic counters are stable.
         on_free(100);
         on_free(200);
         let after = snapshot();
