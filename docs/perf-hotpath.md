@@ -109,3 +109,34 @@ cost on the benchmarked path. (Only `secure`/`debug` pay the rotate/xor.)
   Miri (strict-provenance) + loom + the cross-thread TSan stress.
 - This repo's CI box cannot profile (`perf_event_paranoid` high) and is noisy —
   authoritative measurements come from a controlled local run.
+
+## Isolation experiment (`examples/microbench.rs`) — instruction-count A/B
+
+`profile_alloc`/`bench_suite` mix per-iteration overhead (RNG, `Vec::swap_remove`,
+`Layout`, touch) into the loop. `microbench` strips all of it: a fixed size, a
+precomputed `Layout`, and a power-of-two ring (`i & mask`) — one alloc + one
+free per iter with only a mask/index/branch/store around them. It runs **one
+allocator per process** (`MB_ALLOC=rs|c|system`) so `perf stat` attributes its
+counters cleanly. Compare instruction counts:
+
+```sh
+RUSTFLAGS="-C debuginfo=1 -C force-frame-pointers=yes" cargo build --release --example microbench
+MB_ALLOC=rs perf stat -e instructions,cycles,L1-dcache-load-misses -- ./target/release/examples/microbench
+MIMALLOC_C_LIB=<dir> MB_ALLOC=c perf stat -e instructions,cycles,L1-dcache-load-misses -- ./target/release/examples/microbench
+# per-op (alloc+free) instruction delta = (rs_insn - c_insn) / (2 * MB_ROUNDS)
+```
+Reads: rs **more instructions** ⇒ leaner fast path can win (code); rs **similar
+instructions but more cycles/L1-misses** ⇒ microarchitectural (cache/TLS/ports),
+little to gain from shaving instructions. (The C reference is FFI-indirect, so a
+few thunk instructions are charged to `c` — biased *against* "rs has more".)
+
+### Finding so far (fixed vs mixed size)
+On the dev box, the **fixed-size** microbench (`size=64`) shows rs ≈ **91%** of
+C (444 vs 488 Mops/s — only ~9% behind), whereas `bench_suite` phase 1 (**mixed**
+`8..1032`) shows ~74%. So the gap is small on a single hot size class and
+**widens with size diversity** — pointing at the memory side (more bins → more
+pages → the 13.9% L1-miss working set) rather than a single hot instruction.
+This is consistent with the three point-fixes that measured **neutral**
+(aligned over-alloc, nightly TLS null-test, free-path divide skip): no single op
+dominates. The instruction-count A/B above decides whether the remaining lever
+is code-leanness or microarchitecture.

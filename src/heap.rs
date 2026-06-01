@@ -483,7 +483,17 @@ pub unsafe fn free(ptr: NonNull<u8>) {
         )
     };
     let off = ptr.addr().get() - pstart.addr();
-    let block_start = pstart.wrapping_add((off / bs) * bs);
+    // Fast path: a block-start pointer (`off == 0`) needs no normalization —
+    // skip the per-free integer division. This is the overwhelmingly common
+    // case (`malloc`/`free` of block-start pointers); only an *interior* pointer
+    // from a large-alignment allocation (`align > MI_MAX_ALIGN_SIZE`) takes the
+    // divide to recover its block start. Behavior is identical (`off == 0` makes
+    // the old `(off / bs) * bs` zero anyway).
+    let block_start = if off == 0 {
+        ptr.as_ptr()
+    } else {
+        pstart.wrapping_add((off / bs) * bs)
+    };
     // SAFETY: block_start is the start of a live block in this page.
     let block = unsafe { NonNull::new_unchecked(block_start) };
     crate::stats::on_free(bs);
