@@ -789,6 +789,438 @@ pub unsafe extern "C" fn mi_heap_realloc(
     np
 }
 
+/// `mi_heap_mallocn`: allocate `count * size` bytes from `heap` (overflow ⇒ null).
+///
+/// # Safety
+/// As [`mi_heap_malloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_mallocn(
+    heap: *mut Heap,
+    count: usize,
+    size: usize,
+) -> *mut c_void {
+    match checked_total(count, size) {
+        // SAFETY: forwarded contract.
+        Some(total) => unsafe { mi_heap_malloc(heap, total) },
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `mi_heap_reallocn`: resize `p` to `count * size` in `heap` (overflow ⇒ null).
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_reallocn(
+    heap: *mut Heap,
+    p: *mut c_void,
+    count: usize,
+    size: usize,
+) -> *mut c_void {
+    match checked_total(count, size) {
+        // SAFETY: forwarded contract.
+        Some(total) => unsafe { mi_heap_realloc(heap, p, total) },
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `mi_heap_reallocf` (BSD `reallocf`): resize `p` to `newsize` in `heap`; on
+/// failure the original `p` is freed before returning null.
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_reallocf(
+    heap: *mut Heap,
+    p: *mut c_void,
+    newsize: usize,
+) -> *mut c_void {
+    // SAFETY: forwarded contract.
+    let np = unsafe { mi_heap_realloc(heap, p, newsize) };
+    if np.is_null() && !p.is_null() {
+        // SAFETY: realloc failed and did not free `p`; free the original.
+        unsafe { mi_free(p) };
+    }
+    np
+}
+
+/// `mi_heap_strdup`: duplicate a NUL-terminated C string, allocating from `heap`.
+///
+/// # Safety
+/// `heap` is live; `s` is null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_strdup(heap: *mut Heap, s: *const c_char) -> *mut c_char {
+    if s.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: `s` is a valid C string per contract.
+    let len = unsafe { c_strlen(s) };
+    // SAFETY: forwarded contract.
+    let p = unsafe { mi_heap_malloc(heap, len + 1) };
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: dst valid for len+1; src valid for len+1 (incl NUL).
+    unsafe { core::ptr::copy_nonoverlapping(s as *const u8, p as *mut u8, len + 1) };
+    p as *mut c_char
+}
+
+/// `mi_heap_strndup`: duplicate at most `n` bytes of a C string, from `heap`.
+///
+/// # Safety
+/// `heap` is live; `s` is null or points to at least `min(strlen(s), n)`
+/// readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_strndup(
+    heap: *mut Heap,
+    s: *const c_char,
+    n: usize,
+) -> *mut c_char {
+    if s.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: `s` valid per contract.
+    let len = unsafe { c_strnlen(s, n) };
+    // SAFETY: forwarded contract.
+    let p = unsafe { mi_heap_malloc(heap, len + 1) };
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: copy `len` bytes then NUL-terminate.
+    unsafe {
+        core::ptr::copy_nonoverlapping(s as *const u8, p as *mut u8, len);
+        *(p as *mut u8).add(len) = 0;
+    }
+    p as *mut c_char
+}
+
+/// Allocate from `heap` so that `ptr + offset` is `align`-aligned.
+///
+/// # Safety
+/// `heap` is a live heap from [`mi_heap_new`], used from its owning thread.
+unsafe fn heap_aligned_at(
+    heap: *mut Heap,
+    size: usize,
+    align: usize,
+    offset: usize,
+) -> Option<NonNull<u8>> {
+    let h = NonNull::new(heap)?;
+    if !align.is_power_of_two() {
+        return None;
+    }
+    // SAFETY: live heap per contract.
+    let heap = unsafe { h.as_ref() };
+    if offset == 0 {
+        return heap.alloc_aligned(size, align.max(1));
+    }
+    // Over-allocate so an interior pointer `r` with `(r+offset) % align == 0`
+    // fits; `free` recovers the block start via the page-map. Guard against
+    // `size + align` overflow (return null rather than wrap).
+    let p = heap.alloc(size.checked_add(align)?)?;
+    let base = p.addr().get();
+    let r = base + ((align - ((base + offset) & (align - 1))) & (align - 1));
+    // SAFETY: `r` is within `[base, base+align)` and the block is ≥ size+align.
+    Some(unsafe { NonNull::new_unchecked(p.as_ptr().with_addr(r)) })
+}
+
+/// `mi_heap_malloc_aligned_at`.
+///
+/// # Safety
+/// As [`mi_heap_malloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_malloc_aligned_at(
+    heap: *mut Heap,
+    size: usize,
+    alignment: usize,
+    offset: usize,
+) -> *mut c_void {
+    // SAFETY: live heap per contract.
+    out(unsafe { heap_aligned_at(heap, size, alignment, offset) })
+}
+
+/// `mi_heap_zalloc_aligned`.
+///
+/// # Safety
+/// As [`mi_heap_malloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_zalloc_aligned(
+    heap: *mut Heap,
+    size: usize,
+    alignment: usize,
+) -> *mut c_void {
+    // SAFETY: live heap per contract.
+    let p = unsafe { heap_aligned_at(heap, size, alignment, 0) };
+    if let Some(nn) = p {
+        // SAFETY: valid for `size` bytes.
+        unsafe { core::ptr::write_bytes(nn.as_ptr(), 0, size) };
+    }
+    out(p)
+}
+
+/// `mi_heap_zalloc_aligned_at`.
+///
+/// # Safety
+/// As [`mi_heap_malloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_zalloc_aligned_at(
+    heap: *mut Heap,
+    size: usize,
+    alignment: usize,
+    offset: usize,
+) -> *mut c_void {
+    // SAFETY: live heap per contract.
+    let p = unsafe { heap_aligned_at(heap, size, alignment, offset) };
+    if let Some(nn) = p {
+        // SAFETY: valid for `size` bytes.
+        unsafe { core::ptr::write_bytes(nn.as_ptr(), 0, size) };
+    }
+    out(p)
+}
+
+/// `mi_heap_calloc_aligned` (overflow ⇒ null).
+///
+/// # Safety
+/// As [`mi_heap_malloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_calloc_aligned(
+    heap: *mut Heap,
+    count: usize,
+    size: usize,
+    alignment: usize,
+) -> *mut c_void {
+    match checked_total(count, size) {
+        // SAFETY: forwarded contract.
+        Some(total) => unsafe { mi_heap_zalloc_aligned(heap, total, alignment) },
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `mi_heap_calloc_aligned_at` (overflow ⇒ null).
+///
+/// # Safety
+/// As [`mi_heap_malloc`].
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_calloc_aligned_at(
+    heap: *mut Heap,
+    count: usize,
+    size: usize,
+    alignment: usize,
+    offset: usize,
+) -> *mut c_void {
+    match checked_total(count, size) {
+        // SAFETY: forwarded contract.
+        Some(total) => unsafe { mi_heap_zalloc_aligned_at(heap, total, alignment, offset) },
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `mi_heap_realloc_aligned`: resize `p` to `newsize` in `heap`, keeping the
+/// result `alignment`-aligned. `Heap` has no in-place aligned realloc, so this
+/// allocates a fresh aligned block, copies, and frees the old block.
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_realloc_aligned(
+    heap: *mut Heap,
+    p: *mut c_void,
+    newsize: usize,
+    alignment: usize,
+) -> *mut c_void {
+    let Some(nn) = NonNull::new(p as *mut u8) else {
+        // SAFETY: live heap per contract.
+        return out(unsafe { heap_aligned_at(heap, newsize, alignment, 0) });
+    };
+    // SAFETY: live allocation.
+    let old = unsafe { heap::usable_size(nn) };
+    // In-place reuse: if the block already fits and is still correctly aligned,
+    // return it unchanged (matches the C reference and keeps the pointer stable).
+    if newsize <= old
+        && alignment.max(1).is_power_of_two()
+        && nn.addr().get() % alignment.max(1) == 0
+    {
+        return p;
+    }
+    // SAFETY: live heap per contract.
+    let Some(np) = (unsafe { heap_aligned_at(heap, newsize, alignment, 0) }) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `np`/`nn` are valid for `min(old, newsize)` bytes and disjoint.
+    unsafe {
+        core::ptr::copy_nonoverlapping(nn.as_ptr(), np.as_ptr(), old.min(newsize));
+        init::free(nn);
+    }
+    out(Some(np))
+}
+
+/// `mi_heap_realloc_aligned_at`: like [`mi_heap_realloc_aligned`] but the result
+/// is `alignment`-aligned at `offset`.
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_realloc_aligned_at(
+    heap: *mut Heap,
+    p: *mut c_void,
+    newsize: usize,
+    alignment: usize,
+    offset: usize,
+) -> *mut c_void {
+    let Some(nn) = NonNull::new(p as *mut u8) else {
+        // SAFETY: live heap per contract.
+        return out(unsafe { heap_aligned_at(heap, newsize, alignment, offset) });
+    };
+    // SAFETY: live allocation.
+    let old = unsafe { heap::usable_size(nn) };
+    // In-place reuse: if the block already fits and `p + offset` is still
+    // correctly aligned, return it unchanged (matches the C reference).
+    if newsize <= old
+        && alignment.max(1).is_power_of_two()
+        && (nn.addr().get() + offset) % alignment.max(1) == 0
+    {
+        return p;
+    }
+    // SAFETY: live heap per contract.
+    let Some(np) = (unsafe { heap_aligned_at(heap, newsize, alignment, offset) }) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `np`/`nn` are valid for `min(old, newsize)` bytes and disjoint.
+    unsafe {
+        core::ptr::copy_nonoverlapping(nn.as_ptr(), np.as_ptr(), old.min(newsize));
+        init::free(nn);
+    }
+    out(Some(np))
+}
+
+/// `mi_heap_rezalloc`: resize `p` to `newsize` in `heap`, zeroing any grown tail.
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_rezalloc(
+    heap: *mut Heap,
+    p: *mut c_void,
+    newsize: usize,
+) -> *mut c_void {
+    // SAFETY: `p` is null or live.
+    let old = NonNull::new(p as *mut u8).map_or(0, |nn| unsafe { heap::usable_size(nn) });
+    // SAFETY: forwarded contract.
+    let np = unsafe { mi_heap_realloc(heap, p, newsize) };
+    if !np.is_null() && newsize > old {
+        // SAFETY: `np` is valid for `newsize` bytes; zero the grown tail.
+        unsafe { core::ptr::write_bytes((np as *mut u8).add(old), 0, newsize - old) };
+    }
+    np
+}
+
+/// `mi_heap_recalloc`: resize `p` to `newcount * size` in `heap` (overflow ⇒
+/// null), zeroing any grown tail.
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_recalloc(
+    heap: *mut Heap,
+    p: *mut c_void,
+    newcount: usize,
+    size: usize,
+) -> *mut c_void {
+    match checked_total(newcount, size) {
+        // SAFETY: forwarded contract.
+        Some(total) => unsafe { mi_heap_rezalloc(heap, p, total) },
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `mi_heap_rezalloc_aligned`: resize `p` to `newsize` in `heap`, keeping the
+/// result `alignment`-aligned and zeroing any grown tail.
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_rezalloc_aligned(
+    heap: *mut Heap,
+    p: *mut c_void,
+    newsize: usize,
+    alignment: usize,
+) -> *mut c_void {
+    // SAFETY: `p` is null or live.
+    let old = NonNull::new(p as *mut u8).map_or(0, |nn| unsafe { heap::usable_size(nn) });
+    // SAFETY: forwarded contract.
+    let np = unsafe { mi_heap_realloc_aligned(heap, p, newsize, alignment) };
+    if !np.is_null() && newsize > old {
+        // SAFETY: `np` is valid for `newsize` bytes; zero the grown tail.
+        unsafe { core::ptr::write_bytes((np as *mut u8).add(old), 0, newsize - old) };
+    }
+    np
+}
+
+/// `mi_heap_rezalloc_aligned_at`: like [`mi_heap_rezalloc_aligned`] but the
+/// result is `alignment`-aligned at `offset`.
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_rezalloc_aligned_at(
+    heap: *mut Heap,
+    p: *mut c_void,
+    newsize: usize,
+    alignment: usize,
+    offset: usize,
+) -> *mut c_void {
+    // SAFETY: `p` is null or live.
+    let old = NonNull::new(p as *mut u8).map_or(0, |nn| unsafe { heap::usable_size(nn) });
+    // SAFETY: forwarded contract.
+    let np = unsafe { mi_heap_realloc_aligned_at(heap, p, newsize, alignment, offset) };
+    if !np.is_null() && newsize > old {
+        // SAFETY: `np` is valid for `newsize` bytes; zero the grown tail.
+        unsafe { core::ptr::write_bytes((np as *mut u8).add(old), 0, newsize - old) };
+    }
+    np
+}
+
+/// `mi_heap_recalloc_aligned`: resize `p` to `newcount * size` in `heap`
+/// (overflow ⇒ null), keeping the result `alignment`-aligned and zeroing any
+/// grown tail.
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_recalloc_aligned(
+    heap: *mut Heap,
+    p: *mut c_void,
+    newcount: usize,
+    size: usize,
+    alignment: usize,
+) -> *mut c_void {
+    match checked_total(newcount, size) {
+        // SAFETY: forwarded contract.
+        Some(total) => unsafe { mi_heap_rezalloc_aligned(heap, p, total, alignment) },
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `mi_heap_recalloc_aligned_at`: like [`mi_heap_recalloc_aligned`] but the
+/// result is `alignment`-aligned at `offset`.
+///
+/// # Safety
+/// `heap` is live; `p` is null or a live allocation.
+#[no_mangle]
+pub unsafe extern "C" fn mi_heap_recalloc_aligned_at(
+    heap: *mut Heap,
+    p: *mut c_void,
+    newcount: usize,
+    size: usize,
+    alignment: usize,
+    offset: usize,
+) -> *mut c_void {
+    match checked_total(newcount, size) {
+        // SAFETY: forwarded contract.
+        Some(total) => unsafe { mi_heap_rezalloc_aligned_at(heap, p, total, alignment, offset) },
+        None => core::ptr::null_mut(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Collection
 // ---------------------------------------------------------------------------
@@ -1014,6 +1446,104 @@ mod tests {
             let q = mi_heap_malloc(h2, 32);
             mi_free(q); // free before delete so nothing is abandoned
             mi_heap_delete(h2);
+        }
+    }
+
+    #[test]
+    fn c_api_heap_variants() {
+        // SAFETY: standard mi_heap_* usage on one thread.
+        unsafe {
+            let h = mi_heap_new();
+            assert!(!h.is_null());
+
+            // mi_heap_mallocn: count*size, overflow guarded.
+            let n = mi_heap_mallocn(h, 8, 16);
+            assert!(!n.is_null());
+            assert!(mi_usable_size(n) >= 128);
+            assert!(mi_heap_mallocn(h, usize::MAX, 2).is_null());
+
+            // mi_heap_malloc_aligned_at: (ptr+offset) aligned.
+            let at = mi_heap_malloc_aligned_at(h, 64, 64, 8);
+            assert!(!at.is_null());
+            assert_eq!(((at as usize) + 8) % 64, 0);
+
+            // mi_heap_zalloc_aligned: aligned + zeroed.
+            let za = mi_heap_zalloc_aligned(h, 40, 128);
+            assert!(!za.is_null());
+            assert_eq!((za as usize) % 128, 0);
+            assert_eq!(*(za as *const u8), 0);
+
+            // mi_heap_calloc_aligned: aligned + zeroed; overflow guarded.
+            let ca = mi_heap_calloc_aligned(h, 4, 32, 64) as *mut u8;
+            assert!(!ca.is_null());
+            assert_eq!((ca as usize) % 64, 0);
+            assert_eq!(*ca.add(64), 0);
+            assert!(mi_heap_calloc_aligned(h, usize::MAX, 2, 16).is_null());
+
+            // mi_heap_realloc_aligned: pattern preserved across a grow.
+            let r0 = mi_heap_realloc_aligned(h, core::ptr::null_mut(), 32, 64) as *mut u8;
+            assert!(!r0.is_null());
+            core::ptr::write_bytes(r0, 0x5A, 32);
+            let r1 = mi_heap_realloc_aligned(h, r0 as *mut c_void, 4096, 64) as *mut u8;
+            assert!(!r1.is_null());
+            assert_eq!((r1 as usize) % 64, 0);
+            for i in 0..32 {
+                assert_eq!(*r1.add(i), 0x5A);
+            }
+
+            // mi_heap_recalloc: grown tail zeroed.
+            let c0 = mi_heap_malloc(h, 16);
+            core::ptr::write_bytes(c0 as *mut u8, 0xFF, 16);
+            let c1 = mi_heap_recalloc(h, c0, 1, 4096) as *mut u8;
+            assert!(!c1.is_null());
+            assert_eq!(*c1.add(2048), 0);
+
+            // mi_heap_strdup.
+            let d = mi_heap_strdup(h, c"hello".as_ptr());
+            assert!(!d.is_null());
+            assert_eq!(c_strlen(d), 5);
+
+            // mi_heap_reallocf: basic grow works.
+            let f0 = mi_heap_malloc(h, 8);
+            let f1 = mi_heap_reallocf(h, f0, 64);
+            assert!(!f1.is_null());
+            assert!(mi_usable_size(f1) >= 64);
+
+            // mi_heap_reallocn / mi_heap_strndup.
+            let rn = mi_heap_reallocn(h, core::ptr::null_mut(), 4, 32);
+            assert!(!rn.is_null() && mi_usable_size(rn) >= 128);
+            let sn = mi_heap_strndup(h, c"hello world".as_ptr(), 5);
+            assert_eq!(c_strlen(sn), 5);
+
+            // Offset-aligned resize path (the most intricate logic): allocate at
+            // an offset, write a pattern, grow via rezalloc_aligned_at, and assert
+            // the pattern is preserved, the new offset alignment holds, and the
+            // grown tail is zeroed.
+            let o0 = mi_heap_malloc_aligned_at(h, 48, 64, 8) as *mut u8;
+            assert_eq!((o0 as usize + 8) % 64, 0);
+            core::ptr::write_bytes(o0, 0x3C, 48);
+            let o1 = mi_heap_rezalloc_aligned_at(h, o0 as *mut c_void, 4096, 64, 8) as *mut u8;
+            assert!(!o1.is_null());
+            assert_eq!((o1 as usize + 8) % 64, 0);
+            for i in 0..48 {
+                assert_eq!(*o1.add(i), 0x3C, "offset rezalloc lost data");
+            }
+            assert_eq!(*o1.add(2048), 0, "grown tail not zeroed");
+
+            // In-place reuse: shrinking an aligned block returns the same pointer.
+            let s0 = mi_heap_malloc_aligned(h, 256, 64) as *mut u8;
+            let s1 = mi_heap_realloc_aligned(h, s0 as *mut c_void, 64, 64) as *mut u8;
+            assert_eq!(s0, s1, "in-place shrink should keep the pointer");
+
+            // overflow guards on aligned paths.
+            assert!(mi_heap_malloc_aligned_at(h, usize::MAX, 64, 8).is_null());
+            assert!(mi_heap_calloc_aligned(h, usize::MAX, 2, 16).is_null());
+            assert!(
+                mi_heap_recalloc_aligned(h, core::ptr::null_mut(), usize::MAX, 2, 64).is_null()
+            );
+
+            // Free all blocks at once via destroy (recovers offset-path blocks).
+            mi_heap_destroy(h);
         }
     }
 
