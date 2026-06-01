@@ -80,6 +80,32 @@ impl Subproc {
         self.arena_count.load(Ordering::Acquire)
     }
 
+    /// Whether `ptr` lies within any registered arena's reserved data region.
+    ///
+    /// This is an **address-range** test over the arenas this subproc owns. It
+    /// is independent of whether the specific slice is currently mapped to a
+    /// page in the page-map: a retired/recycled page returns false from
+    /// [`crate::page_map::lookup`] but its address is still inside the arena
+    /// (arenas are never unmapped back to the OS — [`Arena::free_slices`] only
+    /// flips bitmap bits). This is the semantically-correct basis for
+    /// `mi_is_in_heap_region` and for deciding "foreign vs ours" in the
+    /// `override` fallback, where a null page-map lookup alone is ambiguous
+    /// (it covers both genuinely foreign pointers and our own already-retired
+    /// or double-freed blocks).
+    pub fn owns_address(&self, ptr: *const u8) -> bool {
+        let count = self.arena_count();
+        for i in 0..count {
+            if let Some(arena) = self.arena_at(i) {
+                // SAFETY: registered arenas stay live for the process.
+                let a = unsafe { arena.as_ref() };
+                if a.slice_index_of(ptr).is_some() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Visit registered arenas in order.
     fn arena_at(&self, i: usize) -> Option<NonNull<Arena>> {
         NonNull::new(self.arenas[i].load(Ordering::Acquire))

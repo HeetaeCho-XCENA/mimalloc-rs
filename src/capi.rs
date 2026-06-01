@@ -660,6 +660,15 @@ pub extern "C" fn mi_malloc_good_size(size: usize) -> usize {
     heap::good_size(size)
 }
 
+/// `mi_is_in_heap_region`: whether `p` was allocated by this allocator.
+///
+/// # Safety
+/// `p` is any pointer value (not dereferenced).
+#[no_mangle]
+pub unsafe extern "C" fn mi_is_in_heap_region(p: *const c_void) -> bool {
+    heap::is_in_heap_region(p as *const u8)
+}
+
 // ---------------------------------------------------------------------------
 // First-class heaps (`mi_heap_t*` == `*mut Heap`)
 //
