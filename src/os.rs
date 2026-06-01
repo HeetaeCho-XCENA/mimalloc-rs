@@ -21,13 +21,13 @@ pub enum MemKind {
     None,
     /// Statically allocated; never freed.
     Static,
-    /// Allocated by the metadata allocator (`arena-meta`). (added in M3)
+    /// Allocated by the metadata allocator (`arena-meta`).
     Meta,
     /// Allocated directly from the OS.
     Os,
     /// Allocated as huge OS pages (pinned).
     OsHuge,
-    /// Carved from an arena. (added in M3)
+    /// Carved from an arena.
     Arena,
 }
 

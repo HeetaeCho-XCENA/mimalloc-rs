@@ -6,7 +6,7 @@
 //! (from OS randomness), and each thread gets its own [`Heap`] in thread-local
 //! storage on first use. The richer lifecycle — `pthread_key` thread-exit page
 //! handoff, reentrancy guards for `#[global_allocator]` init-before-main — is
-//! introduced alongside cross-thread free in M6/M7.
+//! follow-up work.
 //!
 //! The thread-local default heap requires the `std` feature; `no_std` embedders
 //! drive their own [`Heap`] instances directly.
@@ -356,8 +356,9 @@ mod tests {
 
     #[test]
     fn multithreaded_each_thread_own_heap() {
-        // Each thread allocates and frees its own pointers (no cross-thread free
-        // yet — that is M6). Verifies per-thread TLS heaps work concurrently.
+        // Each thread allocates and frees its own pointers; this exercises the
+        // per-thread TLS heaps working concurrently (cross-thread free is
+        // covered elsewhere).
         let handles: alloc::vec::Vec<_> = (0..8)
             .map(|t| {
                 std::thread::spawn(move || {

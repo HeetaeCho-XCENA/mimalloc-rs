@@ -13,6 +13,7 @@
 
 use core::cell::Cell;
 
+#[cfg(any(feature = "secure", feature = "debug"))]
 use crate::bits::{mi_rotl, mi_rotr};
 
 /// Whether free-list links are encoded (mirrors `MI_ENCODE_FREELIST`).
@@ -84,11 +85,6 @@ fn decode(x: usize, keys: [usize; 2]) -> *mut Block {
     let a = mi_rotr(x.wrapping_sub(keys[0]), keys[0]) ^ keys[1];
     core::ptr::with_exposed_provenance_mut(a)
 }
-
-// Keep the rotate imports used in the plain build too (silences unused warnings).
-#[cfg(not(any(feature = "secure", feature = "debug")))]
-#[allow(unused_imports)]
-use {mi_rotl as _r1, mi_rotr as _r2};
 
 #[cfg(all(test, not(any(feature = "secure", feature = "debug"))))]
 mod tests {
