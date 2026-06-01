@@ -55,6 +55,13 @@ pub mod init;
 pub mod layout;
 pub mod options;
 pub mod os;
+// The raw libc symbols are exported ONLY when the explicit `override_export`
+// cfg is set (in addition to the `override` feature) — see the module doc.
+// This keeps them out of every cargo `test`/`build` (unit AND integration
+// binaries), so they can never interpose a test harness; they are emitted only
+// for the deliberately-built preload cdylib/staticlib.
+#[cfg(all(feature = "override", override_export))]
+mod override_symbols;
 pub mod page;
 pub mod page_map;
 pub mod page_queue;
