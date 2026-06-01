@@ -1244,6 +1244,52 @@ pub unsafe extern "C" fn mi_heap_collect(heap: *mut Heap, force: bool) {
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle / registration
+// ---------------------------------------------------------------------------
+
+/// C deferred-free callback type: `(force, heartbeat, arg)`. Reuses the
+/// `init` alias so the two cannot drift.
+pub type MiDeferredFreeFun = init::DeferredFreeFun;
+
+/// `mi_register_deferred_free`: register (or clear, if null) a callback fired
+/// during collection.
+///
+/// # Safety
+/// `fun` is null or a valid C function pointer of the matching signature; `arg`
+/// is passed back to the callback verbatim.
+#[no_mangle]
+pub unsafe extern "C" fn mi_register_deferred_free(
+    fun: Option<MiDeferredFreeFun>,
+    arg: *mut c_void,
+) {
+    init::register_deferred_free(fun, arg);
+}
+
+/// `mi_thread_init`: ensure the calling thread's default heap is initialized.
+#[no_mangle]
+pub extern "C" fn mi_thread_init() {
+    init::thread_init();
+}
+
+/// `mi_thread_done`: reclaim the calling thread's pending frees now.
+#[no_mangle]
+pub extern "C" fn mi_thread_done() {
+    init::thread_done();
+}
+
+/// `mi_process_init`: force process-wide initialization (keys + this thread).
+#[no_mangle]
+pub extern "C" fn mi_process_init() {
+    init::process_init();
+}
+
+/// `mi_process_done`: best-effort process cleanup (drains the calling thread).
+#[no_mangle]
+pub extern "C" fn mi_process_done() {
+    init::process_done();
+}
+
+// ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
 
@@ -1579,6 +1625,51 @@ mod tests {
 
             // Allocator still usable after collection.
             let q = mi_malloc(100);
+            assert!(!q.is_null());
+            mi_free(q);
+        }
+    }
+
+    #[test]
+    fn c_api_lifecycle() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        // Keyed to its own `arg` sentinel so parallel tests' collects don't count.
+        static FIRED: AtomicUsize = AtomicUsize::new(0);
+        static SENTINEL: u8 = 0;
+
+        extern "C" fn cb(_force: bool, _heartbeat: u64, arg: *mut c_void) {
+            if arg == core::ptr::addr_of!(SENTINEL) as *mut c_void {
+                FIRED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // Serialize with the other deferred-registry tests (shared global state).
+        let _guard = crate::init::DEFERRED_REG_TEST_LOCK.lock().unwrap();
+        // SAFETY: standard C-style lifecycle usage on one live thread.
+        unsafe {
+            mi_process_init();
+            mi_thread_init();
+
+            let p = mi_malloc(128);
+            assert!(!p.is_null());
+            mi_free(p);
+
+            let arg = core::ptr::addr_of!(SENTINEL) as *mut c_void;
+            mi_register_deferred_free(Some(cb), arg);
+            let before = FIRED.load(Ordering::Relaxed);
+            mi_collect(true);
+            assert!(
+                FIRED.load(Ordering::Relaxed) > before,
+                "registered deferred-free callback must fire on mi_collect"
+            );
+            mi_register_deferred_free(None, core::ptr::null_mut());
+
+            mi_thread_done();
+            mi_process_done();
+
+            // Allocator still usable after the lifecycle calls.
+            let q = mi_malloc(64);
             assert!(!q.is_null());
             mi_free(q);
         }

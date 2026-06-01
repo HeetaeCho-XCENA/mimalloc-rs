@@ -381,6 +381,9 @@ impl Heap {
             crate::init::current_tid(),
             "Heap::collect called from a non-owning thread (mi_heap_* is owner-thread-only)"
         );
+        // Fire any registered deferred-free callback (our heartbeat point).
+        #[cfg(feature = "std")]
+        crate::init::run_deferred_free(force);
         for b in 0..MI_BIN_COUNT {
             let mut cur = self.pages[b].first();
             while !cur.is_null() {
