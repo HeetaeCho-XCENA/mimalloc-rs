@@ -10,7 +10,7 @@
 //! protect/free) plus the small system queries the allocator needs (page
 //! config, NUMA, clock, randomness, env, yield, stderr). Thread-local storage
 //! and the thread-exit hook (`_mi_prim_thread_init_auto_done`) are layered in
-//! at M5 where the heap lifecycle lives.
+//! where the heap lifecycle lives.
 
 #[cfg(target_os = "linux")]
 mod linux;

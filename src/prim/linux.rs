@@ -60,7 +60,7 @@ impl Prim for Sys {
         };
         OsMemConfig {
             page_size,
-            large_page_size: 2 * 1024 * 1024, // 2 MiB (THP/hugetlb); detection is M8 work
+            large_page_size: 2 * 1024 * 1024, // 2 MiB (THP/hugetlb); detection is future work
             alloc_granularity: page_size,
             physical_memory,
             virtual_address_bits: crate::bits::MI_MAX_VABITS,

@@ -13,7 +13,7 @@
 use core::ptr::NonNull;
 
 use crate::bitmap::{BChunk, Bitmap, CHUNK_BITS};
-use crate::os::{self, MemId, MemKind};
+use crate::os::{self, MemId};
 use crate::sync::SpinLock;
 
 /// Bytes per metadata block.
@@ -147,9 +147,6 @@ pub unsafe fn meta_free(ptr: NonNull<u8>, size: usize) {
         cur = chunk.next;
     }
 }
-
-/// Marker so callers can record meta provenance in a `MemId` if needed.
-pub const META_KIND: MemKind = MemKind::Meta;
 
 #[cfg(all(test, feature = "std"))]
 mod tests {

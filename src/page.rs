@@ -422,11 +422,6 @@ impl Page {
         let a = ptr.addr();
         a >= base && a < base + (self.reserved as usize) * self.block_size
     }
-
-    /// Index of the block containing `ptr` (assumes [`Page::contains`]).
-    pub fn block_index(&self, ptr: *const u8) -> usize {
-        (ptr.addr() - self.page_start.addr()) / self.block_size
-    }
 }
 
 #[cfg(all(test, feature = "std"))]

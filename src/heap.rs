@@ -9,8 +9,7 @@
 //! The heap is single-owner (per thread). It has a `pages_free_direct` fast
 //! array (skip the bin-queue scan for small sizes), retires empty pages to the
 //! arena, and on thread exit abandons/releases its pages (see [`crate::page`]
-//! and [`crate::subproc`]). The `mi_theap_t`/`tld` split and deferred-free
-//! heartbeat remain follow-up work.
+//! and [`crate::subproc`]). The `mi_theap_t`/`tld` split remains follow-up work.
 
 use core::cell::Cell;
 use core::ptr::NonNull;
@@ -441,7 +440,8 @@ pub fn is_in_heap_region(ptr: *const u8) -> bool {
 /// Free a block previously returned by [`Heap::alloc`] (heap-independent).
 ///
 /// Finds the owning page through the page-map and returns the block to it.
-/// Cross-thread frees are handled by M6; for now this is the owner path.
+/// Owner frees take the local deferred-free path; non-owner (cross-thread)
+/// frees push the block onto the page's atomic `xthread_free` list.
 ///
 /// # Safety
 /// `ptr` must be a live allocation from this allocator.
