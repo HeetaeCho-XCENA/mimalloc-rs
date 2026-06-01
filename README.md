@@ -59,6 +59,22 @@ cargo rustc --release --features capi --crate-type cdylib   # → libmimalloc_rs
 
 First-class heaps from Rust: `Heap::new_boxed`, `Heap::{delete,destroy}`.
 
+As a **transparent `LD_PRELOAD` drop-in** (`override` feature): also export the
+standard libc symbols (`malloc`/`free`/`calloc`/`realloc`/`aligned_alloc`/
+`posix_memalign`/`valloc`/…) so an unmodified program uses this allocator. The
+raw symbols are emitted only when the explicit `override_export` cfg is set (so
+they never leak into `cargo test`/`build`):
+
+```sh
+RUSTFLAGS="--cfg override_export" \
+  cargo rustc --release --features override --crate-type cdylib   # → libmimalloc_rs.so
+LD_PRELOAD=./target/release/libmimalloc_rs.so  ./your_program
+```
+
+Pointers allocated before interposition (or by paths we don't intercept) are
+detected by arena-membership and forwarded to the real system allocator, so
+mixing is safe.
+
 ## Features
 
 | feature   | default | effect                                                        |
