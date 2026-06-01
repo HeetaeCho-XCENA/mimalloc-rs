@@ -421,6 +421,23 @@ impl Heap {
     }
 }
 
+/// Whether `ptr` points into a region this allocator manages (i.e. it lies
+/// within one of our arenas). Foreign pointers (system malloc, the dynamic
+/// linker, TLS, etc.) return false. This is the basis for the override fallback
+/// and for `mi_is_in_heap_region`.
+///
+/// This tests **arena membership**, not page-map presence (mirroring the C
+/// `mi_is_in_heap_region`, which tests arena/region membership). A page-map
+/// lookup is null for both genuinely foreign pointers *and* our own pointers
+/// whose page was retired/unregistered (a double-free, a free racing a retire,
+/// or freeing an already-reclaimed block). Such a pointer is still inside our
+/// arena — arenas are never unmapped back to the OS — so handing it to the
+/// system allocator (under `override`) would abort. Arena membership separates
+/// "ours but not currently mapped" from "truly foreign".
+pub fn is_in_heap_region(ptr: *const u8) -> bool {
+    !ptr.is_null() && subproc_main().owns_address(ptr)
+}
+
 /// Free a block previously returned by [`Heap::alloc`] (heap-independent).
 ///
 /// Finds the owning page through the page-map and returns the block to it.
@@ -431,7 +448,24 @@ impl Heap {
 pub unsafe fn free(ptr: NonNull<u8>) {
     let page_ptr = page_map::lookup(ptr.addr().get()) as *mut Page;
     if page_ptr.is_null() {
-        // Freeing a pointer this allocator never handed out.
+        // A null page-map lookup is ambiguous: the pointer is either genuinely
+        // foreign (system malloc, the linker, TLS) or one of *ours* whose page
+        // was retired/unregistered (a double-free, a free racing a concurrent
+        // retire, or freeing an already-reclaimed block). Disambiguate by arena
+        // membership — arenas are never unmapped, so an our-arena address with a
+        // cleared page-map entry is still ours and must NOT go to the system
+        // allocator (glibc would abort with "free(): invalid pointer").
+        #[cfg(all(feature = "override", feature = "std"))]
+        if !subproc_main().owns_address(ptr.as_ptr()) {
+            // Genuinely foreign pointer: hand it back to the real system free.
+            // SAFETY: not in any of our arenas ⇒ it is a system allocation safe
+            // to hand to the real libc free.
+            unsafe { crate::sysalloc::free(ptr.as_ptr() as *mut core::ffi::c_void) };
+            return;
+        }
+        // Ours-but-unmapped (or, in non-override builds, any unmapped pointer):
+        // an invalid/double free of one of our blocks. Default builds treat it
+        // as a no-op; hardened builds abort. Never forward it to the system.
         #[cfg(any(feature = "secure", feature = "debug"))]
         report_corruption_and_abort(
             "mimalloc-rs: invalid free (pointer not owned by this allocator)\n",
@@ -634,6 +668,16 @@ impl Drop for Heap {
 pub unsafe fn usable_size(ptr: NonNull<u8>) -> usize {
     let page_ptr = page_map::lookup(ptr.addr().get()) as *mut Page;
     if page_ptr.is_null() {
+        // Null page-map lookup is ambiguous (see `free`): disambiguate by arena
+        // membership. A genuinely foreign pointer reports the system usable
+        // size; an our-arena pointer with a cleared page-map entry is not a
+        // live block, so it has no usable size (0) — never query the system
+        // allocator about a pointer it does not own.
+        #[cfg(all(feature = "override", feature = "std"))]
+        if !subproc_main().owns_address(ptr.as_ptr()) {
+            // SAFETY: not in any of our arenas ⇒ `ptr` is a system allocation.
+            return unsafe { crate::sysalloc::usable_size(ptr.as_ptr() as *mut core::ffi::c_void) };
+        }
         return 0;
     }
     // SAFETY: valid page header; const fields read via raw projection.
@@ -817,6 +861,16 @@ mod tests {
         }
     }
 
+    // The following cross-thread tests free *reconstructed raw addresses* from
+    // worker threads, exercising the retire/abandon/reclaim machinery against
+    // the process-global page-map and arena. Run in one process alongside many
+    // other heaps, a freed address can land in the brief window where its page
+    // was retired (page-map entry cleared, slices returned to the arena) — a
+    // null page-map lookup. They run under every feature combo, including
+    // `override`: the foreign-vs-ours decision is made by *arena membership*
+    // (`Subproc::owns_address`), not page-map presence, so an our-arena address
+    // with a cleared page-map entry is correctly treated as ours (no-op /
+    // hardened-build abort) and is never forwarded to the system allocator.
     #[test]
     fn collect_reclaims_cross_thread_frees() {
         // The owner allocates N blocks; a worker thread frees them all
@@ -862,6 +916,8 @@ mod tests {
         }
     }
 
+    // See the note on `collect_reclaims_cross_thread_frees`: runs under every
+    // feature combo (the foreign-vs-ours decision uses arena membership).
     #[test]
     fn stress_owner_retire_vs_cross_thread_free() {
         // Exercises the retire-vs-foreign-free window: a producer allocates and
@@ -906,6 +962,8 @@ mod tests {
         });
     }
 
+    // See the note on `collect_reclaims_cross_thread_frees`: runs under every
+    // feature combo (the foreign-vs-ours decision uses arena membership).
     #[test]
     fn abandoned_pages_reclaimed_across_threads() {
         // A worker allocates a batch and exits while the blocks are still live;
@@ -956,6 +1014,8 @@ mod tests {
         }
     }
 
+    // See the note on `collect_reclaims_cross_thread_frees`: runs under every
+    // feature combo (the foreign-vs-ours decision uses arena membership).
     #[test]
     fn cross_thread_free_collected_by_owner() {
         // Owner heap lives on this thread; worker threads free its blocks
@@ -1009,5 +1069,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn is_in_heap_region_basic() {
+        // One of ours → true; a stack address and null → false.
+        let h = test_heap();
+        let p = h.alloc(64).unwrap();
+        assert!(is_in_heap_region(p.as_ptr()));
+        let stack = 0u8;
+        assert!(!is_in_heap_region(&stack as *const u8));
+        assert!(!is_in_heap_region(core::ptr::null()));
+        // SAFETY: ours, freed on this thread.
+        unsafe { free(p) };
+    }
+
     extern crate alloc;
+}
+
+#[cfg(all(test, feature = "override", feature = "std"))]
+mod override_tests {
+    use super::*;
+
+    #[test]
+    fn foreign_free_is_forwarded_not_aborted() {
+        // A block from the REAL system allocator is foreign to us. Freeing it
+        // through our path must forward to system free (never leak/abort) — the
+        // test simply completing is the proof.
+        // SAFETY: standard libc usage.
+        unsafe {
+            let p = libc::malloc(64) as *mut u8;
+            assert!(!p.is_null());
+            assert!(!is_in_heap_region(p), "system block must be foreign");
+            // touch the block to prove it is real, valid memory
+            core::ptr::write_bytes(p, 0xAB, 64);
+            assert_eq!(*p, 0xAB);
+            // our free forwards foreign pointers to the real system free
+            free(NonNull::new(p).unwrap());
+
+            // One of ours behaves normally.
+            let h = Heap::new(crate::init::process_keys(), crate::init::current_tid());
+            let q = h.alloc(64).unwrap();
+            assert!(is_in_heap_region(q.as_ptr()), "our block must be in-region");
+            free(q);
+        }
+    }
+
+    #[test]
+    fn foreign_realloc_is_forwarded() {
+        // A system block reallocated through our path must go to system realloc:
+        // non-null, contents preserved. The result is a system pointer, so our
+        // free forwards it back to the system allocator.
+        // SAFETY: standard libc usage.
+        unsafe {
+            let p = libc::malloc(32) as *mut u8;
+            assert!(!p.is_null());
+            for i in 0..32usize {
+                *p.add(i) = (i as u8).wrapping_mul(7);
+            }
+            let np = crate::init::realloc(NonNull::new(p).unwrap(), 128)
+                .expect("system realloc must return non-null");
+            let np = np.as_ptr();
+            for i in 0..32usize {
+                assert_eq!(*np.add(i), (i as u8).wrapping_mul(7), "pattern preserved");
+            }
+            assert!(
+                !is_in_heap_region(np),
+                "reallocated block is still a system pointer"
+            );
+            // free the (system) result via our forwarding path
+            free(NonNull::new(np).unwrap());
+        }
+    }
+
+    #[test]
+    fn foreign_usable_size_is_forwarded() {
+        // SAFETY: standard libc usage.
+        unsafe {
+            let p = libc::malloc(48) as *mut u8;
+            assert!(!p.is_null());
+            let sz = usable_size(NonNull::new(p).unwrap());
+            assert!(sz >= 48, "system usable_size must cover the request: {sz}");
+            free(NonNull::new(p).unwrap());
+        }
+    }
 }

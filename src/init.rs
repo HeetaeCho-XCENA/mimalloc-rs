@@ -261,6 +261,15 @@ pub unsafe fn realloc(
     ptr: core::ptr::NonNull<u8>,
     new_size: usize,
 ) -> Option<core::ptr::NonNull<u8>> {
+    // Foreign pointer (allocated by the system allocator): realloc it with the
+    // real system realloc rather than treating it as one of ours.
+    #[cfg(all(feature = "override", feature = "std"))]
+    if !crate::heap::is_in_heap_region(ptr.as_ptr()) {
+        // SAFETY: not in our heap region ⇒ `ptr` is a live system allocation.
+        let p =
+            unsafe { crate::sysalloc::realloc(ptr.as_ptr() as *mut core::ffi::c_void, new_size) };
+        return core::ptr::NonNull::new(p as *mut u8);
+    }
     // SAFETY: ptr is a live allocation.
     let old = unsafe { crate::heap::usable_size(ptr) };
     if new_size <= old {
@@ -285,6 +294,17 @@ pub unsafe fn realloc_aligned(
     new_size: usize,
     align: usize,
 ) -> Option<core::ptr::NonNull<u8>> {
+    // Foreign pointer under override: realloc of a foreign pointer ignores the
+    // alignment refinement and just system-reallocs (the system allocator's own
+    // alignment guarantees apply); we cannot relocate a block we do not own.
+    #[cfg(all(feature = "override", feature = "std"))]
+    if !crate::heap::is_in_heap_region(ptr.as_ptr()) {
+        let _ = align;
+        // SAFETY: not in our heap region ⇒ `ptr` is a live system allocation.
+        let p =
+            unsafe { crate::sysalloc::realloc(ptr.as_ptr() as *mut core::ffi::c_void, new_size) };
+        return core::ptr::NonNull::new(p as *mut u8);
+    }
     // SAFETY: ptr is a live allocation.
     let old = unsafe { crate::heap::usable_size(ptr) };
     let np = malloc_aligned(new_size, align)?;
@@ -368,18 +388,26 @@ mod tests {
 
         // Process-global counters; key the callback to its own `arg` sentinel so
         // collects driven by other (parallel) tests' threads never bump them.
+        // The heartbeat is *per-thread* and only globally meaningful on this
+        // test's own thread, so also gate updates to the registering thread:
+        // a `collect` driven by a parallel test's thread would otherwise store
+        // that thread's (unrelated, non-monotonic) heartbeat into `LAST_HB`.
         static FIRED: AtomicUsize = AtomicUsize::new(0);
         static LAST_HB: AtomicU64 = AtomicU64::new(0);
+        static OWNER_TID: AtomicU64 = AtomicU64::new(0);
         static SENTINEL: u8 = 0;
 
         extern "C" fn cb(_force: bool, heartbeat: u64, arg: *mut c_void) {
-            if arg == core::ptr::addr_of!(SENTINEL) as *mut c_void {
+            if arg == core::ptr::addr_of!(SENTINEL) as *mut c_void
+                && super::current_tid() as u64 == OWNER_TID.load(Ordering::Relaxed)
+            {
                 FIRED.fetch_add(1, Ordering::Relaxed);
                 LAST_HB.store(heartbeat, Ordering::Relaxed);
             }
         }
 
         let _guard = super::DEFERRED_REG_TEST_LOCK.lock().unwrap();
+        OWNER_TID.store(super::current_tid() as u64, Ordering::Relaxed);
         let arg = core::ptr::addr_of!(SENTINEL) as *mut c_void;
         register_deferred_free(Some(cb), arg);
         let before = FIRED.load(Ordering::Relaxed);
@@ -413,12 +441,18 @@ mod tests {
 
         // A callback that re-enters collection must NOT be fired again (the
         // recurse guard bounds it to depth 1), so this cannot stack-overflow.
+        // The recurse guard is *per-thread*, so `DEPTH` is only meaningful on
+        // this test's own thread; gate updates to the registering thread so a
+        // `collect` driven by a parallel test's thread cannot inflate `DEPTH`.
         static DEPTH: AtomicUsize = AtomicUsize::new(0);
         static MAX_DEPTH: AtomicUsize = AtomicUsize::new(0);
+        static OWNER_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         static SENTINEL: u8 = 0;
 
         extern "C" fn cb(_force: bool, _heartbeat: u64, arg: *mut c_void) {
-            if arg != core::ptr::addr_of!(SENTINEL) as *mut c_void {
+            if arg != core::ptr::addr_of!(SENTINEL) as *mut c_void
+                || super::current_tid() as u64 != OWNER_TID.load(Ordering::Relaxed)
+            {
                 return;
             }
             let d = DEPTH.fetch_add(1, Ordering::Relaxed) + 1;
@@ -430,6 +464,7 @@ mod tests {
         }
 
         let _guard = super::DEFERRED_REG_TEST_LOCK.lock().unwrap();
+        OWNER_TID.store(super::current_tid() as u64, Ordering::Relaxed);
         let arg = core::ptr::addr_of!(SENTINEL) as *mut c_void;
         register_deferred_free(Some(cb), arg);
         collect(true); // must return (no unbounded self-recursion)

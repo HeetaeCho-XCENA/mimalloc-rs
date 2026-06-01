@@ -32,6 +32,10 @@ track = []
 capi = ["std"]
 # Differential test harness against the C libmimalloc (set MIMALLOC_C_LIB).
 differential = ["std"]
+# Transparent malloc/free override (LD_PRELOAD). Exports standard libc symbols
+# (Phase N) and routes foreign pointers (not allocated by us) to the real system
+# allocator instead of leaking/aborting. Requires std. Off by default.
+override = ["std"]
 
 [dependencies]
 # Stable `Allocator` trait. On nightly we additionally impl `core::alloc::Allocator`.

@@ -62,6 +62,8 @@ pub mod prim;
 pub mod stats;
 pub mod subproc;
 pub mod sync;
+#[cfg(all(feature = "override", feature = "std"))]
+pub mod sysalloc;
 pub mod theap;
 pub mod track;
 
