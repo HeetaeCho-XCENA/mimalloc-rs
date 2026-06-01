@@ -140,3 +140,66 @@ This is consistent with the three point-fixes that measured **neutral**
 (aligned over-alloc, nightly TLS null-test, free-path divide skip): no single op
 dominates. The instruction-count A/B above decides whether the remaining lever
 is code-leanness or microarchitecture.
+
+## Checkpoint: confirmed root cause + plan (2026-06)
+
+The instruction-count A/B (`microbench`, `perf stat`, dev box, core-pinned) was
+decisive. Per-size, mimalloc-rs vs the C reference (`MB_ROUNDS=5e7`):
+
+| size | rs Mops (IPC) | c Mops (IPC) | live pages | rs insn | c insn |
+|---:|---|---|---:|---:|---:|
+| 256 | 265 (2.99) | 500 (4.11) | 8 | 6.0 B | 4.5 B |
+| 512 | 256 (2.83) | 440 (4.04) | 16 | 6.1 B | 5.1 B |
+| 768 | 269 (3.02) | 236 (4.48) | 21 | 6.1 B | 10.4 B (C worse here) |
+| 1024 | **11.9 (0.48)** | 198 (4.67) | 32 | **22.4 B** | 12.9 B |
+
+The C reference holds **IPC ≈ 4.0–4.7 at every size — no cliff**. mimalloc-rs's
+IPC falls as the live-page count grows and **collapses at size 1024** (IPC 0.48,
+instructions 3.7× higher, L1-misses ~1000× higher). Both *more instructions*
+(scan work) and *more stalls* (cache).
+
+Two **missing mimalloc mechanisms** explain the gap (both real, both absent):
+
+1. **Full-page eviction (the search-queue `MI_BIN_FULL`).** `Heap::alloc_impl`
+   keeps full pages in the per-bin queue and merely *skips* them while scanning,
+   so every alloc re-walks all full pages — ~O(live pages). This is the
+   instruction explosion (22 B at size 1024). mimalloc moves full pages to a
+   dedicated full queue so the search stays short, and uses a **delayed-free
+   protocol** (atomic `xthread_free` "delayed" state + a per-heap
+   thread-delayed-free list) to bring a full page back when a *cross-thread*
+   free targets it.
+   - A first attempt (move full pages to `pages[MI_BIN_FULL]`; un-full on local
+     free; rely on `collect` for cross-thread frees instead of delayed-free)
+     **regressed cross-thread correctness**: the secure+debug parallel suite's
+     intermittent "invalid free / not owned" abort rose from **1/12 (main) to
+     6/12**. Root cause class: without delayed-free, a full page off the search
+     queue can be retired/relocated in a window that races a cross-thread free
+     (the retire-vs-free happens-before that `used==0` normally guarantees). The
+     attempt was **not merged** (parked/discarded). Conclusion: full-page
+     eviction **requires** the delayed-free protocol to be cross-thread-safe.
+
+2. **Lazy page extend (`capacity` vs `reserved`).** `Page::init` →
+   `build_free_list` threads **all** `reserved` blocks upfront, touching every
+   block's first word across the whole page (e.g. 64 cache lines for a 64 KiB
+   small page) and scattering the free list across the page → cold-cache writes
+   at page creation and cache-unfriendly traversal. mimalloc inits `capacity=0`
+   and **extends the free list in batches** (`mi_page_extend_free`,
+   ~`MI_MAX_EXTEND_SIZE/bsize` blocks at a time) from the generic alloc path, so
+   only the memory actually used is initialized and stays hot. The `Page`
+   already carries a (currently vestigial) `capacity` field set to `reserved`.
+   This is **owner-only page state — no cross-thread hazard** — so it is the
+   lower-risk lever, and it directly targets the IPC/L1-miss collapse.
+
+### Plan (perf round, ordered low-risk → high-risk)
+1. **Lazy page extend** — make `Page::init` start `capacity=0` and add
+   `mi_page_extend_free`-style batched extension on the generic alloc path
+   (owner-only). Re-measure size 1024 / mixed. *(safe; do first)*
+2. **Full-page eviction + delayed-free** — port mimalloc's full queue together
+   with the delayed-free protocol (atomic `xthread_free` delayed state + per-heap
+   thread-delayed-free list) so cross-thread frees into off-queue full pages are
+   handled correctly. Gate on the cross-thread tests + loom + TSan + the
+   secure+debug parallel abort rate (must return to ≤ main's 1/12, ideally 0).
+   *(complex; concurrency-critical)*
+
+Method unchanged: one change per PR, measured before/after on a pinned machine,
+behavior locked by tests + Miri + loom + the cross-thread TSan stress.
