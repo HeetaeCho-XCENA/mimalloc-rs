@@ -73,6 +73,16 @@ jobs:
       - run: cargo miri test --lib layout
       - run: cargo miri test --lib bits
 
+  # Transparent LD_PRELOAD override: build the cdylib and verify an unmodified
+  # C program uses our allocator (mi_is_in_heap_region) and common binaries run.
+  preload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run LD_PRELOAD verification
+        run: bash scripts/preload-check.sh
+
   # Concurrency model checking (bitmap CAS + xthread_free MPSC).
   loom:
     runs-on: ubuntu-latest
