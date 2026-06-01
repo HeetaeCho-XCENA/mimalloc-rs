@@ -151,10 +151,8 @@ pub unsafe extern "C" fn mi_recalloc(p: *mut c_void, count: usize, size: usize) 
     let old = unsafe { mi_usable_size(p) };
     // SAFETY: forwarded contract.
     let np = unsafe { mi_realloc(p, total) };
-    if !np.is_null() && total > old {
-        // SAFETY: `np` is valid for `total` bytes; zero the grown tail.
-        unsafe { core::ptr::write_bytes((np as *mut u8).add(old), 0, total - old) };
-    }
+    // SAFETY: `np` is null or valid for `total` bytes; zero the grown tail.
+    unsafe { zero_grown_tail(np as *mut u8, old, total) };
     np
 }
 
@@ -181,6 +179,36 @@ pub unsafe extern "C" fn mi_expand(p: *mut c_void, newsize: usize) -> *mut c_voi
 // Aligned allocation
 // ---------------------------------------------------------------------------
 
+/// Given a block `p` of at least `size + align` bytes, return the interior
+/// pointer `r` in `[p, p + align)` such that `(r + offset) % align == 0` — used
+/// to satisfy an over-aligned request from a normal block; `free` recovers the
+/// block start from the interior pointer via the page-map.
+///
+/// `align` must be a power of two.
+#[inline]
+fn interior_aligned(p: NonNull<u8>, align: usize, offset: usize) -> NonNull<u8> {
+    let base = p.addr().get();
+    let r = base + ((align - ((base + offset) & (align - 1))) & (align - 1));
+    // SAFETY: `r` is within `[base, base + align)`, and the block is ≥ size+align,
+    // so the interior pointer stays inside the same block.
+    unsafe { NonNull::new_unchecked(p.as_ptr().with_addr(r)) }
+}
+
+/// Zero the region grown by a realloc — bytes `[old, new)` of `p` — when the
+/// allocation grew (`new > old`). No-op if `p` is null or it did not grow.
+/// Mirrors the `recalloc`/`rezalloc` zero-the-new-tail contract.
+///
+/// # Safety
+/// If `p` is non-null it must be valid for at least `new` bytes.
+#[inline]
+unsafe fn zero_grown_tail(p: *mut u8, old: usize, new: usize) {
+    if !p.is_null() && new > old {
+        // SAFETY: `p` is valid for `new` bytes per the caller's contract; zero
+        // only the grown tail `[old, new)`.
+        unsafe { core::ptr::write_bytes(p.add(old), 0, new - old) };
+    }
+}
+
 /// Allocate `size` bytes so that `ptr + offset` is `align`-aligned.
 fn aligned_at(size: usize, align: usize, offset: usize) -> Option<NonNull<u8>> {
     if !align.is_power_of_two() {
@@ -193,10 +221,7 @@ fn aligned_at(size: usize, align: usize, offset: usize) -> Option<NonNull<u8>> {
     // fits in one block; `free` recovers the block start via the page-map.
     // Guard against `size + align` overflow (return null rather than wrap).
     let p = init::malloc(size.checked_add(align)?)?;
-    let base = p.addr().get();
-    let r = base + ((align - ((base + offset) & (align - 1))) & (align - 1));
-    // SAFETY: `r` is within `[base, base+align)` and the block is ≥ size+align.
-    Some(unsafe { NonNull::new_unchecked(p.as_ptr().with_addr(r)) })
+    Some(interior_aligned(p, align, offset))
 }
 
 /// `mi_malloc_aligned`.
@@ -271,10 +296,8 @@ pub unsafe extern "C" fn mi_aligned_recalloc(
     let old = unsafe { mi_usable_size(p) };
     // SAFETY: forwarded contract.
     let np = unsafe { mi_realloc_aligned(p, total, alignment) };
-    if !np.is_null() && total > old {
-        // SAFETY: `np` is valid for `total` bytes; zero the grown tail.
-        unsafe { core::ptr::write_bytes((np as *mut u8).add(old), 0, total - old) };
-    }
+    // SAFETY: `np` is null or valid for `total` bytes; zero the grown tail.
+    unsafe { zero_grown_tail(np as *mut u8, old, total) };
     np
 }
 
@@ -330,10 +353,8 @@ pub unsafe extern "C" fn mi_recalloc_aligned_at(
         core::ptr::copy_nonoverlapping(nn.as_ptr(), np.as_ptr(), old.min(total));
         init::free(nn);
     }
-    if total > old {
-        // SAFETY: `np` is valid for `total` bytes; zero the grown tail.
-        unsafe { core::ptr::write_bytes(np.as_ptr().add(old), 0, total - old) };
-    }
+    // SAFETY: `np` is non-null and valid for `total` bytes; zero the grown tail.
+    unsafe { zero_grown_tail(np.as_ptr(), old, total) };
     out(Some(np))
 }
 
@@ -926,10 +947,7 @@ unsafe fn heap_aligned_at(
     // fits; `free` recovers the block start via the page-map. Guard against
     // `size + align` overflow (return null rather than wrap).
     let p = heap.alloc(size.checked_add(align)?)?;
-    let base = p.addr().get();
-    let r = base + ((align - ((base + offset) & (align - 1))) & (align - 1));
-    // SAFETY: `r` is within `[base, base+align)` and the block is ≥ size+align.
-    Some(unsafe { NonNull::new_unchecked(p.as_ptr().with_addr(r)) })
+    Some(interior_aligned(p, align, offset))
 }
 
 /// `mi_heap_malloc_aligned_at`.
@@ -1115,10 +1133,8 @@ pub unsafe extern "C" fn mi_heap_rezalloc(
     let old = NonNull::new(p as *mut u8).map_or(0, |nn| unsafe { heap::usable_size(nn) });
     // SAFETY: forwarded contract.
     let np = unsafe { mi_heap_realloc(heap, p, newsize) };
-    if !np.is_null() && newsize > old {
-        // SAFETY: `np` is valid for `newsize` bytes; zero the grown tail.
-        unsafe { core::ptr::write_bytes((np as *mut u8).add(old), 0, newsize - old) };
-    }
+    // SAFETY: `np` is null or valid for `newsize` bytes; zero the grown tail.
+    unsafe { zero_grown_tail(np as *mut u8, old, newsize) };
     np
 }
 
@@ -1157,10 +1173,8 @@ pub unsafe extern "C" fn mi_heap_rezalloc_aligned(
     let old = NonNull::new(p as *mut u8).map_or(0, |nn| unsafe { heap::usable_size(nn) });
     // SAFETY: forwarded contract.
     let np = unsafe { mi_heap_realloc_aligned(heap, p, newsize, alignment) };
-    if !np.is_null() && newsize > old {
-        // SAFETY: `np` is valid for `newsize` bytes; zero the grown tail.
-        unsafe { core::ptr::write_bytes((np as *mut u8).add(old), 0, newsize - old) };
-    }
+    // SAFETY: `np` is null or valid for `newsize` bytes; zero the grown tail.
+    unsafe { zero_grown_tail(np as *mut u8, old, newsize) };
     np
 }
 
@@ -1181,10 +1195,8 @@ pub unsafe extern "C" fn mi_heap_rezalloc_aligned_at(
     let old = NonNull::new(p as *mut u8).map_or(0, |nn| unsafe { heap::usable_size(nn) });
     // SAFETY: forwarded contract.
     let np = unsafe { mi_heap_realloc_aligned_at(heap, p, newsize, alignment, offset) };
-    if !np.is_null() && newsize > old {
-        // SAFETY: `np` is valid for `newsize` bytes; zero the grown tail.
-        unsafe { core::ptr::write_bytes((np as *mut u8).add(old), 0, newsize - old) };
-    }
+    // SAFETY: `np` is null or valid for `newsize` bytes; zero the grown tail.
+    unsafe { zero_grown_tail(np as *mut u8, old, newsize) };
     np
 }
 
