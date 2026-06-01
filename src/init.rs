@@ -96,13 +96,161 @@ mod tls {
 
     /// Reclaim memory in the calling thread's default heap (`force` is more
     /// aggressive — see [`crate::heap::Heap::collect`]).
+    ///
+    /// Documented to run on a live thread (drives `mi_collect`/`init::collect`),
+    /// so it uses `.with` — accessing the TLS during/after destruction would
+    /// panic, which is the correct signal for that misuse.
     pub fn collect(force: bool) {
         DEFAULT_HEAP.with(|h| h.collect(force));
+    }
+
+    /// Force the calling thread's default heap to be initialized (no-op if it
+    /// already is). Used by the lifecycle wrappers.
+    ///
+    /// Uses `try_with` so a late call (after the thread's TLS destructors have
+    /// begun) is a safe no-op rather than a "TLS during destruction" panic.
+    pub fn touch() {
+        let _ = DEFAULT_HEAP.try_with(|_| {});
+    }
+
+    /// Like [`collect`], but for the lifecycle wrappers (`thread_done`,
+    /// `process_done`): uses `try_with` so a late call after the thread's TLS
+    /// destructors started is a safe no-op instead of a panic. Full page
+    /// hand-off still happens via the `Heap` `Drop` at real thread exit.
+    pub fn collect_lifecycle(force: bool) {
+        let _ = DEFAULT_HEAP.try_with(|h| h.collect(force));
     }
 }
 
 #[cfg(feature = "std")]
 pub use tls::{collect, malloc, malloc_aligned, zalloc};
+
+// ---------------------------------------------------------------------------
+// Lifecycle / deferred-free registration (ports `mi_register_deferred_free`
+// and the thread/process lifecycle entry points). `std`-only: they drive the
+// thread-local default heap.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "std")]
+mod lifecycle {
+    use core::cell::Cell;
+    use core::ffi::c_void;
+    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+    /// C deferred-free callback: `(force, heartbeat, arg)`.
+    pub type DeferredFreeFun = extern "C" fn(bool, u64, *mut c_void);
+
+    static DEFERRED_FN: AtomicUsize = AtomicUsize::new(0); // fn ptr as usize (0 = none)
+    static DEFERRED_ARG: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+
+    /// Per-thread deferred-free state: a `recurse` reentrancy flag (mirrors the C
+    /// reference's `tld->recurse`, page.c:895) and a per-thread `heartbeat` tick.
+    /// Per-thread, not process-global, matching mimalloc's per-`theap` heartbeat.
+    struct DeferredState {
+        recurse: Cell<bool>,
+        heartbeat: Cell<u64>,
+    }
+    std::thread_local! {
+        static STATE: DeferredState = const {
+            DeferredState { recurse: Cell::new(false), heartbeat: Cell::new(0) }
+        };
+    }
+
+    /// Register (or, with `None`, clear) the deferred-free callback.
+    pub fn register_deferred_free(fun: Option<DeferredFreeFun>, arg: *mut c_void) {
+        DEFERRED_ARG.store(arg, Ordering::Release);
+        let addr = fun.map_or(0, |f| f as usize);
+        DEFERRED_FN.store(addr, Ordering::Release);
+    }
+
+    /// Invoke the registered deferred-free callback (if any), bumping the
+    /// per-thread heartbeat. Called from `collect` — our "heartbeat" point
+    /// (mimalloc also fires it from the generic alloc slow path; we fire on
+    /// collect, which is honest and sufficient).
+    ///
+    /// Bounded to recursion depth 1 (mirrors C's `tld->recurse`): if the callback
+    /// re-enters collection, it is not fired again, so a callback that calls
+    /// `mi_collect` cannot self-recurse into a stack overflow.
+    pub fn run_deferred_free(force: bool) {
+        let addr = DEFERRED_FN.load(Ordering::Acquire);
+        if addr == 0 {
+            return;
+        }
+        // Claim the reentrancy flag and take this thread's heartbeat tick. The
+        // `try_with` makes a call during TLS teardown a safe no-op. A `None`
+        // result means we are already inside a deferred-free callback (recursing)
+        // or the TLS is gone — either way, skip.
+        let hb = match STATE.try_with(|s| {
+            if s.recurse.get() {
+                return None;
+            }
+            s.recurse.set(true);
+            let hb = s.heartbeat.get();
+            s.heartbeat.set(hb.wrapping_add(1));
+            Some(hb)
+        }) {
+            Ok(Some(hb)) => hb,
+            _ => return,
+        };
+        // Clear the reentrancy flag even if the callback unwinds.
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                let _ = STATE.try_with(|s| s.recurse.set(false));
+            }
+        }
+        let _clear = Clear;
+        let arg = DEFERRED_ARG.load(Ordering::Acquire);
+        // SAFETY: `addr` was produced from a valid `DeferredFreeFun` in
+        // `register_deferred_free` (and is non-zero, checked above); transmute
+        // back to call it. Re-registration is not expected to race with
+        // collection (single-registration contract); `arg` is opaque and never
+        // dereferenced here.
+        let fun: DeferredFreeFun = unsafe { core::mem::transmute::<usize, DeferredFreeFun>(addr) };
+        fun(force, hb, arg);
+    }
+
+    /// `mi_thread_init`: ensure the calling thread's default heap is
+    /// initialized. Idempotent — safe to call repeatedly.
+    pub fn thread_init() {
+        super::tls::touch();
+    }
+
+    /// `mi_thread_done`: reclaim the calling thread's pending frees now. Full
+    /// page hand-off (abandoning pages that still hold live blocks) happens
+    /// automatically at real thread exit via the thread_local `Drop`; this just
+    /// drains + retires empties early. Idempotent.
+    pub fn thread_done() {
+        super::tls::collect_lifecycle(true);
+    }
+
+    /// `mi_process_init`: force process-wide initialization (keys + this
+    /// thread's heap). Idempotent (keys via `OnceBox`; heap via thread_local).
+    pub fn process_init() {
+        let _ = super::process_keys();
+        thread_init();
+    }
+
+    /// `mi_process_done`: best-effort process cleanup. The OS reclaims all
+    /// mappings at exit, so this only drains the calling thread; it does NOT
+    /// tear down global state (other threads may still be running). Idempotent
+    /// and safe to call more than once.
+    pub fn process_done() {
+        super::tls::collect_lifecycle(true);
+    }
+}
+
+#[cfg(feature = "std")]
+pub use lifecycle::{
+    process_done, process_init, register_deferred_free, run_deferred_free, thread_done,
+    thread_init, DeferredFreeFun,
+};
+
+/// Serializes tests that mutate the process-global deferred-free registry
+/// (here and in `capi`), so concurrent test threads don't overwrite each
+/// other's registration. Test-only; no effect on the shipped allocator.
+#[cfg(all(test, feature = "std"))]
+pub(crate) static DEFERRED_REG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Grow/shrink an allocation, preserving its contents.
 ///
@@ -210,6 +358,106 @@ mod tests {
             .collect();
         for h in handles {
             h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn deferred_free_fires_on_collect() {
+        use core::ffi::c_void;
+        use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        // Process-global counters; key the callback to its own `arg` sentinel so
+        // collects driven by other (parallel) tests' threads never bump them.
+        static FIRED: AtomicUsize = AtomicUsize::new(0);
+        static LAST_HB: AtomicU64 = AtomicU64::new(0);
+        static SENTINEL: u8 = 0;
+
+        extern "C" fn cb(_force: bool, heartbeat: u64, arg: *mut c_void) {
+            if arg == core::ptr::addr_of!(SENTINEL) as *mut c_void {
+                FIRED.fetch_add(1, Ordering::Relaxed);
+                LAST_HB.store(heartbeat, Ordering::Relaxed);
+            }
+        }
+
+        let _guard = super::DEFERRED_REG_TEST_LOCK.lock().unwrap();
+        let arg = core::ptr::addr_of!(SENTINEL) as *mut c_void;
+        register_deferred_free(Some(cb), arg);
+        let before = FIRED.load(Ordering::Relaxed);
+        collect(true);
+        let after = FIRED.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "deferred-free callback must fire on collect"
+        );
+        // Heartbeat advances monotonically (other threads may bump it too).
+        let hb1 = LAST_HB.load(Ordering::Relaxed);
+        collect(true);
+        let hb2 = LAST_HB.load(Ordering::Relaxed);
+        assert!(hb2 > hb1, "heartbeat must advance across collects");
+
+        // After clearing, our keyed counter must not advance again.
+        register_deferred_free(None, core::ptr::null_mut());
+        let cleared = FIRED.load(Ordering::Relaxed);
+        collect(true);
+        assert_eq!(
+            FIRED.load(Ordering::Relaxed),
+            cleared,
+            "callback must not fire after being cleared"
+        );
+    }
+
+    #[test]
+    fn deferred_free_reentrancy_bounded() {
+        use core::ffi::c_void;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        // A callback that re-enters collection must NOT be fired again (the
+        // recurse guard bounds it to depth 1), so this cannot stack-overflow.
+        static DEPTH: AtomicUsize = AtomicUsize::new(0);
+        static MAX_DEPTH: AtomicUsize = AtomicUsize::new(0);
+        static SENTINEL: u8 = 0;
+
+        extern "C" fn cb(_force: bool, _heartbeat: u64, arg: *mut c_void) {
+            if arg != core::ptr::addr_of!(SENTINEL) as *mut c_void {
+                return;
+            }
+            let d = DEPTH.fetch_add(1, Ordering::Relaxed) + 1;
+            MAX_DEPTH.fetch_max(d, Ordering::Relaxed);
+            // Re-enter collection from inside the callback: the guard must make
+            // this a no-op (our callback must not fire a second time).
+            collect(true);
+            DEPTH.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        let _guard = super::DEFERRED_REG_TEST_LOCK.lock().unwrap();
+        let arg = core::ptr::addr_of!(SENTINEL) as *mut c_void;
+        register_deferred_free(Some(cb), arg);
+        collect(true); // must return (no unbounded self-recursion)
+        register_deferred_free(None, core::ptr::null_mut());
+        // Bounded to depth 1: the nested collect never re-fired the callback.
+        // (`<= 1` rather than `== 1` to tolerate the global registry being
+        // overwritten by a parallel test before our outer collect fires it.)
+        assert!(
+            MAX_DEPTH.load(Ordering::Relaxed) <= 1,
+            "deferred-free callback must be bounded to recursion depth 1"
+        );
+    }
+
+    #[test]
+    fn lifecycle_idempotent() {
+        // Repeated lifecycle calls are safe no-ops on a live thread.
+        process_init();
+        thread_init();
+        thread_init();
+        thread_done();
+        process_done();
+        process_done();
+        // Allocator still usable after the lifecycle calls.
+        // SAFETY: pointer comes from this allocator.
+        unsafe {
+            let p = malloc(64).unwrap();
+            core::ptr::write_bytes(p.as_ptr(), 0x11, 64);
+            free(p);
         }
     }
 
