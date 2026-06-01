@@ -23,6 +23,17 @@ use crate::bits::{MI_ARENA_SLICE_SIZE, MI_INTPTR_SIZE, MI_MAX_ALIGN_SIZE, MI_PAG
 use crate::free_list::Block;
 use crate::layout::align_up;
 
+/// Extend the free list by at most this many bytes' worth of blocks at a time
+/// (ports `MI_MAX_EXTEND_SIZE`); bounds the upfront init cost per batch.
+const MI_MAX_EXTEND_SIZE: usize = 4096;
+/// Always extend by at least this many blocks (ports `MI_MIN_EXTEND`).
+///
+/// Upstream uses `8*MI_SECURE` under `secure` to enlarge batches for the
+/// randomized free-list-shuffle hardening; that shuffle path is not yet ported
+/// (see the `secure` free-list work), so we keep `1` for all builds. This only
+/// affects batch size, not correctness.
+const MI_MIN_EXTEND: usize = 1;
+
 /// A mimalloc page: header for a run of slices serving fixed-size blocks.
 #[repr(C)]
 pub struct Page {
@@ -101,7 +112,10 @@ impl Page {
                 local_free: Cell::new(core::ptr::null_mut()),
                 xthread_free: AtomicPtr::new(core::ptr::null_mut()),
                 used: Cell::new(0),
-                capacity: Cell::new(reserved),
+                // Lazily built: the free list starts empty and is extended in
+                // batches on demand (see `extend_free`), so page creation does
+                // not touch every block's memory upfront (better cache locality).
+                capacity: Cell::new(0),
                 reserved,
                 block_size,
                 page_start,
@@ -115,30 +129,51 @@ impl Page {
                 bin: Cell::new(0),
                 abandoned_next: AtomicPtr::new(core::ptr::null_mut()),
             });
-            let page = &*hdr;
-            page.build_free_list();
+            // No upfront free-list build: the first `alloc` extends it.
             NonNull::new_unchecked(hdr)
         }
     }
 
-    /// Thread all `reserved` blocks onto the `free` list.
+    /// Extend the free list from uninitialized capacity, in a bounded batch
+    /// (ports `mi_page_extend_free`). Threads blocks `[capacity, capacity+n)`
+    /// onto `free` in ascending address order and advances `capacity`. Does
+    /// nothing once `capacity == reserved`. This keeps page creation from
+    /// touching every block upfront and keeps freshly-initialized blocks hot in
+    /// cache near their first use.
     ///
     /// # Safety
-    /// Must run once, at init, before the page is shared.
-    unsafe fn build_free_list(&self) {
-        let mut head: *mut Block = core::ptr::null_mut();
-        let mut i = self.reserved as usize;
-        while i > 0 {
+    /// Owner-only; called when `free` is empty. `self`'s `Cell` fields are not
+    /// touched by other threads.
+    unsafe fn extend_free(&self) {
+        let cap = self.capacity.get() as usize;
+        let reserved = self.reserved as usize;
+        if cap >= reserved {
+            return;
+        }
+        // Batch ~MI_MAX_EXTEND_SIZE bytes of blocks at a time (at least
+        // MI_MIN_EXTEND), capped by the remaining capacity. Simplified-equivalent
+        // of upstream's `bsize >= MI_MAX_EXTEND_SIZE ? MI_MIN_EXTEND : .../bsize`
+        // branch for `MI_MIN_EXTEND == 1` (block_size >= MI_INTPTR_SIZE, so no
+        // divide-by-zero).
+        let max_extend = (MI_MAX_EXTEND_SIZE / self.block_size).max(MI_MIN_EXTEND);
+        let extend = (reserved - cap).min(max_extend);
+        // Thread `[cap, cap+extend)` with the lowest index at the head, prepended
+        // to the current free list (empty in practice on the owner path) —
+        // sequential addresses for locality.
+        let mut head = self.free.get();
+        let mut i = cap + extend;
+        while i > cap {
             i -= 1;
-            // SAFETY: block i lies within the page area.
+            // SAFETY: block `i < reserved` lies within the page area.
             let b = unsafe { self.page_start.add(i * self.block_size) } as *mut Block;
-            // SAFETY: b is a valid, writable block slot.
+            // SAFETY: `b` is a valid, writable block slot.
             unsafe {
                 (*b).set_next(head, self.keys);
             }
             head = b;
         }
         self.free.set(head);
+        self.capacity.set((cap + extend) as u32);
     }
 
     /// Migrate `local_free` and the cross-thread `xthread_free` list into `free`.
@@ -281,11 +316,17 @@ impl Page {
     pub fn alloc(&self) -> Option<NonNull<u8>> {
         let mut b = self.free.get();
         if b.is_null() {
-            // SAFETY: owner path.
+            // SAFETY: owner path — reclaim any local/cross-thread frees first.
             unsafe { self.collect() };
             b = self.free.get();
             if b.is_null() {
-                return None;
+                // Still empty: initialize the next batch of blocks on demand.
+                // SAFETY: owner path; only runs when `free` is empty.
+                unsafe { self.extend_free() };
+                b = self.free.get();
+                if b.is_null() {
+                    return None; // truly full: capacity == reserved
+                }
             }
         }
         // Debug: every block handed out must lie on the page's block grid; a
@@ -406,14 +447,20 @@ impl Page {
         self.used.get() == 0
     }
 
-    /// Is the page out of immediately-available blocks (after a collect)?
+    /// Is the page unable to serve another allocation? It is full only when the
+    /// free list is empty after a collect **and** there is no uninitialized
+    /// capacity left to extend (`capacity == reserved`); an extendable page can
+    /// still serve, so it is not full.
     pub fn is_full(&self) -> bool {
         if !self.free.get().is_null() {
             return false;
         }
         // SAFETY: owner path.
         unsafe { self.collect() };
-        self.free.get().is_null()
+        if !self.free.get().is_null() {
+            return false;
+        }
+        self.capacity.get() >= self.reserved
     }
 
     /// Does block-aligned `ptr` belong to this page's area?
