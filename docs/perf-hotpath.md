@@ -100,6 +100,52 @@ The implementation is preserved at the git tag
 path or a non-Linux TLS model makes the direct slot pay off). Do not re-attempt
 without new evidence that TLS access — not full-page scan / inlining — is the cost.
 
+#### C2-update — the real TLS lever is the **TLS model**, and it only shows under `LD_PRELOAD`
+The A1a null result above was measured on a **statically-linked** binary
+(`profile_alloc`, and the `#[global_allocator]`-style `bench_suite`/`perf_compare`
+harness). A static executable gets the **local-exec** TLS model automatically —
+the fastest model, a bare `%fs`-relative load — so `.with()` vs a raw
+`#[thread_local]` slot is genuinely neutral there. That hid the true cost.
+
+Under **`LD_PRELOAD`** (the *fair* cross-allocator comparison — the C reference
+and mimalloc-rs both preloaded as shared objects), the picture is different. A
+Rust `cdylib` defaults to the **general-dynamic** TLS model, whose every access
+is an out-of-line **`__tls_get_addr`** call. Both TLS reads on the hot path —
+`DEFAULT_HEAP` (alloc) and the `TID` cell behind `current_tid()` (free) — pay it
+on *every* `malloc`/`free`. mimalloc-C, even when preloaded, compiles its
+`__thread` theap pointer with **initial-exec** (`MI_TLS_MODEL` /
+`__attribute__((tls_model("initial-exec")))`), so it never makes that call.
+
+Profiling larson under `LD_PRELOAD` on the pinned i7-14700K confirmed it:
+`__tls_get_addr` (+ its PLT stub) accounted for **~5–6%** of cycles, and building
+the preload `cdylib` with `-Z tls-model=initial-exec` removed it — a direct
+`%fs`-relative load, matching C. Measured medians (LD_PRELOAD, vs C `libmimalloc`):
+
+| workload | default (general-dynamic) | initial-exec | gap to C: before → after |
+|----------|---------------------------|--------------|--------------------------|
+| larson (8T) | 200 Mops/s | ~214 Mops/s | −10.4% → **−4.3%** |
+| cfrac (1T)  | 1.74 s     | 1.62 s      | −13.7% → **−5.9%** |
+| espresso (1T) | 2.91 s   | 2.84 s      | −5.4% → **−2.9%** |
+| mstress (8T) | ≈C        | =C          | — |
+
+initial-exec is safe for a preloaded library (it is loaded at program startup,
+when the dynamic linker still sizes the static TLS block). The fix therefore
+lives in the **preload build recipe** (`scripts/mimalloc-bench.sh`,
+`scripts/preload-check.sh`), applied only on a nightly toolchain (the `-Z` flag),
+and changes **no source** — so the statically-linked path (already local-exec)
+and the in-repo `perf_compare` gate are untouched. See `docs/benchmarking.md`.
+
+**TLS footprint (deferred, not a perf change).** `DEFAULT_HEAP` stores the whole
+`Heap` *inline* in TLS (a few KB), whereas C keeps a `__thread mi_heap_t*`
+*pointer* (8 B) and allocates the heap out of line. The inline form is actually
+*faster* for the dominant static `#[global_allocator]` use — TLS access is a
+direct address, with no pointer dereference. Moving the heap out of line would
+make initial-exec usable even when the library is `dlopen`-ed at runtime (not
+just `LD_PRELOAD`-ed), and would match C more closely, but it adds one
+indirection per access and risks regressing the static phase-1 hot path for no
+benchmark gain. Left as documented future work; `dlopen` users who hit a static
+TLS-block error should build with the default (general-dynamic) model.
+
 ### C3 — call-chain inlining — `init::malloc_aligned → DEFAULT_HEAP.with(closure) → Heap::alloc_aligned → alloc → alloc_impl → Page::alloc` — **needs asm**
 Six layers plus the `.with` closure. If the chain does not collapse, every alloc
 pays call overhead the C fast path does not.

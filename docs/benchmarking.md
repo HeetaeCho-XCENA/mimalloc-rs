@@ -46,10 +46,31 @@ cargo run --release --example rss_spike                       # purge on  → RS
 MIMALLOC_PURGE_DELAY=-1 cargo run --release --example rss_spike  # off → RSS stays (control)
 ```
 
+## Preload TLS model (fair LD_PRELOAD comparison)
+
+For an apples-to-apples comparison both allocators must be loaded the same way —
+**`LD_PRELOAD`-ed shared objects** (not the C lib via `dlopen` function pointers,
+which adds indirection and flatters mimalloc-rs). When the preload `cdylib` is
+built on a **nightly** toolchain, `scripts/mimalloc-bench.sh` and
+`scripts/preload-check.sh` add `-Z tls-model=initial-exec`, matching
+mimalloc-C's `MI_TLS_MODEL`: a Rust `cdylib` otherwise defaults to the
+general-dynamic TLS model, whose `__tls_get_addr` call lands on every
+malloc/free. initial-exec removes it (≈+7% on larson/cfrac; see
+`docs/perf-hotpath.md` §C2-update). It is safe because a preloaded library is
+loaded at startup. To reproduce by hand:
+
+```sh
+RUSTFLAGS="--cfg override_export -Z tls-model=initial-exec" \
+  cargo rustc --release --features override --crate-type cdylib --target-dir target/preload
+```
+
+This affects only the preload `cdylib`; statically-linked `#[global_allocator]`
+use already gets the fast local-exec model, so `perf_compare.sh` is unaffected.
+
 ## Notes / caveats
 
 - **Linux residency**: on overcommit Linux `commit` is `mprotect`; pages become
   resident on first touch, so the lever for RSS is **purge** (`MADV_DONTNEED`),
   not commit. See `docs/perf-hotpath.md` §C2 and the purge round notes.
 - The known small-object hot-path gap vs C and its analysis (full-page eviction,
-  inlining; TLS ruled out) live in `docs/perf-hotpath.md`.
+  inlining; TLS model on the preload path) live in `docs/perf-hotpath.md`.
