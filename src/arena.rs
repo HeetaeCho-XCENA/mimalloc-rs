@@ -39,11 +39,10 @@ pub struct Arena {
     /// `set = free`. Storage: `[free_chunkmap][free_chunks; chunk_count]`.
     free_chunkmap: NonNull<BChunk>,
     free_chunks: NonNull<BChunk>,
-    /// `set = committed`.
+    /// `set = committed`. Authoritative: an eager arena pre-sets every bit at
+    /// creation, so on-demand commit and recommit-after-purge share one path.
     commit_chunkmap: NonNull<BChunk>,
     commit_chunks: NonNull<BChunk>,
-    /// Whether the whole region was committed at creation.
-    eager_committed: bool,
 }
 
 // SAFETY: the only mutable shared state is the atomic bitmaps (BChunk = atomics);
@@ -119,11 +118,14 @@ impl Arena {
                 free_chunks,
                 commit_chunkmap,
                 commit_chunks,
-                eager_committed: commit,
             });
             let a = &*arena;
             // Mark all real slices free.
             a.free_bitmap().unsafe_set_n(0, slice_count);
+            // Eager arenas commit the whole region up front: pre-set every commit
+            // bit so the (authoritative) commit bitmap reflects reality and the
+            // alloc path does no per-slice commit. A lazy arena leaves the bits
+            // clear and commits on demand in `ensure_committed`.
             if commit {
                 a.commit_bitmap().unsafe_set_n(0, slice_count);
             }
@@ -180,8 +182,14 @@ impl Arena {
 
     /// Ensure slices `[idx, idx+n)` are committed. Returns false if the OS
     /// refused to commit (e.g. `ENOMEM` on a `MAP_NORESERVE` reservation).
+    ///
+    /// The commit bitmap is **authoritative**: an eager arena pre-set all bits at
+    /// creation (so this is a no-op for it), and a purge that decommits clears
+    /// the bits, so reuse re-commits here. This is what makes purge-then-reuse
+    /// correct even under `debug`/`secure`, where decommit strips access
+    /// (`PROT_NONE`) and a real recommit (`mprotect`) is required.
     fn ensure_committed(&self, idx: usize, n: usize) -> bool {
-        if self.eager_committed || self.commit_bitmap().is_set_n(idx, n) {
+        if self.commit_bitmap().is_set_n(idx, n) {
             return true;
         }
         let ptr = self.slice_ptr(idx);
@@ -270,6 +278,44 @@ mod tests {
             a.free_slices(i8, 8);
             a.free_slices(i16, 16);
             assert_eq!(a.free_slice_count(), 64, "no slice leak");
+
+            Arena::destroy(arena);
+        }
+    }
+
+    #[test]
+    fn recommit_after_commit_bit_clear() {
+        // The property PC2 relies on: a purge that clears commit bits must force
+        // a real recommit on the next allocation of that slice. Exercised here by
+        // decommitting + clearing the bits directly (eager arena, all bits preset).
+        let arena = Arena::create(4, true).unwrap();
+        // SAFETY: fresh arena; single-threaded test.
+        unsafe {
+            let a = arena.as_ref();
+            let (i, p) = a.alloc_slices(4, 0).unwrap();
+            assert_eq!(i, 0);
+            core::ptr::write_bytes(p.as_ptr(), 0xCC, 4 * MI_ARENA_SLICE_SIZE);
+            a.free_slices(0, 4);
+
+            // Simulate a decommit-purge of the region: drop the pages and clear
+            // the commit bits (under debug/secure this also strips access).
+            os::decommit(p, 4 * MI_ARENA_SLICE_SIZE);
+            a.commit_bitmap().clear_n(0, 4);
+            assert!(
+                !a.commit_bitmap().is_set_n(0, 4),
+                "purge cleared commit bits"
+            );
+
+            // Reuse must recommit before handing the slices back.
+            let (j, q) = a.alloc_slices(4, 0).unwrap();
+            assert_eq!(j, 0);
+            core::ptr::write_bytes(q.as_ptr(), 0x99, 4 * MI_ARENA_SLICE_SIZE);
+            assert_eq!(*q.as_ptr(), 0x99, "recommitted slice is writable");
+            assert_eq!(*q.as_ptr().add(4 * MI_ARENA_SLICE_SIZE - 1), 0x99);
+            assert!(
+                a.commit_bitmap().is_set_n(0, 4),
+                "reuse re-set the commit bits"
+            );
 
             Arena::destroy(arena);
         }
