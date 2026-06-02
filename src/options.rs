@@ -29,10 +29,13 @@ pub enum Opt {
     ArenaReserve = 5,
     /// `MIMALLOC_ARENA_PURGE_MULT`: multiplier on `PurgeDelay` for arenas (v3).
     ArenaPurgeMult = 6,
+    /// `MIMALLOC_PAGE_FULL_RETAIN`: number of full (small) pages to keep in a
+    /// bin queue before evicting (abandoning) them during the page search (v3).
+    PageFullRetain = 7,
 }
 
 /// Number of options.
-pub const OPT_COUNT: usize = 7;
+pub const OPT_COUNT: usize = 8;
 
 impl Opt {
     /// Map a C API option index to an `Opt`.
@@ -45,6 +48,7 @@ impl Opt {
             4 => Some(Opt::PurgeDelay),
             5 => Some(Opt::ArenaReserve),
             6 => Some(Opt::ArenaPurgeMult),
+            7 => Some(Opt::PageFullRetain),
             _ => None,
         }
     }
@@ -58,6 +62,7 @@ impl Opt {
             Opt::PurgeDelay => "MIMALLOC_PURGE_DELAY",
             Opt::ArenaReserve => "MIMALLOC_ARENA_RESERVE",
             Opt::ArenaPurgeMult => "MIMALLOC_ARENA_PURGE_MULT",
+            Opt::PageFullRetain => "MIMALLOC_PAGE_FULL_RETAIN",
         }
     }
 
@@ -68,6 +73,21 @@ impl Opt {
             Opt::PurgeDecommits => 1, // v3: purge via decommit (MADV_DONTNEED on Linux)
             Opt::PurgeDelay => 1000,  // v3: 1000 ms before purging freed memory
             Opt::ArenaPurgeMult => 1, // v3: arena delay = purge_delay * 1
+            // Full-page eviction default. `>=0` enables it with that retain
+            // budget; `<0` disables it. It relieves cross-thread-free contention
+            // (xmalloc-test) but its abandon/reclaim churn regresses the
+            // single/intra-thread small-alloc path (perf_compare phase 1/2) where
+            // there is nothing to relieve — so it is **off** for a static
+            // `#[global_allocator]` and **on** for the preload `cdylib`
+            // (`override_export`), the LD_PRELOAD allocator-replacement scenario.
+            // The on-value is 16, not v3's 2: our abandon/reclaim churn is
+            // costlier than C's, so a measured-higher retain keeps the
+            // xmalloc-test win (-24%->-11%) without regressing larson/mstress
+            // (docs/GOAL-fe2-revival.md FR3).
+            #[cfg(override_export)]
+            Opt::PageFullRetain => 16,
+            #[cfg(not(override_export))]
+            Opt::PageFullRetain => -1,
             _ => 0,
         }
     }
@@ -164,6 +184,14 @@ pub fn eager_commit() -> bool {
 #[inline]
 pub fn purge_delay() -> i64 {
     get(Opt::PurgeDelay)
+}
+
+/// Number of full (small) pages a bin queue retains before the page search
+/// evicts (abandons) them (v3 `page_full_retain`, default 2). `<0` disables
+/// eviction (full pages are never abandoned during the search).
+#[inline]
+pub fn page_full_retain() -> i64 {
+    get(Opt::PageFullRetain)
 }
 
 /// Whether a purge returns memory via decommit (`true`) or reset (`false`).
