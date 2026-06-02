@@ -216,27 +216,12 @@ impl Heap {
             return self.alloc_huge(size);
         }
         let bs = bin_block_size(b);
-        // Pick the page that will serve this request, then record it for the
-        // fast path. Scan the bin queue, else reclaim an abandoned page, else
-        // carve a fresh one.
-        let mut pg = {
-            let mut found = core::ptr::null_mut();
-            let mut cur = self.pages[b].first();
-            while !cur.is_null() {
-                // SAFETY: queue holds valid pages owned by this heap.
-                if !unsafe { (*cur).is_full() } {
-                    found = cur;
-                    break;
-                }
-                cur = unsafe { (*cur).next.get() };
-            }
-            if found.is_null() {
-                found = self.try_reclaim(b).unwrap_or(core::ptr::null_mut());
-            }
-            if found.is_null() {
-                found = self.new_page(b, bs, page_slices_for(bs))?;
-            }
-            found
+        // Pick the page that will serve this request: scan the bin queue (evicting
+        // full pages as we pass them), else reclaim an abandoned page, else carve
+        // a fresh one.
+        let mut pg = match self.find_free_page(b) {
+            Some(p) => p,
+            None => self.new_page(b, bs, page_slices_for(bs))?,
         };
         // SAFETY: `pg` is a live page owned by this heap.
         let mut blk = unsafe { (*pg).alloc() };
@@ -247,10 +232,82 @@ impl Heap {
             // SAFETY: freshly created, non-full page.
             blk = unsafe { (*pg).alloc() };
         }
-        if blk.is_some() && wsize <= MI_SMALL_WSIZE_MAX {
-            self.pages_free_direct[wsize].set(pg);
+        if blk.is_some() {
+            if wsize <= MI_SMALL_WSIZE_MAX {
+                self.pages_free_direct[wsize].set(pg);
+            } else if bs > MI_SMALL_MAX_OBJ_SIZE && unsafe { (*pg).is_full() } {
+                // A medium/large page that just filled is evicted immediately
+                // (ports the end-of-`_mi_malloc_generic` to-full, page.c:1034) —
+                // these never linger in the queue; only small pages are retained.
+                // SAFETY: we own `pg`; the block just handed out keeps it live.
+                unsafe { self.page_to_full(pg, b) };
+            }
         }
         blk
+    }
+
+    /// Find a page in bin `b` with a free block, **evicting full pages** as the
+    /// scan passes them so the queue does not grow without bound (ports
+    /// `mi_page_queue_find_free_ex` — first-fit with a `page_full_retain` budget;
+    /// the candidate-preference heuristic is omitted). Returns the first usable
+    /// page, else an abandoned page reclaimed for this heap, else `None` (the
+    /// caller carves a fresh page).
+    fn find_free_page(&self, b: usize) -> Option<*mut Page> {
+        // Only small pages are retained; larger pages are evicted as soon as full.
+        let mut retain: i64 = if bin_block_size(b) <= MI_SMALL_MAX_OBJ_SIZE {
+            crate::options::page_full_retain()
+        } else {
+            0
+        };
+        let mut cur = self.pages[b].first();
+        while !cur.is_null() {
+            // SAFETY: the bin queue holds valid pages owned by this heap.
+            let next = unsafe { (*cur).next.get() };
+            // Ready block? Check cheaply first, then collect on a miss.
+            // SAFETY: owner-only access to our own page.
+            let avail = unsafe {
+                (*cur).has_free() || {
+                    (*cur).collect_free();
+                    (*cur).has_free()
+                }
+            };
+            // SAFETY: owner.
+            if avail || unsafe { (*cur).is_expandable() } {
+                return Some(cur); // first usable page (alloc extends it if needed)
+            }
+            // Full and not expandable: evict (abandon) once the retain budget runs out.
+            retain -= 1;
+            if retain < 0 {
+                // SAFETY: owner; `cur` is in this bin queue.
+                unsafe { self.page_to_full(cur, b) };
+            }
+            cur = next;
+        }
+        self.try_reclaim(b)
+    }
+
+    /// Evict a full page from bin `b`: unlink it and hand it off to the abandoned
+    /// state (ports `mi_page_to_full` → `_mi_page_abandon` for the default
+    /// abandon-capable heap). Its live blocks stay valid; a later free into it
+    /// claims it (collect-on-free) and frees or remaps it.
+    ///
+    /// # Safety
+    /// `page_ptr` is a live page owned by this heap, linked in `self.pages[bin]`.
+    unsafe fn page_to_full(&self, page_ptr: *mut Page, bin: usize) {
+        // Clear any fast-path entries pointing at it before it leaves the heap.
+        for slot in self.pages_free_direct.iter() {
+            if slot.get() == page_ptr {
+                slot.set(core::ptr::null_mut());
+            }
+        }
+        // SAFETY: `page_ptr` is linked in this bin queue; then hand it off.
+        unsafe {
+            self.pages[bin].remove(page_ptr);
+            abandon_owned_page(self.subproc, page_ptr, bin);
+        }
+        // Drive delayed purging opportunistically (mirrors v3 abandon →
+        // `_mi_arenas_collect`).
+        self.subproc.try_purge(false);
     }
 
     /// Adopt an abandoned page of `bin` (left by an exited thread): claim
@@ -686,6 +743,42 @@ unsafe fn release_page_slices(page_ptr: *mut Page) {
     }
 }
 
+/// Hand a page we own off to the abandoned state (shared by `Heap::drop` and
+/// full-page eviction, `page_to_full`). Collect it, then: empty → return its
+/// slices to the arena; full → abandoned **unmapped** (resurrected only via a
+/// later free-claim); otherwise → abandoned **mapped** (registered in
+/// `pages_abandoned[bin]`, findable for reclaim-on-alloc). Ownership is released
+/// last, after the state is stamped, so a concurrent free cannot claim it
+/// mid-handoff. Ports `_mi_page_abandon`.
+///
+/// # Safety
+/// `page_ptr` is a live page owned by the caller, already unlinked from any bin
+/// queue, with provenance set.
+unsafe fn abandon_owned_page(subproc: &Subproc, page_ptr: *mut Page, bin: usize) {
+    // SAFETY: owner-only access to our own page.
+    unsafe { (*page_ptr).collect_free() };
+    // SAFETY: owner.
+    if unsafe { (*page_ptr).is_all_free() } {
+        // SAFETY: empty + unlinked.
+        unsafe { release_page_slices(page_ptr) };
+    } else if unsafe { (*page_ptr).is_full() } {
+        // Full ⇒ abandoned but unmapped (kept out of the registry).
+        // SAFETY: owner.
+        unsafe {
+            (*page_ptr).set_owner(MI_THREADID_ABANDONED);
+            (*page_ptr).set_unowned();
+        }
+    } else {
+        // Has free space ⇒ abandoned mapped: register, stamp, then release.
+        // SAFETY: owner; the page's slices belong to its arena.
+        unsafe {
+            subproc.abandon_page(page_ptr, bin);
+            (*page_ptr).set_owner(MI_THREADID_ABANDONED_MAPPED);
+            (*page_ptr).set_unowned();
+        }
+    }
+}
+
 /// Clear a page's entry from its arena's abandoned registry, if it is currently
 /// abandoned-mapped. Called before freeing/reusing a page we own.
 ///
@@ -772,23 +865,7 @@ impl Drop for Heap {
                 // SAFETY: owner thread; draining our own queue.
                 unsafe {
                     self.pages[b].remove(cur);
-                    (*cur).collect_free();
-                    if (*cur).is_all_free() {
-                        release_page_slices(cur);
-                    } else if (*cur).is_full() {
-                        // Full ⇒ abandoned but **unmapped** (kept out of the
-                        // registry; resurrected only when a later free claims it).
-                        (*cur).set_owner(MI_THREADID_ABANDONED);
-                        (*cur).set_unowned();
-                    } else {
-                        // Has free space ⇒ abandoned **mapped**: register it (set
-                        // the bitmap bit) and stamp the mapped state before
-                        // releasing ownership, so a reclaimer that finds the bit
-                        // must win the ownership race first.
-                        self.subproc.abandon_page(cur, b);
-                        (*cur).set_owner(MI_THREADID_ABANDONED_MAPPED);
-                        (*cur).set_unowned();
-                    }
+                    abandon_owned_page(self.subproc, cur, b);
                 }
                 cur = next;
             }
@@ -842,6 +919,53 @@ mod tests {
             [0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321],
             crate::init::current_tid(),
         )
+    }
+
+    #[test]
+    fn full_pages_evicted_keeps_queue_bounded() {
+        // The core FE2 property: holding many pages' worth of live blocks, full
+        // pages are evicted (abandoned) from the bin queue so it stays bounded —
+        // while every block remains valid and everything frees without leak.
+        let h = test_heap();
+        let b = bin(64);
+        // SAFETY: pointers come from this heap; freed on this thread.
+        unsafe {
+            let n = 20_000usize; // ~20 pages' worth of 64-byte blocks
+            let mut ptrs = alloc::vec::Vec::new();
+            for _ in 0..n {
+                ptrs.push(h.alloc(64).unwrap());
+            }
+            // Without eviction the queue would hold ~20 pages; with eviction it is
+            // bounded to the retain budget + the page being filled.
+            let qlen = h.pages[b].len();
+            assert!(
+                qlen <= 8,
+                "bin queue not bounded under full-page eviction: {qlen} pages"
+            );
+            // No corruption from abandon/claim: every block is distinct + writable.
+            let mut addrs: alloc::vec::Vec<usize> = ptrs.iter().map(|p| p.addr().get()).collect();
+            addrs.sort_unstable();
+            let len = addrs.len();
+            addrs.dedup();
+            assert_eq!(addrs.len(), len, "eviction caused a double allocation");
+            for (i, p) in ptrs.iter().enumerate() {
+                core::ptr::write_bytes(p.as_ptr(), (i & 0xff) as u8, 64);
+            }
+            // Frees into evicted (abandoned) pages take the claim/collect-on-free
+            // path; everything must drain with no leak.
+            for p in ptrs {
+                free(p);
+            }
+            h.collect(true);
+            assert_eq!(
+                h.pages[b].len(),
+                0,
+                "all pages should be freed after draining the live set"
+            );
+            // Heap still usable.
+            let q = h.alloc(64).unwrap();
+            free(q);
+        }
     }
 
     #[test]

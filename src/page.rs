@@ -625,6 +625,22 @@ impl Page {
             == MI_THREADID_ABANDONED_MAPPED
     }
 
+    /// Does the page have a block ready to hand out *right now* (the `free` list
+    /// is non-empty)? Cheap (no collect) — the page search checks this first and
+    /// only collects on a miss (ports `mi_page_immediate_available`). Owner-only.
+    #[inline]
+    pub fn has_free(&self) -> bool {
+        !self.free.get().is_null()
+    }
+
+    /// Can the page still initialize more blocks (capacity below reserved)? Such
+    /// a page is not "full" — `alloc` will extend it on demand (ports
+    /// `mi_page_is_expandable`). Owner-only.
+    #[inline]
+    pub fn is_expandable(&self) -> bool {
+        self.capacity.get() < self.reserved
+    }
+
     /// Block size served by this page.
     #[inline]
     pub fn block_size(&self) -> usize {
