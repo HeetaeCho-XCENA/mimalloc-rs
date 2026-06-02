@@ -157,3 +157,35 @@ blast radius per gate.
    whole point is keeping full pages out of the search.)
 4. **`page_reclaim_on_free` default 0** (reclaim only into the originating theap)
    — confirm we skip the threadpool/cross-thread-reclaim knobs for now.
+
+## 7. Refinements found during FE1b implementation (decisions recorded)
+
+- **tid base collides with `MI_THREADID_ABANDONED_MAPPED`.** `init::current_tid`
+  starts its counter at `NEXT = 1` ⇒ first tid `= 1 << 2 = 4`, which equals
+  `MI_THREADID_ABANDONED_MAPPED`. With the FE1b abandoned-state encoding
+  (`is_abandoned = owner_tid <= 4`), the first thread's pages would be
+  misclassified as abandoned. **Fix in FE1b:** start the counter at `NEXT = 2`
+  (first tid `= 8`), so every real tid is `> MI_THREADID_ABANDONED_MAPPED`.
+  (v3 is immune: `_mi_prim_thread_id()` returns a large OS value.) FE0/FE1a were
+  unaffected — they only compared `owner_tid` for equality with
+  `MI_THREADID_ABANDONED = 0`, which `4` never matched.
+- **Defer originating-theap reclaim-on-free.** v3's
+  `mi_abandoned_page_try_reclaim` (step 2 of the collect-mt ladder) reclaims a
+  freed-into abandoned page directly back into the originating theap. It needs
+  `free` to reach the current thread's heap (free is otherwise heap-independent).
+  **Decision:** FE1b implements steps 1 (free), 3 (reabandon-to-mapped), 4
+  (unown) only; a non-full claimed page goes back to the bitmap (mapped) and is
+  reclaimed on the next allocation. Correctness is identical; the only cost is an
+  extra bitmap round-trip vs a direct reclaim (an optimization left for a
+  follow-up if FE2 perf needs it). This keeps `free` decoupled from the heap and
+  shrinks the FE1b surface.
+- **`collect()` uses full collect (not v3's `_mi_page_free_collect_partly`).** The
+  port already drains `xthread_free` fully on collect; FE1b keeps that and makes
+  the swap a CAS that **preserves the owned LSB** (ports
+  `mi_page_thread_free_collect`), so after collect `xthread_free == (NULL, owned)`
+  — the state `unown_from_free` expects.
+- **`Bitmap::try_find_and_claim(tseq, claim) -> Option<usize>`** must clear the
+  bit **only if `claim` (page-ownership `fetch_or`-equivalent CAS) succeeds**, so
+  a free that already owns a mapped page is not stolen by an alloc-reclaimer (the
+  ownership LSB is the single serialization point). The existing
+  `try_find_and_clear` (unconditional clear) is **not** sufficient for FE1b.
