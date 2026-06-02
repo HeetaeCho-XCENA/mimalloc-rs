@@ -129,3 +129,49 @@ jobs:
         run: cargo install cargo-fuzz
       - name: Smoke fuzz (bounded)
         run: cargo fuzz run alloc -- -runs=100000 -max_total_time=60
+
+  # AddressSanitizer over the unit tests: out-of-bounds / use-after-free / leaks
+  # in our unsafe code paths.
+  asan:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo test --lib --target x86_64-unknown-linux-gnu
+
+  # ThreadSanitizer over the cross-thread stress tests: data races at real scale,
+  # complementing the loom models. Needs build-std for accurate instrumentation.
+  tsan:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Zsanitizer=thread
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - run: >
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --lib --
+          stress_owner_retire_vs_cross_thread_free
+          cross_thread_free_collected_by_owner
+          collect_reclaims_cross_thread_frees
+          abandoned_pages_reclaimed_across_threads
+
+  # Coverage report (informational; uploaded as an artifact).
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov
+      - name: Coverage (lib)
+        run: cargo llvm-cov --lib --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
