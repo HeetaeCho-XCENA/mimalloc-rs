@@ -33,9 +33,18 @@ trap cleanup EXIT
 #
 # NOTE: CI sets a global `RUSTFLAGS: -D warnings`. We must combine our cfg with
 # it, because setting RUSTFLAGS here fully *replaces* the inherited value.
+#
+# TLS model: build the preload library with the initial-exec model when on a
+# nightly toolchain (the `-Z` probe), matching mimalloc-C's `MI_TLS_MODEL` and
+# avoiding a `__tls_get_addr` call on every malloc/free (see scripts/mimalloc-bench.sh
+# and docs/perf-hotpath.md §C2). Safe for LD_PRELOAD (loaded at startup). On the
+# stable CI toolchain `-Zhelp` fails, the flag is omitted, and this correctness
+# smoke-test runs on the default model — TLS model does not affect correctness.
 PRELOAD_TARGET="$REPO_ROOT/target/preload"
-echo "Building override cdylib (RUSTFLAGS='--cfg override_export -D warnings')..."
-RUSTFLAGS="--cfg override_export -D warnings" \
+TLS_FLAG=""
+if rustc -Zhelp >/dev/null 2>&1; then TLS_FLAG=" -Z tls-model=initial-exec"; fi
+echo "Building override cdylib (RUSTFLAGS='--cfg override_export -D warnings${TLS_FLAG}')..."
+RUSTFLAGS="--cfg override_export -D warnings${TLS_FLAG}" \
     cargo rustc --release --features override --crate-type cdylib \
     --target-dir "$PRELOAD_TARGET"
 

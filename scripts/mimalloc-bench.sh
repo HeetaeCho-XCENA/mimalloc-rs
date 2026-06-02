@@ -41,7 +41,20 @@ THREADS="${BENCH_THREADS:-$(( $(nproc 2>/dev/null || echo 4) ))}"
 # --- 1. Build the mimalloc-rs override cdylib (same recipe as preload-check) ---
 PRELOAD_TARGET="$REPO_ROOT/target/preload"
 echo ">> building mimalloc-rs override cdylib ..."
-RUSTFLAGS="--cfg override_export" \
+# TLS model: mimalloc-C compiles its `__thread` theap pointer with the
+# initial-exec model (`MI_TLS_MODEL`). A Rust cdylib otherwise defaults to the
+# general-dynamic model, whose per-access `__tls_get_addr` call lands on *every*
+# malloc/free (the heap + thread-id live in TLS) — a measurable preload-path tax
+# (≈+7% on larson and cfrac on a pinned i7-14700K). initial-exec removes that
+# call (a direct `%fs`-relative load) and is safe here because an LD_PRELOAD
+# library is loaded at program startup, when the dynamic linker still sizes the
+# static TLS block. The flag is nightly-only (`-Z`); on stable we fall back to
+# the default model (correct, just a slower TLS access on the preload path).
+# Statically-linked `#[global_allocator]` use is unaffected — it already gets the
+# fast local-exec model. See docs/perf-hotpath.md §C2 and docs/benchmarking.md.
+TLS_FLAG=""
+if rustc -Zhelp >/dev/null 2>&1; then TLS_FLAG=" -Z tls-model=initial-exec"; fi
+RUSTFLAGS="--cfg override_export${TLS_FLAG}" \
     cargo rustc --release --features override --crate-type cdylib \
     --target-dir "$PRELOAD_TARGET" || { echo "FAIL: cdylib build"; exit 1; }
 RS_SO="$PRELOAD_TARGET/release/libmimalloc_rs.so"
