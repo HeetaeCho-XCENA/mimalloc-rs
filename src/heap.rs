@@ -29,33 +29,32 @@ use crate::page::Page;
 use crate::page_map;
 use crate::page_queue::PageQueue;
 use crate::subproc::{subproc_main, Subproc};
-use crate::sync::OnceBox;
 
-/// Canonical block size for each bin (the largest request the bin serves).
-fn bin_sizes() -> &'static [usize; MI_BIN_COUNT] {
-    static SIZES: OnceBox<[usize; MI_BIN_COUNT]> = OnceBox::new();
-    SIZES.get_or_init(|| {
-        let mut t = [0usize; MI_BIN_COUNT];
-        // Scan every word size up to the largest non-huge object and record the
-        // maximum byte size landing in each bin.
-        let max_wsize = MI_LARGE_MAX_OBJ_SIZE / MI_INTPTR_SIZE;
-        let mut w = 1;
-        while w <= max_wsize {
-            let sz = w * MI_INTPTR_SIZE;
-            let b = bin(sz);
-            if b < MI_BIN_HUGE && sz > t[b] {
-                t[b] = sz;
-            }
-            w += 1;
+/// Canonical block size for each bin (the largest request the bin serves),
+/// evaluated at compile time. C reads `pages[bin].block_size` (a plain field);
+/// computing this table as a `const` makes `bin_block_size` a bare array index
+/// with no runtime initialization atomic on the direct-miss alloc path.
+const BIN_SIZES: [usize; MI_BIN_COUNT] = {
+    let mut t = [0usize; MI_BIN_COUNT];
+    // Scan every word size up to the largest non-huge object and record the
+    // maximum byte size landing in each bin.
+    let max_wsize = MI_LARGE_MAX_OBJ_SIZE / MI_INTPTR_SIZE;
+    let mut w = 1;
+    while w <= max_wsize {
+        let sz = w * MI_INTPTR_SIZE;
+        let b = bin(sz);
+        if b < MI_BIN_HUGE && sz > t[b] {
+            t[b] = sz;
         }
-        t
-    })
-}
+        w += 1;
+    }
+    t
+};
 
 /// Block size for a (non-huge) bin.
 #[inline]
 fn bin_block_size(b: usize) -> usize {
-    bin_sizes()[b]
+    BIN_SIZES[b]
 }
 
 /// The usable size a `malloc(size)` would yield (`mi_good_size`): the block
@@ -182,6 +181,7 @@ impl Heap {
 
     /// Allocate `size` bytes (≥ `MI_INTPTR_SIZE`, naturally aligned to
     /// max-align). Returns `None` on OOM.
+    #[inline]
     pub fn alloc(&self, size: usize) -> Option<NonNull<u8>> {
         let r = self.alloc_impl(size);
         // Account by block size (matches `free`); only compiled under `stats`.
@@ -194,12 +194,23 @@ impl Heap {
         r
     }
 
+    /// Allocation fast path: serve from the page that last served this word size
+    /// (`pages_free_direct`), which usually still has a free block. The cold
+    /// queue-scan / reclaim / fresh-page work lives in `alloc_generic`.
+    ///
+    /// `alloc_generic` is marked `#[cold]` **only in the preload `cdylib` build**
+    /// (`cfg(override_export)`): there the fast shell must stay small so it inlines
+    /// across the export-symbol boundary into `malloc`/`operator new` (mirroring
+    /// C's force-inlined `mi_page_malloc_zero` over the noinline `_mi_malloc_generic`).
+    /// In a statically-linked `#[global_allocator]` build the caller sees the whole
+    /// chain and inlines holistically, so we leave `alloc_generic` un-hinted and let
+    /// the optimizer fold it back in — forcing it out of line there measurably
+    /// regresses the small-alloc hot path (phase 1).
+    #[inline]
     fn alloc_impl(&self, size: usize) -> Option<NonNull<u8>> {
         let size = size.max(MI_INTPTR_SIZE);
         let wsize = wsize_from_size(size);
 
-        // Fast path: the page that last served this word size (if any) usually
-        // still has a free block — skip the bin-queue scan.
         if wsize <= MI_SMALL_WSIZE_MAX {
             let p = self.pages_free_direct[wsize].get();
             if !p.is_null() {
@@ -210,7 +221,14 @@ impl Heap {
                 }
             }
         }
+        self.alloc_generic(size, wsize)
+    }
 
+    /// Cold allocation path: no direct page was available — map the size to its
+    /// bin and scan the bin queue, reclaim an abandoned page, or carve a fresh
+    /// one. (`#[cold]` only in the preload cdylib; see `alloc_impl`.)
+    #[cfg_attr(override_export, cold)]
+    fn alloc_generic(&self, size: usize, wsize: usize) -> Option<NonNull<u8>> {
         let b = bin(size);
         if b >= MI_BIN_HUGE {
             return self.alloc_huge(size);
@@ -459,6 +477,47 @@ pub fn is_in_heap_region(ptr: *const u8) -> bool {
     !ptr.is_null() && subproc_main().owns_address(ptr)
 }
 
+/// Cold free path for a pointer with no page-map entry: it is either genuinely
+/// foreign (system malloc, the linker, TLS) or one of *ours* whose page was
+/// retired/unregistered (a double-free, a free racing a concurrent retire, or
+/// freeing an already-reclaimed block). Disambiguate by arena membership —
+/// arenas are never unmapped, so an our-arena address with a cleared page-map
+/// entry is still ours and must NOT go to the system allocator (glibc would
+/// abort with "free(): invalid pointer"). Out of line in the preload cdylib so
+/// the common free path inlines into the exported entry point.
+///
+/// # Safety
+/// `ptr` was passed to `free` and has no page-map entry.
+#[cfg_attr(override_export, cold)]
+// The early `return` after handing a foreign pointer to the system free is
+// needed only when `secure`/`debug` is also on (otherwise control would fall
+// through to the abort); in the `override`-only config it is the last statement,
+// which clippy flags — but it is genuinely cfg-conditional, so allow it.
+#[allow(clippy::needless_return)]
+unsafe fn free_foreign_or_invalid(ptr: NonNull<u8>) {
+    // `ptr` is consumed below only in the `override`+`std` configuration; tie it
+    // off up front so every feature combination (e.g. `secure`/`debug` without
+    // `override`, where only the abort path runs) keeps it "used". `NonNull` is
+    // `Copy`, so the later reads are unaffected, and being first this is never
+    // unreachable after the diverging abort.
+    let _ = ptr;
+    #[cfg(all(feature = "override", feature = "std"))]
+    if !subproc_main().owns_address(ptr.as_ptr()) {
+        // Genuinely foreign pointer: hand it back to the real system free.
+        // SAFETY: not in any of our arenas ⇒ it is a system allocation safe
+        // to hand to the real libc free.
+        unsafe { crate::sysalloc::free(ptr.as_ptr() as *mut core::ffi::c_void) };
+        return;
+    }
+    // Ours-but-unmapped (or, in non-override builds, any unmapped pointer): an
+    // invalid/double free of one of our blocks. Default builds treat it as a
+    // no-op; hardened builds abort. Never forward it to the system.
+    #[cfg(any(feature = "secure", feature = "debug"))]
+    report_corruption_and_abort(
+        "mimalloc-rs: invalid free (pointer not owned by this allocator)\n",
+    );
+}
+
 /// Free a block previously returned by [`Heap::alloc`] (heap-independent).
 ///
 /// Finds the owning page through the page-map and returns the block to it.
@@ -467,33 +526,12 @@ pub fn is_in_heap_region(ptr: *const u8) -> bool {
 ///
 /// # Safety
 /// `ptr` must be a live allocation from this allocator.
+#[inline]
 pub unsafe fn free(ptr: NonNull<u8>) {
     let page_ptr = page_map::lookup(ptr.addr().get()) as *mut Page;
     if page_ptr.is_null() {
-        // A null page-map lookup is ambiguous: the pointer is either genuinely
-        // foreign (system malloc, the linker, TLS) or one of *ours* whose page
-        // was retired/unregistered (a double-free, a free racing a concurrent
-        // retire, or freeing an already-reclaimed block). Disambiguate by arena
-        // membership — arenas are never unmapped, so an our-arena address with a
-        // cleared page-map entry is still ours and must NOT go to the system
-        // allocator (glibc would abort with "free(): invalid pointer").
-        #[cfg(all(feature = "override", feature = "std"))]
-        if !subproc_main().owns_address(ptr.as_ptr()) {
-            // Genuinely foreign pointer: hand it back to the real system free.
-            // SAFETY: not in any of our arenas ⇒ it is a system allocation safe
-            // to hand to the real libc free.
-            unsafe { crate::sysalloc::free(ptr.as_ptr() as *mut core::ffi::c_void) };
-            return;
-        }
-        // Ours-but-unmapped (or, in non-override builds, any unmapped pointer):
-        // an invalid/double free of one of our blocks. Default builds treat it
-        // as a no-op; hardened builds abort. Never forward it to the system.
-        #[cfg(any(feature = "secure", feature = "debug"))]
-        report_corruption_and_abort(
-            "mimalloc-rs: invalid free (pointer not owned by this allocator)\n",
-        );
-        #[cfg(not(any(feature = "secure", feature = "debug")))]
-        return;
+        // SAFETY: forwarded; the cold path re-checks ownership before acting.
+        return unsafe { free_foreign_or_invalid(ptr) };
     }
     // The page's const fields (block size, area start) are immutable after init,
     // so they are sound to read from any thread.
@@ -846,7 +884,7 @@ mod tests {
 
     #[test]
     fn bin_size_table_monotonic() {
-        let t = bin_sizes();
+        let t = &BIN_SIZES;
         // small bins have the expected double-word sizes
         assert_eq!(t[1], 8);
         assert_eq!(t[2], 16);
