@@ -18,7 +18,7 @@ use crate::arena_meta::{meta_free, meta_zalloc};
 use crate::bits::{
     bin, wsize_from_size, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_HUGE, MI_INTPTR_SIZE,
     MI_LARGE_MAX_OBJ_SIZE, MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_PAGES_DIRECT,
-    MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED,
+    MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED, MI_THREADID_ABANDONED_MAPPED,
 };
 // Used only by the std free fast path's XOR dispatch (the no_std path is
 // single-owner and never inspects the page flags).
@@ -566,7 +566,15 @@ pub unsafe fn free(ptr: NonNull<u8>) {
                 recover_block(ptr)
             };
             // SAFETY: live page and block.
-            unsafe { Page::thread_free_push(page_ptr, block) };
+            let claimed = unsafe { Page::thread_free_push(page_ptr, block) };
+            if claimed {
+                // The page was abandoned and this push transitioned it
+                // unowned→owned: we now exclusively own it and must collect it,
+                // then free / reabandon / unown (ports mi_free_block_mt →
+                // mi_free_try_collect_mt).
+                // SAFETY: we exclusively own the page now.
+                unsafe { free_try_collect_mt(page_ptr) };
+            }
         }
     }
     #[cfg(not(feature = "std"))]
@@ -678,6 +686,78 @@ unsafe fn release_page_slices(page_ptr: *mut Page) {
     }
 }
 
+/// Clear a page's entry from its arena's abandoned registry, if it is currently
+/// abandoned-mapped. Called before freeing/reusing a page we own.
+///
+/// # Safety
+/// `page_ptr` is a live page owned by the caller, with provenance set.
+#[cfg(feature = "std")]
+unsafe fn unabandon_if_mapped(page_ptr: *mut Page) {
+    // SAFETY: owner holds the page; provenance set at creation.
+    let page = unsafe { &*page_ptr };
+    if page.is_abandoned_mapped() {
+        let arena = page.owning_arena();
+        if !arena.is_null() {
+            // SAFETY: the page's slice range belongs to this arena.
+            unsafe { (*arena).page_unabandon(page.slice_index, page.bin() as usize) };
+        }
+    }
+}
+
+/// We just claimed a previously-abandoned page by freeing a block into it
+/// (ports `mi_free_try_collect_mt`). With the page exclusively ours: collect, then
+/// (1) free it if now empty, else (3) reabandon-to-mapped if it has space again,
+/// else (4) release ownership. v3's step 2 — reclaim into the originating theap —
+/// is deferred (see `docs/DESIGN-fe1-ownership.md` §7); a freed-into page returns
+/// to the registry and is reclaimed on the next allocation instead.
+///
+/// # Safety
+/// The calling thread exclusively owns `page_ptr` (claimed via the ownership bit).
+#[cfg(feature = "std")]
+unsafe fn free_try_collect_mt(page_ptr: *mut Page) {
+    loop {
+        // SAFETY: we own the page; drain cross-thread + local frees (updates used).
+        unsafe { (*page_ptr).collect_free() };
+
+        // 1. All blocks free → unabandon (clear any registry bit) and return the
+        //    slices to the arena.
+        // SAFETY: owner.
+        if unsafe { (*page_ptr).is_all_free() } {
+            // SAFETY: owner; provenance set at creation.
+            unsafe {
+                unabandon_if_mapped(page_ptr);
+                release_page_slices(page_ptr);
+            }
+            return;
+        }
+
+        // 3. Reabandon-to-mapped: a page with free space that is not yet mapped
+        //    becomes findable for reclaim-on-alloc. Register it (set the bitmap
+        //    bit) and stamp the mapped state *before* releasing ownership, so a
+        //    concurrent reclaimer that finds the bit must lose the ownership race.
+        // SAFETY: owner; provenance set at creation.
+        if unsafe { !(*page_ptr).is_full() && !(*page_ptr).is_abandoned_mapped() } {
+            // SAFETY: owner; the page's slices belong to this arena.
+            unsafe {
+                let bin = (*page_ptr).bin() as usize;
+                let arena = (*page_ptr).owning_arena();
+                if !arena.is_null() {
+                    (*arena).page_abandon((*page_ptr).slice_index, bin);
+                    (*page_ptr).set_owner(MI_THREADID_ABANDONED_MAPPED);
+                }
+            }
+        }
+
+        // 4. Release ownership. If a concurrent free pushed a block in the
+        //    window, `try_unown` fails — loop to re-collect and re-evaluate (the
+        //    page may now be freeable, or already mapped).
+        // SAFETY: owner; just collected.
+        if unsafe { (*page_ptr).try_unown() } {
+            return;
+        }
+    }
+}
+
 impl Drop for Heap {
     /// On thread exit, hand off this heap's pages so their memory is not
     /// stranded: empty pages are released to the arena; pages with live blocks
@@ -695,9 +775,19 @@ impl Drop for Heap {
                     (*cur).collect_free();
                     if (*cur).is_all_free() {
                         release_page_slices(cur);
-                    } else {
+                    } else if (*cur).is_full() {
+                        // Full ⇒ abandoned but **unmapped** (kept out of the
+                        // registry; resurrected only when a later free claims it).
                         (*cur).set_owner(MI_THREADID_ABANDONED);
+                        (*cur).set_unowned();
+                    } else {
+                        // Has free space ⇒ abandoned **mapped**: register it (set
+                        // the bitmap bit) and stamp the mapped state before
+                        // releasing ownership, so a reclaimer that finds the bit
+                        // must win the ownership race first.
                         self.subproc.abandon_page(cur, b);
+                        (*cur).set_owner(MI_THREADID_ABANDONED_MAPPED);
+                        (*cur).set_unowned();
                     }
                 }
                 cur = next;

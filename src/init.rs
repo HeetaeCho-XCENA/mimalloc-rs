@@ -43,7 +43,10 @@ pub fn current_tid() -> usize {
     // Plain process-global counter (not part of any modeled concurrency), so we
     // use core atomics directly — they are usable in `static` (and under loom).
     use core::sync::atomic::{AtomicUsize, Ordering};
-    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    // Start at 2 so the first thread id is `2 << 2 == 8`, strictly greater than
+    // `MI_THREADID_ABANDONED_MAPPED` (4): the abandoned-page state encoding uses
+    // `owner_tid <= 4` to mean "abandoned", so a real owner tid must exceed it.
+    static NEXT: AtomicUsize = AtomicUsize::new(2);
     std::thread_local! {
         static TID: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     }
