@@ -749,6 +749,32 @@ impl Page {
         self.used.get()
     }
 
+    /// Does the page have a block ready to hand out *right now* (`free` is
+    /// non-empty)? Cheap (no collect) — the page search checks this first and
+    /// only collects on a miss (ports `mi_page_immediate_available`). Owner-only.
+    #[inline]
+    pub fn has_free(&self) -> bool {
+        !self.free.get().is_null()
+    }
+
+    /// Can the page still initialize more blocks (capacity below reserved)? Such
+    /// a page is not "full" — `alloc` will extend it on demand (ports
+    /// `mi_page_is_expandable`). Owner-only.
+    #[inline]
+    pub fn is_expandable(&self) -> bool {
+        self.capacity.get() < self.reserved
+    }
+
+    /// Is the page ≥7/8 used (few free slots left)? Ports `mi_page_is_mostly_used`
+    /// — a page with plenty of free space (not mostly used) is worth taking over
+    /// (cross-thread reclaim) so its frees become local; a mostly-used one is left
+    /// to drain. Owner-only.
+    #[inline]
+    pub fn is_mostly_used(&self) -> bool {
+        let frac = self.reserved / 8;
+        self.reserved.saturating_sub(self.used.get()) <= frac
+    }
+
     /// Total blocks the page can hold.
     #[inline]
     pub fn reserved(&self) -> u32 {

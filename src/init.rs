@@ -115,6 +115,24 @@ mod tls {
         DEFAULT_HEAP.with(|h| h.collect(force));
     }
 
+    /// Try to reclaim a just-claimed abandoned `page` **into the calling thread's
+    /// default heap** (the free path's reclaim-on-free, `page_reclaim_on_free == 0`
+    /// originating-theap policy). Returns `true` if reclaimed. Uses `try_with` so
+    /// a late free during TLS destruction is a safe no-op (the page stays
+    /// abandoned), and `reclaim_on_free` itself only reclaims a page that
+    /// originated from this heap — one from another heap is left for its owner.
+    ///
+    /// # Safety
+    /// The caller exclusively owns `page` (claimed it via the ownership bit) and
+    /// has collected it.
+    #[inline]
+    pub unsafe fn try_reclaim_on_free(page: *mut crate::page::Page) -> bool {
+        // SAFETY: forwarded — caller owns and has collected `page`.
+        DEFAULT_HEAP
+            .try_with(|h| unsafe { h.reclaim_on_free(page) })
+            .unwrap_or(false)
+    }
+
     /// Force the calling thread's default heap to be initialized (no-op if it
     /// already is). Used by the lifecycle wrappers.
     ///
@@ -134,7 +152,7 @@ mod tls {
 }
 
 #[cfg(feature = "std")]
-pub use tls::{collect, malloc, malloc_aligned, zalloc};
+pub use tls::{collect, malloc, malloc_aligned, try_reclaim_on_free, zalloc};
 
 // ---------------------------------------------------------------------------
 // Lifecycle / deferred-free registration (ports `mi_register_deferred_free`
