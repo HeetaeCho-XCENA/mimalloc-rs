@@ -92,3 +92,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --lib loom_tests
+
+  # C-vs-rs differential: build the matching C `libmimalloc` (the tag MUST report
+  # the same MI_MALLOC_VERSION the port targets, else `version_matches_c` fails)
+  # and run the observable-contract differential — across all size bins, the
+  # edge-case API surface, and the cross-thread workload.
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build C libmimalloc (v3.3.2 == MI_MALLOC_VERSION 30302)
+        run: |
+          git clone --depth 1 --branch v3.3.2 https://github.com/microsoft/mimalloc.git /tmp/mimalloc-c
+          cmake -S /tmp/mimalloc-c -B /tmp/mimalloc-c/build \
+            -DCMAKE_BUILD_TYPE=Release -DMI_BUILD_TESTS=OFF \
+            -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF
+          cmake --build /tmp/mimalloc-c/build --target mimalloc -j
+          ls -l /tmp/mimalloc-c/build/libmimalloc.so*
+      - name: Differential test against C
+        run: cargo test --features differential --test differential
+        env:
+          MIMALLOC_C_LIB: /tmp/mimalloc-c/build
