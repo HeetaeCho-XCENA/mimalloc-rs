@@ -203,3 +203,35 @@ Two **missing mimalloc mechanisms** explain the gap (both real, both absent):
 
 Method unchanged: one change per PR, measured before/after on a pinned machine,
 behavior locked by tests + Miri + loom + the cross-thread TSan stress.
+
+## Practicality round: delayed purge + on-demand commit (2026-06)
+
+mimalloc-rs now **returns freed memory to the OS** like v3 (previously freed
+arena slices were reused but stayed resident — RSS was sticky at the
+high-water mark). See `docs/GOAL-purge-commit.md` for the staged plan (PC0–PC3).
+
+- **PC0** `os::purge_ex` (reset vs decommit → `needs_recommit`) + v3 option
+  defaults (`purge_delay=1000`, `purge_decommits=1`, `arena_purge_mult=1`).
+- **PC1** the arena commit bitmap is authoritative (eager arenas pre-set all
+  bits → no per-slice commit on the fast path), so recommit-after-purge is
+  correct even under `debug`/`secure` (where decommit strips access).
+- **PC2** per-arena purge bitmap + `purge_expire`: `free_slices` schedules a
+  delayed purge; `collect`/`retire_page` drive it; `run_purge` claims each
+  still-free range from the free bitmap before `madvise` (no alloc can race it).
+- **PC3** `examples/rss_spike.rs` proves it.
+
+**RSS evidence** (`rss_spike`, 128 MiB working set, this box):
+
+| phase | purge on | purge off (`MIMALLOC_PURGE_DELAY=-1`) |
+|---|---|---|
+| peak (touched) | 129.5 MiB | 129.5 MiB |
+| after free | 129.5 MiB | 129.5 MiB |
+| after `collect(true)` | **1.7 MiB** | 129.5 MiB |
+| reclaimed | **100% of the spike** | 0% |
+
+**Linux residency caveat.** On Linux/overcommit `commit` is just `mprotect`;
+pages become resident on first touch, so *lazy commit* barely moves RSS — the
+real lever is **purge** (`MADV_DONTNEED`). Purging is delayed (default 1 s) and
+driven by alloc/free/collect, never a background thread (matching v3); a tight
+loop that frees then idles without collecting keeps its pages until the next
+`collect`/allocation, exactly as in v3.
