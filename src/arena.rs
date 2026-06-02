@@ -35,11 +35,12 @@ fn chunks_for(slice_count: usize) -> usize {
 #[repr(C)]
 pub struct Arena {
     memid: MemId,
-    /// OS region backing all the bitmap storage (free/commit/purge + the
-    /// per-bin abandoned registries). This block is large metadata (~45 KiB for a
-    /// full arena, past the small-block meta allocator), so like the page-map it
-    /// comes straight from the OS; freed in [`Arena::destroy`].
-    bitmap_memid: MemId,
+    /// OS region backing the per-bin abandoned-page registries only. That block
+    /// is large, **cold** metadata (~45 KiB, past the small-block meta allocator,
+    /// and touched only when a page is abandoned/reclaimed), so it comes straight
+    /// from the OS — kept *out* of the compact meta region so it cannot push the
+    /// hot free/commit/purge bitmaps out of cache. Freed in [`Arena::destroy`].
+    abandoned_memid: MemId,
     start: NonNull<u8>,
     slice_count: usize,
     chunk_count: usize,
@@ -88,25 +89,23 @@ impl Arena {
         let size = slice_count * MI_ARENA_SLICE_SIZE;
         let (start, memid) = os::alloc_aligned(size, MI_ARENA_SLICE_SIZE, commit, false)?;
 
-        // Bitmap storage: free + commit + purge + `MI_BIN_COUNT` abandoned-page
-        // registries, each a chunkmap + `chunk_count` chunks laid out contiguously.
-        // This block can reach ~45 KiB (past the small-block meta allocator's
-        // 32 KiB limit), so it comes straight from the OS (zeroed ⇒ all-clear,
-        // which is a valid empty bitmap). Residency stays low: untouched
-        // abandoned-registry pages never fault in.
+        // Hot bitmaps: free + commit + purge, each a chunkmap + `chunk_count`
+        // chunks laid out contiguously. These are touched on **every** slice
+        // alloc/free, so they stay in the compact small-block meta region (cache
+        // warm), exactly as before the abandoned registry was added.
         let stride = chunk_count + 1;
-        let bchunks = (3 + MI_BIN_COUNT) * stride;
-        let bm_bytes = bchunks * core::mem::size_of::<BChunk>();
-        let (bm_region, bitmap_memid) = match os::alloc(bm_bytes, true) {
-            Some(v) => v,
+        let hot_bchunks = 3 * stride;
+        let hot_bytes = hot_bchunks * core::mem::size_of::<BChunk>();
+        let bm_mem = match meta_zalloc(hot_bytes) {
+            Some(p) => p,
             None => {
                 // SAFETY: nothing else references the data region yet.
                 unsafe { os::free(&memid) };
                 return None;
             }
         };
-        let bm_base = bm_region.as_ptr() as *mut BChunk;
-        // SAFETY: bm_mem is `bchunks` zeroed BChunks laid out contiguously.
+        let bm_base = bm_mem.as_ptr() as *mut BChunk;
+        // SAFETY: bm_mem is `hot_bchunks` zeroed BChunks laid out contiguously.
         let (
             free_chunkmap,
             free_chunks,
@@ -114,7 +113,6 @@ impl Arena {
             commit_chunks,
             purge_chunkmap,
             purge_chunks,
-            abandoned_base,
         ) = unsafe {
             (
                 NonNull::new_unchecked(bm_base),
@@ -123,9 +121,27 @@ impl Arena {
                 NonNull::new_unchecked(bm_base.add(stride + 1)),
                 NonNull::new_unchecked(bm_base.add(2 * stride)),
                 NonNull::new_unchecked(bm_base.add(2 * stride + 1)),
-                NonNull::new_unchecked(bm_base.add(3 * stride)),
             )
         };
+
+        // Cold metadata: the `MI_BIN_COUNT` abandoned-page registries (~45 KiB,
+        // past the meta allocator's 32 KiB limit, and touched only on
+        // abandon/reclaim). It comes straight from the OS, kept separate so it
+        // cannot evict the hot bitmaps above from cache. Zeroed ⇒ all-clear (a
+        // valid empty bitmap); residency stays ~0 until pages are abandoned.
+        let ab_bytes = MI_BIN_COUNT * stride * core::mem::size_of::<BChunk>();
+        let (ab_region, abandoned_memid) = match os::alloc(ab_bytes, true) {
+            Some(v) => v,
+            None => {
+                // SAFETY: data region + hot bitmaps are ours and unreferenced.
+                unsafe {
+                    os::free(&memid);
+                    meta_free(bm_mem, hot_bytes);
+                }
+                return None;
+            }
+        };
+        let abandoned_base = ab_region.cast::<BChunk>();
 
         // Descriptor.
         let desc_mem = match meta_zalloc(core::mem::size_of::<Arena>()) {
@@ -134,7 +150,8 @@ impl Arena {
                 // SAFETY: region + bitmap storage are ours and unreferenced.
                 unsafe {
                     os::free(&memid);
-                    os::free(&bitmap_memid);
+                    os::free(&abandoned_memid);
+                    meta_free(bm_mem, hot_bytes);
                 }
                 return None;
             }
@@ -144,7 +161,7 @@ impl Arena {
         unsafe {
             arena.write(Arena {
                 memid,
-                bitmap_memid,
+                abandoned_memid,
                 start,
                 slice_count,
                 chunk_count,
@@ -440,9 +457,12 @@ impl Arena {
         unsafe {
             let a = arena.as_ref();
             let memid = a.memid;
-            let bitmap_memid = a.bitmap_memid;
+            let abandoned_memid = a.abandoned_memid;
+            let hot_bytes = 3 * (a.chunk_count + 1) * core::mem::size_of::<BChunk>();
+            let bm_mem = a.free_chunkmap.cast::<u8>();
             os::free(&memid);
-            os::free(&bitmap_memid);
+            os::free(&abandoned_memid);
+            meta_free(bm_mem, hot_bytes);
             meta_free(arena.cast::<u8>(), core::mem::size_of::<Arena>());
         }
     }
