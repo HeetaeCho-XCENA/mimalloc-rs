@@ -250,19 +250,40 @@ impl Page {
             }
             break;
         }
-        // 2. Splice the owner-local deferred frees.
-        let mut lf = self.local_free.get();
-        while !lf.is_null() {
-            // SAFETY: lf is a valid free block on our local list.
-            let next = unsafe { (*lf).next(self.keys) };
-            // SAFETY: same.
-            unsafe {
-                (*lf).set_next(self.free.get(), self.keys);
+        // 2. Splice the owner-local deferred frees into `free`. Ports
+        // `_mi_page_free_collect`'s key optimization: in the common case `free`
+        // is empty, so move the whole `local_free` list over with a single
+        // **O(1)** head assignment — *no traversal*. (The previous code walked and
+        // re-linked every block, which made `Page::alloc` ~60% pointer-chasing the
+        // `local_free` list on the single-thread fast path.) Only when `free`
+        // already holds blocks (the cross-thread drain above prepended some) do we
+        // walk `local_free` to its tail and append — the rare path.
+        let lf = self.local_free.get();
+        if !lf.is_null() {
+            if self.free.get().is_null() {
+                // Common: just adopt the list head (order preserved; links — encoded
+                // under secure/debug — are already correct and untouched).
+                self.free.set(lf);
+            } else {
+                // Rare: `free` is non-empty (xthread blocks drained in). Walk to
+                // `local_free`'s tail and link it ahead of the current `free`.
+                let mut tail = lf;
+                loop {
+                    // SAFETY: `tail` is a valid free block on our local list.
+                    let next = unsafe { (*tail).next(self.keys) };
+                    if next.is_null() {
+                        break;
+                    }
+                    tail = next;
+                }
+                // SAFETY: `tail` is the last local_free block; link to current free.
+                unsafe {
+                    (*tail).set_next(self.free.get(), self.keys);
+                }
+                self.free.set(lf);
             }
-            self.free.set(lf);
-            lf = next;
+            self.local_free.set(core::ptr::null_mut());
         }
-        self.local_free.set(core::ptr::null_mut());
     }
 
     /// Stamp the owning thread id on a **freshly initialized** page (flags are 0
