@@ -126,7 +126,11 @@ jobs:
       - name: Install cargo-fuzz
         # NB: not `--locked` — cargo-fuzz's pinned lockfile carries an old `rustix`
         # that fails to compile on current nightly; let cargo resolve a compatible one.
+        # Clear the global `-D warnings` so a warning in the tool's own deps can't
+        # fail the install (that code isn't ours to fix).
         run: cargo install cargo-fuzz
+        env:
+          RUSTFLAGS: ""
       - name: Smoke fuzz (bounded)
         run: cargo fuzz run alloc -- -runs=100000 -max_total_time=60
 
@@ -168,7 +172,10 @@ jobs:
         with:
           components: llvm-tools-preview
       - name: Install cargo-llvm-cov
+        # Clear the global `-D warnings` for the third-party tool build (as above).
         run: cargo install cargo-llvm-cov
+        env:
+          RUSTFLAGS: ""
       - name: Coverage (lib)
         run: cargo llvm-cov --lib --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
