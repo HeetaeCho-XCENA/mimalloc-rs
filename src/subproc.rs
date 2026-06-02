@@ -111,6 +111,21 @@ impl Subproc {
         NonNull::new(self.arenas[i].load(Ordering::Acquire))
     }
 
+    /// Drive delayed purging across every registered arena, returning due,
+    /// still-free slices to the OS. Cheap when nothing is pending (one atomic
+    /// load per arena, no syscall). `force` ignores the delay timer. Called from
+    /// page retire and `collect` — there is no background purge thread (matching
+    /// v3, which drives purge from allocation/free/collect operations).
+    pub fn try_purge(&self, force: bool) {
+        let count = self.arena_count();
+        for i in 0..count {
+            if let Some(arena) = self.arena_at(i) {
+                // SAFETY: registered arenas stay live for the whole process.
+                unsafe { arena.as_ref().maybe_purge(force) };
+            }
+        }
+    }
+
     /// Reserve and register a fresh arena of at least `min_slices`.
     fn reserve_arena(&self, min_slices: usize, commit: bool) -> Option<NonNull<Arena>> {
         let slices = min_slices.max(DEFAULT_ARENA_SLICES);
