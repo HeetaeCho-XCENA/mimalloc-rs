@@ -52,6 +52,20 @@ libc = { version = "0.2", default-features = false }
 loom = "0.7"
 
 [dev-dependencies]
+# Statistical micro-benchmarks (`benches/`). Minimal features (no plotters/rayon)
+# to keep the dev dep tree small and MSRV-friendly; `cargo bench` still reports
+# mean/median/CI/outliers and supports `--save-baseline`/`--baseline`.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# MSRV pin: criterion → clap → clap_builder otherwise pulls `clap_lex 1.x`,
+# which needs the `edition2024` Cargo feature (Rust ≥ 1.85) and breaks our 1.84
+# MSRV (benches *are* built by `cargo test`). clap_builder bumped clap_lex to 1.x
+# *within* the 4.5 patch line (4.5.40 uses edition2021 clap_lex 0.7; 4.5.61 uses
+# 1.x), so an exact clap pin is required. Drop once the MSRV moves past 1.85.
+clap = { version = "=4.5.40", default-features = false }
+
+[[bench]]
+name = "alloc"
+harness = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
