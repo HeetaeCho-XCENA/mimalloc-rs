@@ -114,3 +114,18 @@ jobs:
         run: cargo test --features differential --test differential
         env:
           MIMALLOC_C_LIB: /tmp/mimalloc-c/build
+
+  # Fuzzing: a bounded AddressSanitizer smoke run of the alloc/free/realloc/
+  # aligned op-stream target (`fuzz/`). Surfaces regressions without an unbounded
+  # job; deeper fuzzing is run locally/out of band (`cargo +nightly fuzz run alloc`).
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        # NB: not `--locked` — cargo-fuzz's pinned lockfile carries an old `rustix`
+        # that fails to compile on current nightly; let cargo resolve a compatible one.
+        run: cargo install cargo-fuzz
+      - name: Smoke fuzz (bounded)
+        run: cargo fuzz run alloc -- -runs=100000 -max_total_time=60

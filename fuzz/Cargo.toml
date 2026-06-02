@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "mimalloc-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace so this crate (and its libfuzzer-instrumented build) never
+# pollutes the parent crate's `cargo build`/`cargo test`/MSRV resolution.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.mimalloc-rs]
+path = ".."
+
+[[bin]]
+name = "alloc"
+path = "fuzz_targets/alloc.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
