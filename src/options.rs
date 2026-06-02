@@ -27,10 +27,12 @@ pub enum Opt {
     PurgeDelay = 4,
     /// `MIMALLOC_ARENA_RESERVE`: slices reserved when growing the pool.
     ArenaReserve = 5,
+    /// `MIMALLOC_ARENA_PURGE_MULT`: multiplier on `PurgeDelay` for arenas (v3).
+    ArenaPurgeMult = 6,
 }
 
 /// Number of options.
-pub const OPT_COUNT: usize = 6;
+pub const OPT_COUNT: usize = 7;
 
 impl Opt {
     /// Map a C API option index to an `Opt`.
@@ -42,6 +44,7 @@ impl Opt {
             3 => Some(Opt::PurgeDecommits),
             4 => Some(Opt::PurgeDelay),
             5 => Some(Opt::ArenaReserve),
+            6 => Some(Opt::ArenaPurgeMult),
             _ => None,
         }
     }
@@ -54,13 +57,17 @@ impl Opt {
             Opt::PurgeDecommits => "MIMALLOC_PURGE_DECOMMITS",
             Opt::PurgeDelay => "MIMALLOC_PURGE_DELAY",
             Opt::ArenaReserve => "MIMALLOC_ARENA_RESERVE",
+            Opt::ArenaPurgeMult => "MIMALLOC_ARENA_PURGE_MULT",
         }
     }
 
     fn default_value(self) -> i64 {
+        // Mirror v3 `src/options.c` defaults for the wired options.
         match self {
             Opt::EagerCommit => 1,
-            Opt::PurgeDelay => 10,
+            Opt::PurgeDecommits => 1, // v3: purge via decommit (MADV_DONTNEED on Linux)
+            Opt::PurgeDelay => 1000,  // v3: 1000 ms before purging freed memory
+            Opt::ArenaPurgeMult => 1, // v3: arena delay = purge_delay * 1
             _ => 0,
         }
     }
@@ -68,6 +75,11 @@ impl Opt {
 
 static VALUES: [AtomicI64; OPT_COUNT] = [const { AtomicI64::new(0) }; OPT_COUNT];
 static INIT: OnceBox<()> = OnceBox::new();
+
+/// Serializes tests that mutate the process-global option atomics so they do
+/// not race each other under the parallel test runner.
+#[cfg(all(test, feature = "std"))]
+pub(crate) static OPTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn parse_i64(b: &[u8]) -> Option<i64> {
     let (neg, digits) = match b.first() {
@@ -148,12 +160,33 @@ pub fn eager_commit() -> bool {
     is_enabled(Opt::EagerCommit)
 }
 
+/// Purge delay in milliseconds: `<0` disables purging, `0` = purge immediately.
+#[inline]
+pub fn purge_delay() -> i64 {
+    get(Opt::PurgeDelay)
+}
+
+/// Whether a purge returns memory via decommit (`true`) or reset (`false`).
+#[inline]
+pub fn purge_decommits() -> bool {
+    is_enabled(Opt::PurgeDecommits)
+}
+
+/// Effective arena purge delay (ms) = `purge_delay * arena_purge_mult` (v3
+/// `mi_arena_purge_delay`). Stays `<0` (disabled) when `purge_delay < 0`; the
+/// multiplier is clamped to `>= 1` so a stray `0` cannot make purging immediate.
+#[inline]
+pub fn arena_purge_delay() -> i64 {
+    purge_delay().saturating_mul(get(Opt::ArenaPurgeMult).max(1))
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 
     #[test]
     fn defaults_and_runtime_set() {
+        let _g = OPTION_TEST_LOCK.lock().unwrap();
         assert!(is_enabled(Opt::EagerCommit)); // default on
         let prev = get(Opt::PurgeDelay);
         set(Opt::PurgeDelay, 42);
@@ -167,7 +200,17 @@ mod tests {
         disable(Opt::Verbose);
 
         assert_eq!(Opt::from_index(2), Some(Opt::EagerCommit));
+        assert_eq!(Opt::from_index(6), Some(Opt::ArenaPurgeMult));
         assert_eq!(Opt::from_index(99), None);
+    }
+
+    #[test]
+    fn purge_defaults_match_v3() {
+        // Pure defaults (no env/global), so this is race-free.
+        assert_eq!(Opt::PurgeDelay.default_value(), 1000);
+        assert_eq!(Opt::PurgeDecommits.default_value(), 1);
+        assert_eq!(Opt::ArenaPurgeMult.default_value(), 1);
+        assert_eq!(Opt::EagerCommit.default_value(), 1);
     }
 
     #[test]

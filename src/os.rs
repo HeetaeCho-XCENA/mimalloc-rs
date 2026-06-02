@@ -251,13 +251,45 @@ pub unsafe fn reset(addr: NonNull<u8>, size: usize) {
     }
 }
 
-/// Purge `[addr, addr+size)`: return physical memory to the OS (decommit).
+/// Purge `[addr, addr+size)`: hint the OS to drop the physical pages while the
+/// reservation stays mapped. Returns whether the range now **needs recommit**
+/// before reuse — `true` if it was decommitted (a later [`commit`] is required),
+/// `false` if it was reset or left untouched (still committed). Ports
+/// `_mi_os_purge_ex` (`src/os.c`).
+///
+/// Decision (mirrors v3): if purging is disabled (`purge_delay < 0`) it is a
+/// no-op; otherwise if `purge_decommits` is set it decommits; else if
+/// `allow_reset` (the whole range is committed) it resets; else it is a no-op.
+/// On Linux both decommit and reset issue `MADV_DONTNEED`, so the RSS drop is
+/// the same — the difference is the commit-accounting (`needs_recommit`).
+///
+/// # Safety
+/// `(addr, size)` must be a committed range owned by the caller.
+pub unsafe fn purge_ex(addr: NonNull<u8>, size: usize, allow_reset: bool) -> bool {
+    if crate::options::purge_delay() < 0 {
+        return false; // purging disabled
+    }
+    if crate::options::purge_decommits() {
+        // SAFETY: forwarded contract.
+        unsafe { decommit(addr, size) };
+        true
+    } else if allow_reset {
+        // SAFETY: forwarded contract.
+        unsafe { reset(addr, size) };
+        false
+    } else {
+        false
+    }
+}
+
+/// Purge `[addr, addr+size)` without commit tracking (assumes the range is
+/// fully committed, so reset is allowed). Convenience over [`purge_ex`].
 ///
 /// # Safety
 /// `(addr, size)` must be a committed range owned by the caller.
 pub unsafe fn purge(addr: NonNull<u8>, size: usize) {
     // SAFETY: forwarded contract.
-    unsafe { decommit(addr, size) }
+    let _ = unsafe { purge_ex(addr, size, true) };
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -295,6 +327,58 @@ mod tests {
             assert_eq!(*p.as_ptr().add(64 * 1024 - 1), 0x5A);
             free(&memid);
         }
+    }
+
+    #[test]
+    fn purge_ex_decommit_reset_and_disabled() {
+        use crate::options::{self, Opt};
+        // Serialize with other option-mutating tests (process-global atomics).
+        let _g = options::OPTION_TEST_LOCK.lock().unwrap();
+        let save_dec = options::get(Opt::PurgeDecommits);
+        let save_delay = options::get(Opt::PurgeDelay);
+
+        let (p, memid) = alloc_aligned(128 * 1024, MI_ARENA_SLICE_SIZE, true, false).unwrap();
+        // SAFETY: committed 128 KiB region for the duration of the test.
+        unsafe {
+            // (1) decommit path: purge reports needs_recommit; reuse needs commit.
+            options::set(Opt::PurgeDelay, 1000);
+            options::set(Opt::PurgeDecommits, 1);
+            core::ptr::write_bytes(p.as_ptr(), 0x11, 128 * 1024);
+            assert!(
+                purge_ex(p, 128 * 1024, true),
+                "decommit purge must report needs_recommit"
+            );
+            commit(p, 128 * 1024); // recommit before reuse
+            assert_eq!(*p.as_ptr(), 0x00, "recommitted pages read as zero");
+
+            // (2) reset path: stays committed (no recommit needed) and remains
+            // accessible. NB: reset prefers MADV_FREE, which is *lazy* — contents
+            // are indeterminate (NOT guaranteed zero), so we only assert access,
+            // not the value. (A reset-purged slice is therefore "dirty"; a reuse
+            // that needs zero must zero it — handled by the commit/dirty path.)
+            options::set(Opt::PurgeDecommits, 0);
+            core::ptr::write_bytes(p.as_ptr(), 0x22, 128 * 1024);
+            assert!(
+                !purge_ex(p, 128 * 1024, true),
+                "reset purge stays committed"
+            );
+            core::ptr::write_bytes(p.as_ptr(), 0x44, 64);
+            assert_eq!(
+                *p.as_ptr(),
+                0x44,
+                "reset range stays usable without recommit"
+            );
+
+            // (3) disabled (purge_delay < 0): no-op, memory untouched.
+            options::set(Opt::PurgeDelay, -1);
+            core::ptr::write_bytes(p.as_ptr(), 0x33, 128 * 1024);
+            assert!(!purge_ex(p, 128 * 1024, true), "disabled purge is a no-op");
+            assert_eq!(*p.as_ptr(), 0x33, "disabled purge leaves memory intact");
+
+            free(&memid);
+        }
+        options::set(Opt::PurgeDecommits, save_dec);
+        options::set(Opt::PurgeDelay, save_delay);
     }
 
     #[test]
