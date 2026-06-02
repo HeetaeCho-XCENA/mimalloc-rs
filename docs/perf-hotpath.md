@@ -72,17 +72,33 @@ at ~13 ns/op this is a meaningful fraction. The C reference avoids a divide here
   `block_shift` when `bs` is a power of two. Keep mimalloc semantics (interior
   pointers from aligned allocs must still normalize).
 
-### C2 — thread-local access (std `thread_local!`, not `#[thread_local]`) — `src/init.rs:69` — **untested, live**
-`DEFAULT_HEAP` (alloc) and the `TID` cell behind `current_tid()` (free) are both
-plain std `thread_local!`, whose `.with()` carries a lazy-init guard and is
-slower than a native `__thread`/`#[thread_local]` slot. The `nightly` feature
-does **not** change this (no `#[thread_local]` malloc path exists yet) — which is
-why the earlier nightly run showed nothing.
-- **Confirm:** flamegraph shows time in `__tls_get_addr` / the `LocalKey`
-  accessor; `perf stat` low-IPC if TLS stalls.
-- **Fix ideas (T2-tls):** under `nightly`, cache the heap pointer (and tid) in a
-  real `#[thread_local] static` and have `init::malloc*`/`free` read it directly,
-  falling back to the `thread_local!` on stable. Measure the delta.
+### C2 — thread-local access (std `thread_local!`, not `#[thread_local]`) — `src/init.rs` — **TESTED → PARKED (no measured win)**
+`DEFAULT_HEAP` (alloc) and the `TID` cell behind `current_tid()` (free) use std
+`thread_local!`, whose `.with()` carries a lazy-init/state guard, hypothesized to
+be slower than a native `__thread`/`#[thread_local]` slot.
+
+**This was implemented and measured (the "A1a" story), then parked.** Under a
+`nightly`-gated path the default-heap pointer and tid were cached in real
+`#[thread_local]` slots so `malloc`/`free` read them directly (mirroring
+mimalloc-C's `__thread mi_heap_t*` model), with a `Slot::drop` clearing the cache
+before the heap drops (teardown-safe; code-reviewed APPROVE). A pinned-machine
+microbench A/B (`MB_ALLOC=rs`, fixed 64 B, nightly cache vs `.with()`) showed
+**no clear win** — the cached path was not faster, only lower-variance.
+
+**Why (confirmed):** the malloc/free *route* already matches mimalloc-C v3 step
+for step — C v3 itself uses `MI_TLS_MODEL_THREAD_LOCAL` (a `thread_local` theap
+pointer + a `pthread_key` destructor), then `theap->pages_free_direct[idx]`, then
+a free-list pop; rs does the identical `pages_free_direct[wsize]` → `Page::alloc`,
+and `free` uses the same page-map + owner-tid routing. The only divergence A1a
+closed was `.with()` vs a raw `#[thread_local]` load — and modern std
+`thread_local!` is already cheap enough that closing it is neutral. So TLS access
+is **not** the phase-1 bottleneck; the remaining gap is **C1 (full-page eviction /
+search-queue cliff)** and **C3 (call-chain inlining)**, not TLS.
+
+The implementation is preserved at the git tag
+**`archive/a1a-thread-local-cache`** (recoverable if a future, fully-inlined hot
+path or a non-Linux TLS model makes the direct slot pay off). Do not re-attempt
+without new evidence that TLS access — not full-page scan / inlining — is the cost.
 
 ### C3 — call-chain inlining — `init::malloc_aligned → DEFAULT_HEAP.with(closure) → Heap::alloc_aligned → alloc → alloc_impl → Page::alloc` — **needs asm**
 Six layers plus the `.with` closure. If the chain does not collapse, every alloc

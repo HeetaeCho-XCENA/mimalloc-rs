@@ -66,6 +66,14 @@ mod tls {
     use crate::heap::Heap;
     use core::ptr::NonNull;
 
+    // NB: this uses std `thread_local!` (its `.with()` carries a state guard)
+    // rather than a raw `#[thread_local]` pointer cache like mimalloc-C's
+    // `__thread mi_heap_t*`. Such a cache *was* implemented and benchmarked
+    // (git tag `archive/a1a-thread-local-cache`) and **parked**: a pinned-machine
+    // microbench A/B showed no win — the malloc route already matches C v3, and
+    // modern `thread_local!` is cheap enough that TLS access is not the phase-1
+    // bottleneck (that is full-page eviction + inlining). See `docs/perf-hotpath.md`
+    // §C2. Don't re-add without evidence that TLS access is actually the cost.
     std::thread_local! {
         /// The calling thread's default heap.
         static DEFAULT_HEAP: Heap = Heap::new(process_keys(), current_tid());
