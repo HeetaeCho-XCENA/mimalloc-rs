@@ -21,10 +21,40 @@ use core::ptr::NonNull;
 use crate::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use crate::bits::{
     MI_ARENA_SLICE_SIZE, MI_INTPTR_SIZE, MI_MAX_ALIGN_SIZE, MI_PAGE_FLAG_MASK,
-    MI_PAGE_HAS_INTERIOR_POINTERS, MI_PAGE_IN_FULL_QUEUE,
+    MI_PAGE_HAS_INTERIOR_POINTERS, MI_PAGE_IN_FULL_QUEUE, MI_THREADID_ABANDONED_MAPPED,
 };
 use crate::free_list::Block;
 use crate::layout::align_up;
+
+// ---------------------------------------------------------------------------
+// `xthread_free` ownership tag (ports v3's `mi_tf_*`, internal.h:919-950)
+// ---------------------------------------------------------------------------
+//
+// The `xthread_free` head word is a `*mut Block` whose **low bit** is the page's
+// ownership token: a page managed by a live theap (or temporarily claimed by a
+// freeing thread) is *owned* (1); an abandoned page is *unowned* (0) until a
+// free claims it. Blocks are at least pointer-aligned, so the low bit is always
+// free. We tag through `map_addr`, which **preserves provenance**, so the head
+// stays a real (deref-able) pointer with no `expose`/`with_exposed` round-trip.
+
+/// Ownership bit of an `xthread_free` head word.
+const TF_OWNED: usize = 1;
+
+/// The block pointer of a thread-free head (low ownership bit masked off).
+#[inline]
+fn tf_block(tf: *mut Block) -> *mut Block {
+    tf.map_addr(|a| a & !TF_OWNED)
+}
+/// Is the page owned (head word's low bit set)?
+#[inline]
+fn tf_is_owned(tf: *mut Block) -> bool {
+    tf.addr() & TF_OWNED != 0
+}
+/// Build a head word from a block pointer and an ownership flag.
+#[inline]
+fn tf_create(block: *mut Block, owned: bool) -> *mut Block {
+    block.map_addr(|a| (a & !TF_OWNED) | (owned as usize))
+}
 
 /// Extend the free list by at most this many bytes' worth of blocks at a time
 /// (ports `MI_MAX_EXTEND_SIZE`); bounds the upfront init cost per batch.
@@ -110,7 +140,10 @@ impl Page {
                 xthread_id: AtomicUsize::new(0),
                 free: Cell::new(core::ptr::null_mut()),
                 local_free: Cell::new(core::ptr::null_mut()),
-                xthread_free: AtomicPtr::new(core::ptr::null_mut()),
+                // Owned + empty (ports `page->xthread_free == 1` at init): a fresh
+                // page is owned by the heap that created it. `without_provenance`
+                // is correct here — the word carries no block pointer yet.
+                xthread_free: AtomicPtr::new(core::ptr::without_provenance_mut(TF_OWNED)),
                 used: Cell::new(0),
                 // Lazily built: the free list starts empty and is extended in
                 // batches on demand (see `extend_free`), so page creation does
@@ -183,22 +216,39 @@ impl Page {
     /// # Safety
     /// Owner-only; `self`'s `Cell` fields are not touched by other threads.
     unsafe fn collect(&self) {
-        // 1. Drain the cross-thread free stack (atomic swap to empty).
-        let mut tf = self
-            .xthread_free
-            .swap(core::ptr::null_mut(), Ordering::Acquire);
-        while !tf.is_null() {
-            // SAFETY: `tf` blocks were published by freeing threads via
-            // `set_next`, so the link is decoded the same way (encoded under
-            // `secure`/`debug`).
-            let next = unsafe { (*tf).next(self.keys) };
-            // SAFETY: `tf` is a valid block slot owned by this page.
-            unsafe {
-                (*tf).set_next(self.free.get(), self.keys);
+        // 1. Drain the cross-thread free stack. Capture the list with a CAS that
+        // resets the head to (NULL, owned) — **preserving the ownership bit** so a
+        // concurrent freer keeps seeing the page as owned (ports
+        // `mi_page_thread_free_collect`). Retry if a freer pushed meanwhile.
+        loop {
+            let tfree = self.xthread_free.load(Ordering::Acquire);
+            let mut tf = tf_block(tfree);
+            if tf.is_null() {
+                break; // nothing queued; leave the ownership bit untouched
             }
-            self.free.set(tf);
-            self.used.set(self.used.get() - 1);
-            tf = next;
+            let empty = tf_create(core::ptr::null_mut(), tf_is_owned(tfree));
+            if self
+                .xthread_free
+                .compare_exchange_weak(tfree, empty, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            // We now exclusively own the captured `tf` list; splice it into `free`.
+            while !tf.is_null() {
+                // SAFETY: `tf` blocks were published by freeing threads via
+                // `set_next`, so the link is decoded the same way (encoded under
+                // `secure`/`debug`).
+                let next = unsafe { (*tf).next(self.keys) };
+                // SAFETY: `tf` is a valid block slot owned by this page.
+                unsafe {
+                    (*tf).set_next(self.free.get(), self.keys);
+                }
+                self.free.set(tf);
+                self.used.set(self.used.get() - 1);
+                tf = next;
+            }
+            break;
         }
         // 2. Splice the owner-local deferred frees.
         let mut lf = self.local_free.get();
@@ -335,13 +385,21 @@ impl Page {
     }
 
     /// Push `block` onto the page's cross-thread free stack (the freeing thread
-    /// is *not* the owner). Touches only the atomic head and the block's own
-    /// memory, so it is sound to call concurrently with the owner.
+    /// is *not* the owner), marking the head **owned**. Touches only the atomic
+    /// head and the block's own memory, so it is sound to call concurrently with
+    /// the owner. Ports `mi_free_block_mt`'s atomic push.
+    ///
+    /// Returns `true` if this push **claimed** the page — i.e. the head was
+    /// *unowned* before (the page was abandoned) and is now owned by us, so the
+    /// caller must run the collect-on-free protocol. Returns `false` if the page
+    /// was already owned (a live or already-claimed page); then the owner will
+    /// collect the block later.
     ///
     /// # Safety
     /// `page` is a live page header; `block` is a live block of that page no
     /// longer used by the caller.
-    pub unsafe fn thread_free_push(page: *mut Page, block: NonNull<u8>) {
+    #[must_use]
+    pub unsafe fn thread_free_push(page: *mut Page, block: NonNull<u8>) -> bool {
         // SAFETY: project to the atomic head and read the const keys only.
         let head = unsafe { &*core::ptr::addr_of!((*page).xthread_free) };
         let keys = unsafe { Page::raw_keys(page) };
@@ -353,12 +411,15 @@ impl Page {
         let b = unsafe { &*(bp as *const Block) };
         loop {
             let cur = head.load(Ordering::Acquire);
-            // SAFETY: `block` is writable and at least pointer-sized.
+            // SAFETY: link past the ownership bit to the real previous head.
             unsafe {
-                b.set_next(cur, keys);
+                b.set_next(tf_block(cur), keys);
             }
-            match head.compare_exchange_weak(cur, bp, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return,
+            // Always publish as owned: either the page was already owned (no-op on
+            // the bit) or we are claiming a previously-abandoned page.
+            let new = tf_create(bp, true);
+            match head.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return !tf_is_owned(cur),
                 Err(_) => core::hint::spin_loop(),
             }
         }
@@ -483,6 +544,85 @@ impl Page {
     pub unsafe fn collect_free(&self) {
         // SAFETY: forwarded owner-only contract.
         unsafe { self.collect() }
+    }
+
+    /// Is this page owned (the `xthread_free` ownership bit is set)?
+    #[inline]
+    pub fn is_owned(&self) -> bool {
+        tf_is_owned(self.xthread_free.load(Ordering::Acquire))
+    }
+
+    /// Try to claim ownership of an abandoned page (set the ownership bit).
+    /// Returns `true` if we transitioned unowned→owned (we now exclusively own
+    /// it), `false` if it was already owned. Ports `mi_page_claim_ownership`
+    /// (a CAS loop since stable `AtomicPtr` has no `fetch_or`). Sound to call
+    /// from any thread — touches only the atomic head.
+    #[inline]
+    pub fn claim_ownership(&self) -> bool {
+        loop {
+            let cur = self.xthread_free.load(Ordering::Acquire);
+            if tf_is_owned(cur) {
+                return false;
+            }
+            let owned = tf_create(tf_block(cur), true);
+            if self
+                .xthread_free
+                .compare_exchange_weak(cur, owned, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Release ownership of a page we hold, returning it to the unowned
+    /// (abandoned) state. Expects the head to be `(NULL, owned)` — the state
+    /// after a full `collect`. Returns `true` if it cleanly unowned; `false` if a
+    /// concurrent freer pushed a block in the window (so the caller must
+    /// re-collect and retry the collect-on-free ladder). Ports the CAS of
+    /// `mi_abandoned_page_unown_from_free` (full-collect variant).
+    ///
+    /// # Safety
+    /// Caller currently owns the page and has just collected it.
+    #[inline]
+    pub unsafe fn try_unown(&self) -> bool {
+        let expect = tf_create(core::ptr::null_mut(), true);
+        let newtf = tf_create(core::ptr::null_mut(), false);
+        self.xthread_free
+            .compare_exchange(expect, newtf, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Clear the ownership bit (hand the page off / abandon it), **preserving**
+    /// any queued cross-thread block list. Unlike [`try_unown`], this is
+    /// unconditional: it is used when a heap relinquishes a page at thread exit,
+    /// where there is no collect-and-retry ladder — a block freed concurrently
+    /// simply stays queued for whoever next claims the page. CAS-loop since stable
+    /// `AtomicPtr` has no `fetch_and`.
+    ///
+    /// # Safety
+    /// Caller currently owns the page and is giving it up.
+    #[inline]
+    pub unsafe fn set_unowned(&self) {
+        loop {
+            let cur = self.xthread_free.load(Ordering::Acquire);
+            let unowned = tf_create(tf_block(cur), false);
+            if self
+                .xthread_free
+                .compare_exchange_weak(cur, unowned, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Is this page abandoned *and mapped* (registered in its arena's
+    /// `pages_abandoned[bin]`)? Encoded as `owner_tid == MI_THREADID_ABANDONED_MAPPED`.
+    #[inline]
+    pub fn is_abandoned_mapped(&self) -> bool {
+        (self.xthread_id.load(Ordering::Acquire) & !MI_PAGE_FLAG_MASK)
+            == MI_THREADID_ABANDONED_MAPPED
     }
 
     /// Block size served by this page.
@@ -669,7 +809,7 @@ mod loom_tests {
     //! Models the `xthread_free` Treiber stack protocol (push + swap-drain) in
     //! isolation — proving the contended CAS loop loses and duplicates nothing.
     extern crate alloc;
-    use crate::atomic::{AtomicPtr, Ordering};
+    use crate::atomic::{AtomicPtr, AtomicUsize, Ordering};
     use alloc::sync::Arc;
     use alloc::vec::Vec;
     use core::cell::UnsafeCell;
@@ -746,6 +886,98 @@ mod loom_tests {
                 drop(Box::from_raw(n0));
                 drop(Box::from_raw(n1));
             }
+        });
+    }
+
+    // Models the FE1b ownership-claim protocol abstractly: the `xthread_free`
+    // head as `block<<1 | owned` (LSB = ownership token). These prove the
+    // *exactly-once* claim invariant — the property that makes collect-on-free of
+    // an abandoned page safe (only the single claimer frees/reabandons it).
+
+    /// `thread_free_push` marking owned: CAS the head to `(block, owned=1)`;
+    /// the push *claimed* the page iff the prior head was unowned.
+    fn push_claim(head: &AtomicUsize, block: usize) -> bool {
+        loop {
+            let cur = head.load(Ordering::Acquire);
+            let new = (block & !1) | 1;
+            if head
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return cur & 1 == 0; // claimed iff it was unowned
+            }
+        }
+    }
+
+    /// `claim_ownership` (alloc-reclaim): set the LSB iff currently unowned.
+    fn reclaim_claim(head: &AtomicUsize) -> bool {
+        loop {
+            let cur = head.load(Ordering::Acquire);
+            if cur & 1 == 1 {
+                return false; // already owned — give up
+            }
+            if head
+                .compare_exchange_weak(cur, cur | 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_frees_claim_abandoned_page_exactly_once() {
+        loom::model(|| {
+            // Abandoned page: unowned, empty head (0).
+            let head = Arc::new(AtomicUsize::new(0));
+            let claims = Arc::new(AtomicUsize::new(0));
+            let mut hs = Vec::new();
+            for block in [0b10usize, 0b100] {
+                let h = head.clone();
+                let c = claims.clone();
+                hs.push(loom::thread::spawn(move || {
+                    if push_claim(&h, block) {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                claims.load(Ordering::Relaxed),
+                1,
+                "exactly one cross-thread free may claim the abandoned page"
+            );
+            assert_eq!(head.load(Ordering::Relaxed) & 1, 1, "page ends up owned");
+        });
+    }
+
+    #[test]
+    fn reclaim_races_free_claim_exactly_once() {
+        loom::model(|| {
+            // Abandoned page; an alloc-reclaimer and a cross-thread freer race.
+            let head = Arc::new(AtomicUsize::new(0));
+            let claims = Arc::new(AtomicUsize::new(0));
+            let (h1, c1) = (head.clone(), claims.clone());
+            let t_free = loom::thread::spawn(move || {
+                if push_claim(&h1, 0b10) {
+                    c1.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            let (h2, c2) = (head.clone(), claims.clone());
+            let t_reclaim = loom::thread::spawn(move || {
+                if reclaim_claim(&h2) {
+                    c2.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            t_free.join().unwrap();
+            t_reclaim.join().unwrap();
+            assert_eq!(
+                claims.load(Ordering::Relaxed),
+                1,
+                "exactly one of {{reclaim-on-alloc, free}} may claim the page"
+            );
         });
     }
 }

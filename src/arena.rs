@@ -20,6 +20,7 @@ use crate::arena_meta::{meta_free, meta_zalloc};
 use crate::bitmap::{BChunk, Bitmap, CHUNK_BITS, FIELD_BITS};
 use crate::bits::{MI_ARENA_SLICE_SHIFT, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT};
 use crate::os::{self, MemId};
+use crate::page::Page;
 use crate::prim::{DefaultPrim, Prim};
 use crate::sync::SpinLock;
 
@@ -297,7 +298,32 @@ impl Arena {
             return None; // never abandoned ⇒ nothing to reclaim
         }
         // SAFETY: `base` is the mapped registry block; `bin < MI_BIN_COUNT`.
-        unsafe { self.abandoned_bitmap_at(base, bin) }.try_find_and_clear(tseq)
+        let bitmap = unsafe { self.abandoned_bitmap_at(base, bin) };
+        // Claim the page's ownership *before* clearing its registry bit, so a
+        // concurrent free into the same page (which also claims ownership) and
+        // this alloc-reclaim cannot both take it — whoever wins the ownership CAS
+        // owns it; the loser skips. Ports `mi_arena_try_claim_abandoned`.
+        bitmap.try_find_and_claim(tseq, |idx| {
+            // SAFETY: a registered bit's slice index is a page start; the page
+            // header lives at that slice and stays live while abandoned.
+            let page = self.slice_ptr(idx).as_ptr() as *mut Page;
+            unsafe { (*page).claim_ownership() }
+        })
+    }
+
+    /// Clear `page`'s entry (`slice_index`, `bin`) from the registry. The caller
+    /// already **owns** the page (it is freeing or reusing it), so no reclaimer
+    /// can concurrently take it — a plain clear is the ownership-gated unabandon
+    /// (ports `_mi_arenas_page_unabandon`; the busy-wait reader handshake is
+    /// unnecessary because ownership is the gate).
+    #[inline]
+    pub fn page_unabandon(&self, slice_index: usize, bin: usize) {
+        let base = self.abandoned_base.load(Ordering::Acquire);
+        if base.is_null() {
+            return;
+        }
+        // SAFETY: `base` is the mapped registry block; `bin < MI_BIN_COUNT`.
+        unsafe { self.abandoned_bitmap_at(base, bin) }.clear(slice_index);
     }
 
     /// Number of abandoned pages of `bin` registered in this arena (0 if the

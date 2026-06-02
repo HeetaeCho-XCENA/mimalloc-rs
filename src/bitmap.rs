@@ -473,6 +473,44 @@ impl<'a> Bitmap<'a> {
         }
     }
 
+    /// Find a set bit whose `claim(idx)` returns true, clear it, and return its
+    /// index; bits for which `claim` returns false are left set and skipped.
+    ///
+    /// This is the ownership-gated reclaim primitive (ports
+    /// `mi_bitmap_try_find_and_claim`): the `claim` callback (a page-ownership
+    /// CAS) is the single serialization point, so a registered page is removed
+    /// from the bitmap only by the thread that wins its ownership — a concurrent
+    /// freer that already owns the page makes `claim` fail, leaving the bit for a
+    /// later attempt. `tseq` rotates the starting chunk to spread contention.
+    pub fn try_find_and_claim(
+        &self,
+        tseq: usize,
+        mut claim: impl FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        let cc = self.chunk_count();
+        if cc == 0 {
+            return None;
+        }
+        let start = tseq % cc;
+        for k in 0..cc {
+            let c = (start + k) % cc;
+            // Skip chunks the chunkmap marks empty (conservative).
+            if !self.chunkmap.is_set(c) {
+                continue;
+            }
+            for b in 0..CHUNK_BITS {
+                if self.chunks[c].is_set(b) {
+                    let idx = c * CHUNK_BITS + b;
+                    if claim(idx) {
+                        self.clear(idx);
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Cross-chunk contiguous allocation for `n > CHUNK_BITS`.
     fn try_find_and_clear_n_huge(&self, n: usize) -> Option<usize> {
         let total = self.max_bits();
