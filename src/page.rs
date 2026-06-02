@@ -219,11 +219,25 @@ impl Page {
         self.local_free.set(core::ptr::null_mut());
     }
 
-    /// Stamp the owning thread id, **preserving the page flag bits** in the low
-    /// `MI_PAGE_FLAG_MASK` bits (ports `mi_page_set_theap`'s flag-preserving CAS,
-    /// `internal.h:867-871`). A concurrent thread may set `has_interior` while we
-    /// restamp the owner, so we must not clobber the flags. `tid` must have its
-    /// low 2 bits clear (`current_tid` / `MI_THREADID_ABANDONED` both do).
+    /// Stamp the owning thread id on a **freshly initialized** page (flags are 0
+    /// and the page is not yet published in the page-map, so no other thread can
+    /// observe or mutate it) with a single plain store. This is the per-page
+    /// creation path; on the huge-alloc workload (one page per allocation) the
+    /// flag-preserving CAS below is a measurable per-op cost (a locked
+    /// read-modify-write), so the fresh path must stay a plain store.
+    #[inline]
+    pub fn set_owner_fresh(&self, tid: usize) {
+        debug_assert_eq!(tid & MI_PAGE_FLAG_MASK, 0, "tid must have clear flag bits");
+        self.xthread_id.store(tid, Ordering::Release);
+    }
+
+    /// Restamp the owning thread id on an **already-live** page, **preserving the
+    /// page flag bits** in the low `MI_PAGE_FLAG_MASK` bits (ports
+    /// `mi_page_set_theap`'s flag-preserving CAS, `internal.h:867-871`). Used when
+    /// reclaiming an abandoned page, which may carry `has_interior` from a prior
+    /// life (and a concurrent thread may set it), so we must not clobber the flags.
+    /// `tid` must have its low 2 bits clear (`current_tid` / `MI_THREADID_ABANDONED`
+    /// both do).
     #[inline]
     pub fn set_owner(&self, tid: usize) {
         debug_assert_eq!(tid & MI_PAGE_FLAG_MASK, 0, "tid must have clear flag bits");

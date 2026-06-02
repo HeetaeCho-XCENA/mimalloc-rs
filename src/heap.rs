@@ -329,7 +329,11 @@ impl Heap {
         // record heap/arena/bin so the page can be retired when it empties.
         // SAFETY: page just created and owned by this thread.
         unsafe {
-            page.as_ref().set_owner(self.tid);
+            // Fresh, unpublished page (flags are 0, no other thread can see it):
+            // a plain store, not the flag-preserving CAS used when reclaiming a
+            // live page — the per-page creation cost shows up directly on the
+            // huge workload (one page per allocation).
+            page.as_ref().set_owner_fresh(self.tid);
             page.as_ref().set_provenance(
                 self as *const Heap as *mut Heap,
                 arena.as_ptr(),
