@@ -257,7 +257,7 @@ impl Heap {
     /// ownership, drain the cross-thread frees that accumulated while it was
     /// abandoned, re-home it into this heap, and return it.
     fn try_reclaim(&self, bin: usize) -> Option<*mut Page> {
-        let page = self.subproc.reclaim_page(bin)?;
+        let page = self.subproc.reclaim_page(bin, self.next_tseq())?;
         // SAFETY: popped from the abandoned stack — exclusively ours now.
         unsafe {
             let arena = (*page).owning_arena();

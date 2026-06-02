@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicI64, Ordering};
 
 use crate::arena_meta::{meta_free, meta_zalloc};
 use crate::bitmap::{BChunk, Bitmap, CHUNK_BITS, FIELD_BITS};
-use crate::bits::{MI_ARENA_SLICE_SHIFT, MI_ARENA_SLICE_SIZE};
+use crate::bits::{MI_ARENA_SLICE_SHIFT, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT};
 use crate::os::{self, MemId};
 use crate::prim::{DefaultPrim, Prim};
 
@@ -35,6 +35,11 @@ fn chunks_for(slice_count: usize) -> usize {
 #[repr(C)]
 pub struct Arena {
     memid: MemId,
+    /// OS region backing all the bitmap storage (free/commit/purge + the
+    /// per-bin abandoned registries). This block is large metadata (~45 KiB for a
+    /// full arena, past the small-block meta allocator), so like the page-map it
+    /// comes straight from the OS; freed in [`Arena::destroy`].
+    bitmap_memid: MemId,
     start: NonNull<u8>,
     slice_count: usize,
     chunk_count: usize,
@@ -49,6 +54,12 @@ pub struct Arena {
     /// delay); [`Arena::maybe_purge`] later returns the still-free ones to the OS.
     purge_chunkmap: NonNull<BChunk>,
     purge_chunks: NonNull<BChunk>,
+    /// Per-bin **abandoned-page registry** (ports v3's `pages_abandoned[bin]`).
+    /// `set = an abandoned page of that bin starts at this slice`, findable for
+    /// reclaim-on-alloc. The `MI_BIN_COUNT` bitmaps are laid out contiguously
+    /// after the purge bitmap, each `[chunkmap][chunks; chunk_count]`; this points
+    /// at the first one and bin `b`'s bitmap is at `+ b*(chunk_count+1)`.
+    abandoned_base: NonNull<BChunk>,
     /// Earliest time (`clock_now_msecs`) at which a scheduled purge is due, or 0
     /// when nothing is pending. CAS'd 0→deadline by the first scheduler.
     purge_expire: AtomicI64,
@@ -77,20 +88,24 @@ impl Arena {
         let size = slice_count * MI_ARENA_SLICE_SIZE;
         let (start, memid) = os::alloc_aligned(size, MI_ARENA_SLICE_SIZE, commit, false)?;
 
-        // Bitmap storage: free + commit + purge, each a chunkmap + `chunk_count`
-        // chunks laid out contiguously.
-        let bchunks = 3 * (chunk_count + 1);
+        // Bitmap storage: free + commit + purge + `MI_BIN_COUNT` abandoned-page
+        // registries, each a chunkmap + `chunk_count` chunks laid out contiguously.
+        // This block can reach ~45 KiB (past the small-block meta allocator's
+        // 32 KiB limit), so it comes straight from the OS (zeroed ⇒ all-clear,
+        // which is a valid empty bitmap). Residency stays low: untouched
+        // abandoned-registry pages never fault in.
+        let stride = chunk_count + 1;
+        let bchunks = (3 + MI_BIN_COUNT) * stride;
         let bm_bytes = bchunks * core::mem::size_of::<BChunk>();
-        let bm_mem = match meta_zalloc(bm_bytes) {
-            Some(p) => p,
+        let (bm_region, bitmap_memid) = match os::alloc(bm_bytes, true) {
+            Some(v) => v,
             None => {
-                // SAFETY: nothing else references the region yet.
+                // SAFETY: nothing else references the data region yet.
                 unsafe { os::free(&memid) };
                 return None;
             }
         };
-        let bm_base = bm_mem.as_ptr() as *mut BChunk;
-        let stride = chunk_count + 1;
+        let bm_base = bm_region.as_ptr() as *mut BChunk;
         // SAFETY: bm_mem is `bchunks` zeroed BChunks laid out contiguously.
         let (
             free_chunkmap,
@@ -99,6 +114,7 @@ impl Arena {
             commit_chunks,
             purge_chunkmap,
             purge_chunks,
+            abandoned_base,
         ) = unsafe {
             (
                 NonNull::new_unchecked(bm_base),
@@ -107,6 +123,7 @@ impl Arena {
                 NonNull::new_unchecked(bm_base.add(stride + 1)),
                 NonNull::new_unchecked(bm_base.add(2 * stride)),
                 NonNull::new_unchecked(bm_base.add(2 * stride + 1)),
+                NonNull::new_unchecked(bm_base.add(3 * stride)),
             )
         };
 
@@ -117,7 +134,7 @@ impl Arena {
                 // SAFETY: region + bitmap storage are ours and unreferenced.
                 unsafe {
                     os::free(&memid);
-                    meta_free(bm_mem, bm_bytes);
+                    os::free(&bitmap_memid);
                 }
                 return None;
             }
@@ -127,6 +144,7 @@ impl Arena {
         unsafe {
             arena.write(Arena {
                 memid,
+                bitmap_memid,
                 start,
                 slice_count,
                 chunk_count,
@@ -136,6 +154,7 @@ impl Arena {
                 commit_chunks,
                 purge_chunkmap,
                 purge_chunks,
+                abandoned_base,
                 purge_expire: AtomicI64::new(0),
             });
             let a = &*arena;
@@ -183,6 +202,49 @@ impl Arena {
                 core::slice::from_raw_parts(self.purge_chunks.as_ptr(), self.chunk_count),
             )
         }
+    }
+
+    /// The abandoned-page registry bitmap for `bin` (`set = an abandoned page of
+    /// `bin` starts at this slice`). Laid out at `abandoned_base + bin*stride`.
+    #[inline]
+    fn abandoned_bitmap(&self, bin: usize) -> Bitmap<'_> {
+        debug_assert!(bin < MI_BIN_COUNT);
+        let stride = self.chunk_count + 1;
+        // SAFETY: the abandoned block holds `MI_BIN_COUNT` consecutive bitmaps,
+        // each `[chunkmap][chunks; chunk_count]`; bin < MI_BIN_COUNT.
+        unsafe {
+            let chunkmap = self.abandoned_base.as_ptr().add(bin * stride);
+            Bitmap::from_parts(
+                &*chunkmap,
+                core::slice::from_raw_parts(chunkmap.add(1), self.chunk_count),
+            )
+        }
+    }
+
+    /// Register `page` (starting at `slice_index`, size-class `bin`) in the
+    /// abandoned registry so another thread can reclaim it on allocation (ports
+    /// the `mi_bitmap_set(pages_abandoned[bin], slice_index)` of
+    /// `_mi_arenas_page_abandon`). The caller must have just relinquished the page.
+    #[inline]
+    pub fn page_abandon(&self, slice_index: usize, bin: usize) {
+        let was_clear = self.abandoned_bitmap(bin).set(slice_index);
+        debug_assert!(was_clear, "page already in the abandoned registry");
+    }
+
+    /// Reclaim one abandoned page of `bin`, returning its start slice index (and
+    /// removing it from the registry), or `None` if there are none. `tseq`
+    /// spreads concurrent reclaimers. Ports the find-and-clear of
+    /// `mi_arenas_page_try_find_abandoned` (FE1a: no ownership claim yet —
+    /// reclaim is alloc-only, so the atomic clear is the single claim point).
+    #[inline]
+    pub fn reclaim_abandoned(&self, bin: usize, tseq: usize) -> Option<usize> {
+        self.abandoned_bitmap(bin).try_find_and_clear(tseq)
+    }
+
+    /// Number of abandoned pages of `bin` registered in this arena.
+    #[inline]
+    pub fn abandoned_popcount(&self, bin: usize) -> usize {
+        self.abandoned_bitmap(bin).popcount()
     }
 
     /// Slice count.
@@ -377,12 +439,10 @@ impl Arena {
         // SAFETY: caller guarantees `arena` is live and unreferenced.
         unsafe {
             let a = arena.as_ref();
-            let bchunks = 3 * (a.chunk_count + 1);
-            let bm_bytes = bchunks * core::mem::size_of::<BChunk>();
-            let bm_mem = a.free_chunkmap.cast::<u8>();
             let memid = a.memid;
+            let bitmap_memid = a.bitmap_memid;
             os::free(&memid);
-            meta_free(bm_mem, bm_bytes);
+            os::free(&bitmap_memid);
             meta_free(arena.cast::<u8>(), core::mem::size_of::<Arena>());
         }
     }
