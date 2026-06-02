@@ -702,4 +702,99 @@ mod loom_tests {
             assert_eq!(chunk.popcount(), 0);
         });
     }
+
+    /// The arena purge claim protocol: a purger atomically claims a free slot
+    /// (`clear_n`), "purges" it, then releases it (`set_n`), while an allocator
+    /// races to claim slots (`try_find_and_clear`). The slot must never be owned
+    /// by both at once — i.e. a purge can never `madvise` memory an allocation
+    /// is handing out. `owner0` (guarded by the claim) detects any double-owner.
+    #[test]
+    fn purge_claim_never_overlaps_alloc() {
+        use crate::atomic::{AtomicUsize, Ordering};
+        loom::model(|| {
+            let cm = Arc::new(BChunk::zeroed());
+            let chunk = Arc::new(BChunk::zeroed());
+            chunk.set_n(0, 2); // bits 0,1 free
+            cm.set_n(0, 1);
+            let owner0 = Arc::new(AtomicUsize::new(0)); // 0=free, 1=purger, 2=alloc
+
+            // Purger: claim slot 0, (purge), release.
+            let (cm_p, chunk_p, own_p) = (cm.clone(), chunk.clone(), owner0.clone());
+            let p = loom::thread::spawn(move || {
+                let bm = Bitmap::from_parts(&cm_p, core::slice::from_ref(&*chunk_p));
+                if bm.clear_n(0, 1) {
+                    // Exclusively ours now — no allocator may hold it.
+                    assert!(
+                        own_p
+                            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok(),
+                        "purge claimed a slot an allocation owns"
+                    );
+                    own_p.store(0, Ordering::Release);
+                    bm.set_n(0, 1); // release back to free
+                }
+            });
+
+            // Allocator: grab a free slot; if it is slot 0, it owns it.
+            let (cm_a, chunk_a, own_a) = (cm.clone(), chunk.clone(), owner0.clone());
+            let a = loom::thread::spawn(move || {
+                let bm = Bitmap::from_parts(&cm_a, core::slice::from_ref(&*chunk_a));
+                if let Some(x) = bm.try_find_and_clear(0) {
+                    if x == 0 {
+                        assert!(
+                            own_a
+                                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok(),
+                            "allocation took a slot a purge owns"
+                        );
+                    }
+                }
+            });
+            p.join().unwrap();
+            a.join().unwrap();
+        });
+    }
+
+    /// Two concurrent purgers claiming + releasing the same slot must never both
+    /// hold it at once (the `clear_n` CAS gate is the exclusion). Models the
+    /// `delay==0`/`force` case where two `run_purge` calls overlap on one arena.
+    #[test]
+    fn two_purgers_never_overlap() {
+        use crate::atomic::{AtomicUsize, Ordering};
+        loom::model(|| {
+            let cm = Arc::new(BChunk::zeroed());
+            let chunk = Arc::new(BChunk::zeroed());
+            chunk.set_n(0, 1); // one free slot
+            cm.set_n(0, 1);
+            let owner = Arc::new(AtomicUsize::new(0)); // 0 = unheld
+
+            let mut handles = Vec::new();
+            for id in 1..=2u32 {
+                let (cm, chunk, owner) = (cm.clone(), chunk.clone(), owner.clone());
+                handles.push(loom::thread::spawn(move || {
+                    let bm = Bitmap::from_parts(&cm, core::slice::from_ref(&*chunk));
+                    if bm.clear_n(0, 1) {
+                        // Claimed: must be exclusive while held.
+                        assert!(
+                            owner
+                                .compare_exchange(
+                                    0,
+                                    id as usize,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire
+                                )
+                                .is_ok(),
+                            "two purgers held the same slot at once"
+                        );
+                        owner.store(0, Ordering::Release);
+                        bm.set_n(0, 1); // release
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert!(chunk.is_set(0), "slot must be released back to free");
+        });
+    }
 }

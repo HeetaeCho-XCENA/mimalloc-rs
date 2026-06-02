@@ -13,11 +13,13 @@
 //! allocator ([`crate::arena_meta`]), never the global allocator.
 
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicI64, Ordering};
 
 use crate::arena_meta::{meta_free, meta_zalloc};
-use crate::bitmap::{BChunk, Bitmap, CHUNK_BITS};
+use crate::bitmap::{BChunk, Bitmap, CHUNK_BITS, FIELD_BITS};
 use crate::bits::{MI_ARENA_SLICE_SHIFT, MI_ARENA_SLICE_SIZE};
 use crate::os::{self, MemId};
+use crate::prim::{DefaultPrim, Prim};
 
 /// Number of bitmap `BChunk`s needed to cover `slice_count` slices.
 #[inline]
@@ -43,10 +45,17 @@ pub struct Arena {
     /// creation, so on-demand commit and recommit-after-purge share one path.
     commit_chunkmap: NonNull<BChunk>,
     commit_chunks: NonNull<BChunk>,
+    /// `set = scheduled for purge`. A freed slice's bit is set here (with a
+    /// delay); [`Arena::maybe_purge`] later returns the still-free ones to the OS.
+    purge_chunkmap: NonNull<BChunk>,
+    purge_chunks: NonNull<BChunk>,
+    /// Earliest time (`clock_now_msecs`) at which a scheduled purge is due, or 0
+    /// when nothing is pending. CAS'd 0→deadline by the first scheduler.
+    purge_expire: AtomicI64,
 }
 
-// SAFETY: the only mutable shared state is the atomic bitmaps (BChunk = atomics);
-// all other fields are set once in `create` and then read-only.
+// SAFETY: the only mutable shared state is the atomic bitmaps (BChunk = atomics)
+// and `purge_expire` (atomic); all other fields are set once in `create`.
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
@@ -68,8 +77,9 @@ impl Arena {
         let size = slice_count * MI_ARENA_SLICE_SIZE;
         let (start, memid) = os::alloc_aligned(size, MI_ARENA_SLICE_SIZE, commit, false)?;
 
-        // Bitmap storage: free(chunkmap + chunks) + commit(chunkmap + chunks).
-        let bchunks = 2 * (chunk_count + 1);
+        // Bitmap storage: free + commit + purge, each a chunkmap + `chunk_count`
+        // chunks laid out contiguously.
+        let bchunks = 3 * (chunk_count + 1);
         let bm_bytes = bchunks * core::mem::size_of::<BChunk>();
         let bm_mem = match meta_zalloc(bm_bytes) {
             Some(p) => p,
@@ -80,17 +90,23 @@ impl Arena {
             }
         };
         let bm_base = bm_mem.as_ptr() as *mut BChunk;
+        let stride = chunk_count + 1;
         // SAFETY: bm_mem is `bchunks` zeroed BChunks laid out contiguously.
-        let (free_chunkmap, free_chunks, commit_chunkmap, commit_chunks) = unsafe {
-            let free_chunkmap = bm_base;
-            let free_chunks = bm_base.add(1);
-            let commit_chunkmap = bm_base.add(1 + chunk_count);
-            let commit_chunks = bm_base.add(2 + chunk_count);
+        let (
+            free_chunkmap,
+            free_chunks,
+            commit_chunkmap,
+            commit_chunks,
+            purge_chunkmap,
+            purge_chunks,
+        ) = unsafe {
             (
-                NonNull::new_unchecked(free_chunkmap),
-                NonNull::new_unchecked(free_chunks),
-                NonNull::new_unchecked(commit_chunkmap),
-                NonNull::new_unchecked(commit_chunks),
+                NonNull::new_unchecked(bm_base),
+                NonNull::new_unchecked(bm_base.add(1)),
+                NonNull::new_unchecked(bm_base.add(stride)),
+                NonNull::new_unchecked(bm_base.add(stride + 1)),
+                NonNull::new_unchecked(bm_base.add(2 * stride)),
+                NonNull::new_unchecked(bm_base.add(2 * stride + 1)),
             )
         };
 
@@ -118,6 +134,9 @@ impl Arena {
                 free_chunks,
                 commit_chunkmap,
                 commit_chunks,
+                purge_chunkmap,
+                purge_chunks,
+                purge_expire: AtomicI64::new(0),
             });
             let a = &*arena;
             // Mark all real slices free.
@@ -151,6 +170,17 @@ impl Arena {
             Bitmap::from_parts(
                 self.commit_chunkmap.as_ref(),
                 core::slice::from_raw_parts(self.commit_chunks.as_ptr(), self.chunk_count),
+            )
+        }
+    }
+
+    #[inline]
+    fn purge_bitmap(&self) -> Bitmap<'_> {
+        // SAFETY: same layout as `free_bitmap`.
+        unsafe {
+            Bitmap::from_parts(
+                self.purge_chunkmap.as_ref(),
+                core::slice::from_raw_parts(self.purge_chunks.as_ptr(), self.chunk_count),
             )
         }
     }
@@ -214,15 +244,128 @@ impl Arena {
         Some((idx, self.slice_ptr(idx)))
     }
 
-    /// Free `n` slices starting at `idx` (marks them free for reuse).
+    /// Free `n` slices starting at `idx` (marks them free for reuse) and
+    /// schedule them for a (delayed) purge so their physical pages are returned
+    /// to the OS if they stay free. The slices are immediately reusable.
     pub fn free_slices(&self, idx: usize, n: usize) {
         debug_assert!(idx + n <= self.slice_count);
         self.free_bitmap().set_n(idx, n);
+        self.schedule_purge(idx, n);
     }
 
     /// Count of currently-free slices.
     pub fn free_slice_count(&self) -> usize {
         self.free_bitmap().popcount()
+    }
+
+    /// Number of slices currently committed (test/diagnostics; the RSS proxy).
+    #[cfg(test)]
+    pub fn committed_slice_count(&self) -> usize {
+        self.commit_bitmap().popcount()
+    }
+
+    /// Mark `[idx, idx+n)` for purge and arm the delay timer (ports
+    /// `mi_arena_schedule_purge`). Pinned arenas and a disabled `purge_delay`
+    /// (`< 0`) never purge; a zero delay purges immediately.
+    fn schedule_purge(&self, idx: usize, n: usize) {
+        let delay = crate::options::arena_purge_delay();
+        if delay < 0 || self.memid.is_pinned {
+            return;
+        }
+        self.purge_bitmap().set_n(idx, n);
+        if delay == 0 {
+            // Immediate purge (regardless of the expire timer).
+            self.run_purge();
+        } else {
+            let expire = DefaultPrim::clock_now_msecs().saturating_add(delay);
+            // Only the first scheduler since the last purge sets the deadline.
+            let _ =
+                self.purge_expire
+                    .compare_exchange(0, expire, Ordering::AcqRel, Ordering::Relaxed);
+        }
+    }
+
+    /// Purge any slices whose delay has elapsed, returning their pages to the OS.
+    /// Cheap when nothing is pending (one atomic load, no clock syscall). With
+    /// `force`, purges regardless of the timer. Returns whether anything was
+    /// purged. Ports `mi_arena_try_purge`; safe to call from any owner thread.
+    pub fn maybe_purge(&self, force: bool) -> bool {
+        if self.memid.is_pinned {
+            return false;
+        }
+        if force {
+            // Force: reset the timer and scan unconditionally.
+            self.purge_expire.store(0, Ordering::Release);
+            return self.run_purge();
+        }
+        let expire = self.purge_expire.load(Ordering::Acquire);
+        if expire == 0 {
+            return false; // nothing scheduled — avoid the clock syscall
+        }
+        if expire > DefaultPrim::clock_now_msecs() {
+            return false; // not due yet
+        }
+        // Due: claim this cycle by CAS-resetting the deadline to 0. Only the
+        // winner scans — this serializes concurrent purgers and, because a
+        // `schedule_purge` that re-armed `purge_expire` to a newer deadline makes
+        // this CAS fail, it can never clobber the deadline of a slice freed
+        // concurrently (that slice is then purged on the next cycle).
+        if self
+            .purge_expire
+            .compare_exchange(expire, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        self.run_purge()
+    }
+
+    /// Walk the purge bitmap and return each still-free range to the OS. Claims
+    /// a range from the free bitmap before purging so a concurrent allocation
+    /// can never hand out memory mid-`madvise`; reallocated ranges are skipped.
+    /// The caller (`maybe_purge`, or `schedule_purge` for the immediate case)
+    /// owns resetting `purge_expire`. Mirrors `mi_arena_try_purge` + `mi_arena_purge`.
+    fn run_purge(&self) -> bool {
+        let mut purged = false;
+        let mut idx = 0;
+        while idx < self.slice_count {
+            if !self.purge_bitmap().is_set(idx) {
+                idx += 1;
+                continue;
+            }
+            // Extend the run, but never across a 64-bit **field** boundary: the
+            // free-bitmap claim below (`clear_n`) is atomic all-or-nothing only
+            // within a single field, and that single atomic claim is exactly what
+            // makes the purge race-free against allocation. (v3 likewise claims
+            // per bfield.) Adjacent fields are handled as separate runs.
+            let field_end = (idx / FIELD_BITS + 1) * FIELD_BITS;
+            let mut end = idx + 1;
+            while end < self.slice_count && end < field_end && self.purge_bitmap().is_set(end) {
+                end += 1;
+            }
+            let n = end - idx;
+            // Claim the range from the free bitmap (atomic, all-or-nothing): only
+            // purge if every slice is still free, so no allocation races the
+            // `madvise`. If reallocated, skip — it will reschedule when freed.
+            if self.free_bitmap().clear_n(idx, n) {
+                let all_committed = self.commit_bitmap().is_set_n(idx, n);
+                // SAFETY: the range is claimed (exclusively ours) and committed.
+                let needs_recommit = unsafe {
+                    os::purge_ex(self.slice_ptr(idx), n * MI_ARENA_SLICE_SIZE, all_committed)
+                };
+                if needs_recommit {
+                    // Decommitted: reuse must re-commit (see `ensure_committed`).
+                    self.commit_bitmap().clear_n(idx, n);
+                }
+                // Release the range back to the free pool.
+                self.free_bitmap().set_n(idx, n);
+                purged = true;
+            }
+            // Clear the purge marks for this run (claimed or not).
+            self.purge_bitmap().clear_n(idx, n);
+            idx = end;
+        }
+        purged
     }
 
     /// Tear the arena down, releasing the data region and metadata to the OS.
@@ -234,7 +377,7 @@ impl Arena {
         // SAFETY: caller guarantees `arena` is live and unreferenced.
         unsafe {
             let a = arena.as_ref();
-            let bchunks = 2 * (a.chunk_count + 1);
+            let bchunks = 3 * (a.chunk_count + 1);
             let bm_bytes = bchunks * core::mem::size_of::<BChunk>();
             let bm_mem = a.free_chunkmap.cast::<u8>();
             let memid = a.memid;
@@ -319,6 +462,56 @@ mod tests {
 
             Arena::destroy(arena);
         }
+    }
+
+    #[test]
+    fn delayed_purge_waits_then_force_returns_pages() {
+        // Drive purging via `force` and a *positive* delay only — never set the
+        // global delay to 0/immediate, so concurrent tests' frees (which read
+        // these process-global options) are never purged out from under them.
+        use crate::options::{self, Opt};
+        let _g = options::OPTION_TEST_LOCK.lock().unwrap();
+        let (sd, sc) = (
+            options::get(Opt::PurgeDelay),
+            options::get(Opt::PurgeDecommits),
+        );
+        options::set(Opt::PurgeDelay, 1000); // 1s delay (not immediate)
+        options::set(Opt::PurgeDecommits, 1);
+
+        let arena = Arena::create(16, true).unwrap(); // eager: all 16 committed
+                                                      // SAFETY: fresh arena, single-threaded test.
+        unsafe {
+            let a = arena.as_ref();
+            assert_eq!(a.committed_slice_count(), 16);
+            let (i, p) = a.alloc_slices(8, 0).unwrap();
+            core::ptr::write_bytes(p.as_ptr(), 0xAB, 8 * MI_ARENA_SLICE_SIZE);
+            a.free_slices(i, 8); // schedules a purge ~1s out
+
+            // Not yet due: a non-forced purge is a no-op.
+            assert!(!a.maybe_purge(false), "purge must wait for the deadline");
+            #[cfg(any(feature = "debug", feature = "secure"))]
+            assert_eq!(a.committed_slice_count(), 16, "nothing purged before due");
+
+            // Force purges now: pages returned to the OS, slices reusable. The
+            // commit *bitmap* only changes when the purge needs a recommit
+            // (debug/secure decommit strips access → PROT_NONE; release
+            // MADV_DONTNEED keeps it mapped). The RSS drop happens in both.
+            assert!(a.maybe_purge(true), "force purges the due range");
+            assert_eq!(a.free_slice_count(), 16, "purged slices are free again");
+            #[cfg(any(feature = "debug", feature = "secure"))]
+            assert_eq!(a.committed_slice_count(), 8, "force decommitted the range");
+
+            // Reuse must recommit (if needed) and hand back usable, zeroed memory.
+            let (_j, q) = a.alloc_slices(8, 0).unwrap();
+            core::ptr::write_bytes(q.as_ptr(), 0xCD, 8 * MI_ARENA_SLICE_SIZE);
+            assert_eq!(*q.as_ptr(), 0xCD, "reused slice is writable");
+            assert_eq!(*q.as_ptr().add(8 * MI_ARENA_SLICE_SIZE - 1), 0xCD);
+            assert_eq!(a.committed_slice_count(), 16, "reuse left all committed");
+
+            Arena::destroy(arena);
+        }
+        options::set(Opt::PurgeDelay, sd);
+        options::set(Opt::PurgeDecommits, sc);
     }
 
     #[test]

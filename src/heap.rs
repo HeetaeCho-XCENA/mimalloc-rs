@@ -417,6 +417,9 @@ impl Heap {
                 cur = next;
             }
         }
+        // Return any due (and, with `force`, all) freed-but-still-resident arena
+        // slices to the OS. This is the heartbeat that drives delayed purging.
+        self.subproc.try_purge(force);
     }
 }
 
@@ -602,6 +605,9 @@ unsafe fn retire_page(page_ptr: *mut Page) {
         heap.pages[bin].remove(page_ptr);
         release_page_slices(page_ptr);
     }
+    // Drive delayed purging opportunistically as pages drain (cheap when nothing
+    // is due). Mirrors v3 retiring a page → `_mi_arenas_collect` → try-purge.
+    heap.subproc.try_purge(false);
 }
 
 /// Return a page's slices to its arena and drop its address→page mappings.
