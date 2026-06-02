@@ -18,8 +18,12 @@ use crate::arena_meta::{meta_free, meta_zalloc};
 use crate::bits::{
     bin, wsize_from_size, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_HUGE, MI_INTPTR_SIZE,
     MI_LARGE_MAX_OBJ_SIZE, MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_PAGES_DIRECT,
-    MI_PAGE_FLAG_MASK, MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED,
+    MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED,
 };
+// Used only by the std free fast path's XOR dispatch (the no_std path is
+// single-owner and never inspects the page flags).
+#[cfg(feature = "std")]
+use crate::bits::MI_PAGE_FLAG_MASK;
 use crate::layout::align_up;
 use crate::page::Page;
 use crate::page_map;
