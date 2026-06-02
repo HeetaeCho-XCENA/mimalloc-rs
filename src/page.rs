@@ -19,7 +19,10 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use crate::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use crate::bits::{MI_ARENA_SLICE_SIZE, MI_INTPTR_SIZE, MI_MAX_ALIGN_SIZE, MI_PAGE_FLAG_MASK};
+use crate::bits::{
+    MI_ARENA_SLICE_SIZE, MI_INTPTR_SIZE, MI_MAX_ALIGN_SIZE, MI_PAGE_FLAG_MASK,
+    MI_PAGE_HAS_INTERIOR_POINTERS, MI_PAGE_IN_FULL_QUEUE,
+};
 use crate::free_list::Block;
 use crate::layout::align_up;
 
@@ -216,10 +219,27 @@ impl Page {
         self.local_free.set(core::ptr::null_mut());
     }
 
-    /// Stamp the owning thread id (with page flags in the low bits).
+    /// Stamp the owning thread id, **preserving the page flag bits** in the low
+    /// `MI_PAGE_FLAG_MASK` bits (ports `mi_page_set_theap`'s flag-preserving CAS,
+    /// `internal.h:867-871`). A concurrent thread may set `has_interior` while we
+    /// restamp the owner, so we must not clobber the flags. `tid` must have its
+    /// low 2 bits clear (`current_tid` / `MI_THREADID_ABANDONED` both do).
     #[inline]
     pub fn set_owner(&self, tid: usize) {
-        self.xthread_id.store(tid, Ordering::Release);
+        debug_assert_eq!(tid & MI_PAGE_FLAG_MASK, 0, "tid must have clear flag bits");
+        let mut old = self.xthread_id.load(Ordering::Relaxed);
+        loop {
+            let new = tid | (old & MI_PAGE_FLAG_MASK);
+            match self.xthread_id.compare_exchange_weak(
+                old,
+                new,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(e) => old = e,
+            }
+        }
     }
 
     /// Read the owning thread id (flags masked off) without forming a `&Page`
@@ -232,6 +252,55 @@ impl Page {
         // SAFETY: project to the atomic field only (AtomicUsize: Sync).
         let xid = unsafe { &*core::ptr::addr_of!((*page).xthread_id) };
         xid.load(Ordering::Acquire) & !MI_PAGE_FLAG_MASK
+    }
+
+    /// Read the raw `xthread_id` (owner tid **with** the flag bits) without
+    /// forming a `&Page`. This is what the free fast path XORs against the
+    /// current thread id so the owner-vs-cross-thread decision and the
+    /// full/interior flag check collapse into one compare (ports
+    /// `mi_page_xthread_id` as used in `mi_free_ex`, `free.c:185`).
+    ///
+    /// # Safety
+    /// `page` must point at a live page header.
+    #[inline]
+    pub unsafe fn xthread_id_raw(page: *mut Page) -> usize {
+        // SAFETY: project to the atomic field only (AtomicUsize: Sync).
+        let xid = unsafe { &*core::ptr::addr_of!((*page).xthread_id) };
+        xid.load(Ordering::Acquire)
+    }
+
+    /// Set or clear the `in_full` flag (a page is in the heap's full queue). The
+    /// flag lives in `xthread_id`'s low bits so the free fast path sees it for
+    /// free; we use atomic or/and because a non-owner may concurrently set
+    /// `has_interior`. Owner-only caller (queue accounting). Ports
+    /// `mi_page_set_in_full`.
+    #[inline]
+    pub fn set_in_full(&self, in_full: bool) {
+        if in_full {
+            self.xthread_id
+                .fetch_or(MI_PAGE_IN_FULL_QUEUE, Ordering::Release);
+        } else {
+            self.xthread_id
+                .fetch_and(!MI_PAGE_IN_FULL_QUEUE, Ordering::Release);
+        }
+    }
+
+    /// Is this page currently in the full queue?
+    #[inline]
+    pub fn is_in_full(&self) -> bool {
+        self.xthread_id.load(Ordering::Acquire) & MI_PAGE_IN_FULL_QUEUE != 0
+    }
+
+    /// Mark that this page has handed out an interior pointer (from a
+    /// large-alignment `alloc_aligned`), so the free fast path routes its
+    /// pointers through the unalign (block-start recovery) path instead of
+    /// assuming a block-start pointer. Set via atomic or — may be called from a
+    /// non-owner. Ports `mi_page_set_has_interior_pointers` / the
+    /// `MI_PAGE_HAS_INTERIOR_POINTERS` flag.
+    #[inline]
+    pub fn set_has_interior(&self) {
+        self.xthread_id
+            .fetch_or(MI_PAGE_HAS_INTERIOR_POINTERS, Ordering::Release);
     }
 
     /// Const block size, read via raw projection (immutable after init), so it

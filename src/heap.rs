@@ -18,7 +18,7 @@ use crate::arena_meta::{meta_free, meta_zalloc};
 use crate::bits::{
     bin, wsize_from_size, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_HUGE, MI_INTPTR_SIZE,
     MI_LARGE_MAX_OBJ_SIZE, MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_PAGES_DIRECT,
-    MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED,
+    MI_PAGE_FLAG_MASK, MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED,
 };
 use crate::layout::align_up;
 use crate::page::Page;
@@ -282,6 +282,17 @@ impl Heap {
         let total = size.checked_add(align - 1)?;
         let p = self.alloc(total)?;
         let aligned = align_up(p.addr().get(), align);
+        if aligned != p.addr().get() {
+            // We are handing out an *interior* pointer. Flag the page so the free
+            // fast path recovers the block start instead of assuming a block-start
+            // pointer (ports `mi_page_set_has_interior_pointers` in
+            // `alloc-aligned.c`). Only the rare large-alignment path pays the
+            // page-map lookup.
+            let page = page_map::lookup(p.addr().get()) as *mut Page;
+            debug_assert!(!page.is_null(), "just-allocated block must be mapped");
+            // SAFETY: the block we just allocated is registered in the page-map.
+            unsafe { (*page).set_has_interior() };
+        }
         // SAFETY: `aligned - block_start < align <= block_size`, so the aligned
         // pointer stays within the same block.
         Some(unsafe { NonNull::new_unchecked(p.as_ptr().with_addr(aligned)) })
@@ -476,37 +487,45 @@ pub unsafe fn free(ptr: NonNull<u8>) {
         #[cfg(not(any(feature = "secure", feature = "debug")))]
         return;
     }
-    // Normalize to the block start (supports interior pointers) using only the
-    // page's immutable const fields — sound to read from any thread.
-    // SAFETY: page-map only stores valid page headers.
-    let (bs, pstart) = unsafe {
-        (
-            Page::raw_block_size(page_ptr),
-            Page::raw_page_start(page_ptr),
-        )
-    };
-    let off = ptr.addr().get() - pstart.addr();
-    // Fast path: a block-start pointer (`off == 0`) needs no normalization —
-    // skip the per-free integer division. This is the overwhelmingly common
-    // case (`malloc`/`free` of block-start pointers); only an *interior* pointer
-    // from a large-alignment allocation (`align > MI_MAX_ALIGN_SIZE`) takes the
-    // divide to recover its block start. Behavior is identical (`off == 0` makes
-    // the old `(off / bs) * bs` zero anyway).
-    let block_start = if off == 0 {
-        ptr.as_ptr()
-    } else {
-        pstart.wrapping_add((off / bs) * bs)
-    };
-    // SAFETY: block_start is the start of a live block in this page.
-    let block = unsafe { NonNull::new_unchecked(block_start) };
+    // The page's const fields (block size, area start) are immutable after init,
+    // so they are sound to read from any thread.
+    // SAFETY: the page-map only stores valid page headers.
+    let bs = unsafe { Page::raw_block_size(page_ptr) };
     crate::stats::on_free(bs);
+
+    // Recover the block start from a (possibly interior) pointer. A block-start
+    // pointer (`off == 0`, the overwhelmingly common case) skips the divide; only
+    // an interior pointer from a large-alignment `alloc_aligned` — which sets the
+    // page's `has_interior` flag — needs the normalization.
+    let recover_block = |p: NonNull<u8>| -> NonNull<u8> {
+        // SAFETY: `page_ptr` is a live header; const field read.
+        let pstart = unsafe { Page::raw_page_start(page_ptr) };
+        let off = p.addr().get() - pstart.addr();
+        let bstart = if off == 0 {
+            p.as_ptr()
+        } else {
+            pstart.wrapping_add((off / bs) * bs)
+        };
+        // SAFETY: the recovered address is the start of a live block in this page.
+        unsafe { NonNull::new_unchecked(bstart) }
+    };
 
     #[cfg(feature = "std")]
     {
-        // SAFETY: reads the owner tid atomically without forming `&Page`.
-        let owner = unsafe { Page::owner_tid(page_ptr) };
-        if owner == crate::init::current_tid() {
-            // Owner path: deferred local free (touches owner-only `Cell`s).
+        // Fold the owner-vs-cross-thread decision and the page flag check into a
+        // single XOR (ports `mi_free_ex`, `free.c:185-205`): `xtid == 0` means we
+        // own the page *and* it carries no flags (not full, no interior) — the
+        // fast local path; the flag bits route the rare full/interior cases to the
+        // generic paths at no extra cost on the common path. Two distinct thread
+        // ids differ above the flag mask (ids have clear low bits), so
+        // `xtid & !MI_PAGE_FLAG_MASK == 0` iff we are the owner.
+        // SAFETY: reads the raw xthread_id atomically without forming `&Page`.
+        let raw = unsafe { Page::xthread_id_raw(page_ptr) };
+        let xtid = crate::init::current_tid() ^ raw;
+        if xtid & !MI_PAGE_FLAG_MASK == 0 {
+            // Local (we own the page). `xtid == 0` ⇒ block-start pointer;
+            // otherwise an interior/full-flagged page → recover the block start.
+            let block = if xtid == 0 { ptr } else { recover_block(ptr) };
             // SAFETY: this thread owns the page.
             unsafe {
                 // Hardened builds: detect frees of pointers outside the block
@@ -530,7 +549,14 @@ pub unsafe fn free(ptr: NonNull<u8>) {
                 }
             }
         } else {
-            // Cross-thread: atomic Treiber push (touches only the atomic + block).
+            // Cross-thread (or abandoned) page: atomic Treiber push (touches only
+            // the atomic + block). `xtid & FLAG_MASK == 0` ⇒ block-start pointer;
+            // a flagged page → recover the block start.
+            let block = if xtid & MI_PAGE_FLAG_MASK == 0 {
+                ptr
+            } else {
+                recover_block(ptr)
+            };
             // SAFETY: live page and block.
             unsafe { Page::thread_free_push(page_ptr, block) };
         }
@@ -539,6 +565,7 @@ pub unsafe fn free(ptr: NonNull<u8>) {
     {
         // Without std TLS we assume single-owner frees; embedders that share
         // heaps across tasks must route cross-task frees themselves.
+        let block = recover_block(ptr);
         // SAFETY: single-owner assumption.
         unsafe {
             (*page_ptr).free_local(block);
