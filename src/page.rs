@@ -474,22 +474,50 @@ impl Page {
     }
 
     /// Allocate one block, or `None` if the page is full.
+    ///
+    /// Fast path: pop the head of `free`. When `free` is empty the refill
+    /// (collect cross-thread frees, then lazily extend) lives in [`Page::alloc_slow`],
+    /// kept out of line **only in the preload cdylib** (`cfg(override_export)`) so
+    /// this shell inlines across the export boundary — mirroring C's force-inlined
+    /// `mi_page_malloc_zero` over the noinline generic refill. In a static build the
+    /// optimizer folds `alloc_slow` back in (no forced call on the refill path).
+    #[inline]
     pub fn alloc(&self) -> Option<NonNull<u8>> {
+        let b = self.free.get();
+        if b.is_null() {
+            return self.alloc_slow();
+        }
+        // SAFETY: `b` is the current non-null free head.
+        Some(unsafe { self.pop(b) })
+    }
+
+    /// Cold refill path: `free` was empty, so reclaim local/cross-thread frees
+    /// and, if still empty, initialize the next batch of blocks on demand.
+    /// (`#[cold]` only in the preload cdylib; see [`Page::alloc`].)
+    #[cfg_attr(override_export, cold)]
+    fn alloc_slow(&self) -> Option<NonNull<u8>> {
+        // SAFETY: owner path — reclaim any local/cross-thread frees first.
+        unsafe { self.collect() };
         let mut b = self.free.get();
         if b.is_null() {
-            // SAFETY: owner path — reclaim any local/cross-thread frees first.
-            unsafe { self.collect() };
+            // Still empty: initialize the next batch of blocks on demand.
+            // SAFETY: owner path; only runs when `free` is empty.
+            unsafe { self.extend_free() };
             b = self.free.get();
             if b.is_null() {
-                // Still empty: initialize the next batch of blocks on demand.
-                // SAFETY: owner path; only runs when `free` is empty.
-                unsafe { self.extend_free() };
-                b = self.free.get();
-                if b.is_null() {
-                    return None; // truly full: capacity == reserved
-                }
+                return None; // truly full: capacity == reserved
             }
         }
+        // SAFETY: `b` is the current non-null free head.
+        Some(unsafe { self.pop(b) })
+    }
+
+    /// Pop a known-non-null `free` head and return it as the allocated block.
+    ///
+    /// # Safety
+    /// `b` must be the current (non-null) value of `self.free`.
+    #[inline]
+    unsafe fn pop(&self, b: *mut Block) -> NonNull<u8> {
         // Debug: every block handed out must lie on the page's block grid; a
         // violation means the free list was corrupted (e.g. an interior pointer
         // was pushed onto it).
@@ -504,7 +532,7 @@ impl Page {
         self.free.set(next);
         self.used.set(self.used.get() + 1);
         // SAFETY: b is within the page area and non-null.
-        Some(unsafe { NonNull::new_unchecked(b as *mut u8) })
+        unsafe { NonNull::new_unchecked(b as *mut u8) }
     }
 
     /// Free a block back to this page (owner path).
