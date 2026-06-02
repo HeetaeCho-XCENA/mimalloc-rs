@@ -69,7 +69,7 @@ exported body — see `docs/perf-hotpath.md` §C2/§C3.)
 
 | Divergence | v3 behavior | mimalloc-rs | Rationale / status |
 |---|---|---|---|
-| **Full-page eviction** | full pages are abandoned out of the bin queue (`page_full_retain`) so cross-thread freers can claim them | full pages stay in the bin queue (FE2 **parked**) | Two attempts regressed larson/phase-2 MT. **This is the main remaining gap** — see §4. |
+| **Full-page eviction** | full pages are abandoned out of the bin queue (`page_full_retain`) so cross-thread freers can claim them | implemented **for the preload `cdylib` only** (`cfg(any(override_export, test))`); a static `#[global_allocator]` keeps full pages in the bin queue | Ported with cross-thread reclaim + a tuned `page_full_retain=16` (FR2/FR3). Closes the cross-thread-free gap (xmalloc-test −24%→−11%, §4). Gated to preload because the abandon/reclaim churn regresses the single/intra-thread small-alloc path with no contention to relieve; a static build is byte-identical to the pre-eviction scan. (Bare eviction was parked 4× before — cross-thread reclaim is what makes it net-positive.) |
 | **Delayed retire** | `retire_expire` countdown; emptied sole pages freed later by `_mi_theap_collect_retired` on a generic-alloc cadence | emptied pages retired immediately; the sole page of a bin is kept | Keeping the sole page covers the common alloc/free/alloc cycle; the cadence + `retire_expire` is unported (also breaks the deferred-free heartbeat contract — follow-up). |
 | **Reclaim-on-free** | a cross-thread free can reclaim an abandoned page into the freeing thread (`page_reclaim_on_free`, `max_reclaim` cap) | deferred: a freed-into page is reabandoned-to-mapped and reclaimed on the next *alloc* instead | Avoids free↔heap coupling; costs contention on heavy cross-thread frees (§4). |
 | **`_mi_page_free_collect_partly`** | no-atomic small-block collect on the claim path | always full-collects (atomic swap-drain) | Only on the abandoned-claim path; matters once eviction (above) is in play. |
@@ -95,42 +95,44 @@ vs C `libmimalloc` v3.3.2 (− = rs slower / costlier):
 | mstress | 8T | **≈0%** | |
 | rptest | 8T | **≈0%** | |
 | cfrac | 1T | **−4.0%** | pure malloc/free |
-| **alloc-test** | 8T | **+14.6% slower** | heavy cross-thread free |
-| **xmalloc-test** | 8T | **−24% throughput** | producer/consumer cross-thread free |
+| **xmalloc-test** | 8T | **−10.8%** (was −24%) | producer/consumer cross-thread free — closed by FR2 (below) |
+| **alloc-test** | 8T | **+15% slower** | heavy cross-thread free; not improved by eviction (different bottleneck) |
 
 (All trail or match; rs beats glibc on every workload — e.g. xmalloc-test rs
-232 M vs glibc 63 M free/sec.)
+274 M vs glibc 63 M free/sec.)
 
-### The remaining gap is concentrated in heavy cross-thread free
+### The heavy-cross-thread-free gap, and how it was closed (FR2/FR3)
 
 `xmalloc-test` and `alloc-test` are producer/consumer stresses: some threads
-allocate, *other* threads free. Profiling pins the cause precisely:
+allocate, *other* threads free. Profiling pinned the cause: every cross-thread
+free atomically pushes onto the *live owner's* page (`free` was 46% of time, 51%
+of that one `lock cmpxchg` + `pause` spin), with many consumers contending on the
+same head. mimalloc-C avoids it by **abandoning** full pages so a freeing thread
+**claims** one and collects locally; crucially it then keeps the page (reclaim),
+distributing pages across the freeing threads → uncontended local ops.
 
-- **mimalloc-rs**: 46% of time is in `free`, and **51% of that is a single
-  `lock cmpxchg` on `xthread_free`** (plus `pause` spin-retries) — every
-  cross-thread free atomically pushes onto the *live owner's* page, and many
-  consumer threads contend on the same page's head. The owner's alloc then keeps
-  hitting the cold collect/generic path (21% `alloc_generic`).
-- **mimalloc-C**: `mi_free_try_collect_mt` (31%) + `_mi_page_free_collect_partly`
-  (4.5%) + `_mi_arenas_page_try_reabandon_to_mapped` (5%) +
-  `mi_abandoned_page_try_reclaim` (2.9%). C **abandons** the page so a freeing
-  thread **claims** it and collects **locally without atomics** (`_partly`),
-  sidestepping the contended CAS.
+The fix (round `docs/GOAL-fe2-revival.md`, merged): **full-page eviction +
+cross-thread reclaim of mostly-free pages + the no-atomic `_mi_page_free_collect_partly`**.
+Together they took xmalloc-test from **−24% → −10.8%** with no regression on
+larson/cfrac/espresso/mstress/rptest/malloc-large. Bare eviction had been parked
+**4×** (it turns a 1-CAS push into a 3-CAS claim/reabandon/unown cycle); the
+piece that makes it net-positive is **cross-thread reclaim** — handing the page
+to the freeing thread so its subsequent frees are local. Because that
+abandon/reclaim churn *regresses* the single/intra-thread small-alloc path (no
+contention to relieve), it is enabled **only in the preload `cdylib`**
+(`cfg(any(override_export, test))`, runtime `page_full_retain=16`); a static
+`#[global_allocator]` keeps the byte-identical pre-eviction scan.
 
-So the root cause is the trio mimalloc-rs does not yet have: **full-page
-eviction/abandonment (FE2, parked) → reclaim-on-free → no-atomic `_partly`
-collect**. Closing it is a substantial, regression-prone effort (FE2 has been
-parked twice for regressing larson/phase-2) and is tracked as future work, not
-forced through under the no-regression bar. For workloads that are not
-dominated by cross-thread frees, mimalloc-rs is within ~4% of the C reference.
+`alloc-test` (+15%) is *not* helped by eviction — its bottleneck is elsewhere
+(left as future work).
 
 ## 5. Summary
 The core v3 design — segment-less arenas, free-list sharding, the flag-folded
 free fast path, ownership-tagged cross-thread frees, the O(1) collect, delayed
-purge — is ported faithfully and verified differentially against C v3.3.2. The
-port leans on Rust's type system, RAII, strict provenance, and compile-time
-evaluation where they are strict improvements, and documents each divergence.
-On a fair LD_PRELOAD comparison it matches the C reference to within a few
-percent on most workloads; the open gap is heavy cross-thread-free contention,
-whose fix (reviving full-page eviction + reclaim-on-free + `_partly` collect) is
-identified and deferred rather than rushed.
+purge, and (preload) full-page eviction with cross-thread reclaim — is ported
+faithfully and verified differentially against C v3.3.2. The port leans on Rust's
+type system, RAII, strict provenance, compile-time evaluation, and a
+static-vs-preload `cfg` split where they are strict improvements, and documents
+each divergence. On a fair LD_PRELOAD comparison it is within ~2–11% of the C
+reference across the suite; the one remaining outlier is `alloc-test` (+15%),
+identified as a non-eviction bottleneck and left for future work.

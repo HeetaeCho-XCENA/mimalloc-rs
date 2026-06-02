@@ -99,19 +99,25 @@ against the C table in `bits.rs` tests. v3 option defaults match
 
 ## 5. Known divergences & deferred work (cross-ref FIDELITY §3)
 
-- 🔵 **Full-page eviction** (`mi_page_to_full`/`page_full_retain`) — **parked**
-  (twice: `archive/v-round-v1v2`, `archive/fe2-full-page-eviction`). Full pages
-  stay in the bin queue. **This is the main open perf gap** (heavy cross-thread
-  free: xmalloc-test −24%, alloc-test +15%) and the target of the planned FE2
-  revival. Requires the coupled trio below to be net-positive.
+- ✅🟡 **Full-page eviction** (`mi_page_to_full`/`page_full_retain`) — **ported for
+  the preload `cdylib`** (`cfg(any(override_export, test))`, `page_full_retain=16`);
+  a static `#[global_allocator]` keeps the pre-eviction first-fit scan
+  (byte-identical) since the abandon/reclaim churn regresses the no-contention
+  single/intra-thread path. With cross-thread reclaim + `_partly` (below) this
+  closed the heavy-cross-thread-free gap (**xmalloc-test −24% → −11%**). Bare
+  eviction had been parked 4× (`archive/v-round-v1v2`, `archive/fe2-full-page-eviction`).
+- ✅ **Reclaim-on-free** (`mi_abandoned_page_try_reclaim`) — a thread claiming an
+  abandoned page reclaims it into its own heap when originating **or** not
+  mostly-used (cross-thread reclaim of mostly-free pages). This is the piece that
+  makes eviction net-positive (distributes pages to the freeing threads). Preload
+  only (with eviction).
+- ✅ **`_mi_page_free_collect_partly`** — no-atomic small-block collect on the
+  claim path (FR1, merged; always compiled).
 - 🔵 **Delayed retire** (`retire_expire` + `_mi_theap_collect_retired` + generic
   cadence) — emptied pages retire immediately (sole page kept). Also why the
   deferred-free heartbeat is not on a deterministic alloc cadence.
-- 🔵 **Reclaim-on-free** into the originating heap (`page_reclaim_on_free`,
-  `max_reclaim`) — deferred; a freed-into abandoned page is reabandoned-to-mapped
-  and reclaimed on the next alloc instead.
-- 🔵 **`_mi_page_free_collect_partly`** — the no-atomic small-block collect on the
-  claim path; rs always full-collects.
+- 🟡 **alloc-test (+15%)** — a heavy-cross-thread-free outlier *not* helped by
+  eviction; a distinct (non-eviction) bottleneck, left for future work.
 - 🟡 **Candidate search** (`mi_page_queue_find_free_ex`: prefer-fuller,
   free-emptier-mid-scan, `page_max_candidates`, move-to-front) — rs is plain
   first-fit, no move-to-front.
