@@ -16,7 +16,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicI64, Ordering};
 
 use crate::arena_meta::{meta_free, meta_zalloc};
-use crate::bitmap::{BChunk, Bitmap, CHUNK_BITS};
+use crate::bitmap::{BChunk, Bitmap, CHUNK_BITS, FIELD_BITS};
 use crate::bits::{MI_ARENA_SLICE_SHIFT, MI_ARENA_SLICE_SIZE};
 use crate::os::{self, MemId};
 use crate::prim::{DefaultPrim, Prim};
@@ -293,15 +293,29 @@ impl Arena {
         if self.memid.is_pinned {
             return false;
         }
+        if force {
+            // Force: reset the timer and scan unconditionally.
+            self.purge_expire.store(0, Ordering::Release);
+            return self.run_purge();
+        }
         let expire = self.purge_expire.load(Ordering::Acquire);
-        if expire == 0 && !force {
+        if expire == 0 {
             return false; // nothing scheduled — avoid the clock syscall
         }
-        if !force {
-            let now = DefaultPrim::clock_now_msecs();
-            if expire > now {
-                return false; // not due yet
-            }
+        if expire > DefaultPrim::clock_now_msecs() {
+            return false; // not due yet
+        }
+        // Due: claim this cycle by CAS-resetting the deadline to 0. Only the
+        // winner scans — this serializes concurrent purgers and, because a
+        // `schedule_purge` that re-armed `purge_expire` to a newer deadline makes
+        // this CAS fail, it can never clobber the deadline of a slice freed
+        // concurrently (that slice is then purged on the next cycle).
+        if self
+            .purge_expire
+            .compare_exchange(expire, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
         }
         self.run_purge()
     }
@@ -309,10 +323,9 @@ impl Arena {
     /// Walk the purge bitmap and return each still-free range to the OS. Claims
     /// a range from the free bitmap before purging so a concurrent allocation
     /// can never hand out memory mid-`madvise`; reallocated ranges are skipped.
-    /// Mirrors `mi_arena_try_purge` + `mi_arena_purge`.
+    /// The caller (`maybe_purge`, or `schedule_purge` for the immediate case)
+    /// owns resetting `purge_expire`. Mirrors `mi_arena_try_purge` + `mi_arena_purge`.
     fn run_purge(&self) -> bool {
-        // Clear the deadline first; concurrent frees re-arm it for the next cycle.
-        self.purge_expire.store(0, Ordering::Release);
         let mut purged = false;
         let mut idx = 0;
         while idx < self.slice_count {
@@ -320,11 +333,14 @@ impl Arena {
                 idx += 1;
                 continue;
             }
-            // Extend the run, but never across a chunk boundary (the bitmap range
-            // ops are single-chunk) — this also bounds each claim/`madvise`.
-            let chunk_end = (idx / CHUNK_BITS + 1) * CHUNK_BITS;
+            // Extend the run, but never across a 64-bit **field** boundary: the
+            // free-bitmap claim below (`clear_n`) is atomic all-or-nothing only
+            // within a single field, and that single atomic claim is exactly what
+            // makes the purge race-free against allocation. (v3 likewise claims
+            // per bfield.) Adjacent fields are handled as separate runs.
+            let field_end = (idx / FIELD_BITS + 1) * FIELD_BITS;
             let mut end = idx + 1;
-            while end < self.slice_count && end < chunk_end && self.purge_bitmap().is_set(end) {
+            while end < self.slice_count && end < field_end && self.purge_bitmap().is_set(end) {
                 end += 1;
             }
             let n = end - idx;

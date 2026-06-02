@@ -754,4 +754,47 @@ mod loom_tests {
             a.join().unwrap();
         });
     }
+
+    /// Two concurrent purgers claiming + releasing the same slot must never both
+    /// hold it at once (the `clear_n` CAS gate is the exclusion). Models the
+    /// `delay==0`/`force` case where two `run_purge` calls overlap on one arena.
+    #[test]
+    fn two_purgers_never_overlap() {
+        use crate::atomic::{AtomicUsize, Ordering};
+        loom::model(|| {
+            let cm = Arc::new(BChunk::zeroed());
+            let chunk = Arc::new(BChunk::zeroed());
+            chunk.set_n(0, 1); // one free slot
+            cm.set_n(0, 1);
+            let owner = Arc::new(AtomicUsize::new(0)); // 0 = unheld
+
+            let mut handles = Vec::new();
+            for id in 1..=2u32 {
+                let (cm, chunk, owner) = (cm.clone(), chunk.clone(), owner.clone());
+                handles.push(loom::thread::spawn(move || {
+                    let bm = Bitmap::from_parts(&cm, core::slice::from_ref(&*chunk));
+                    if bm.clear_n(0, 1) {
+                        // Claimed: must be exclusive while held.
+                        assert!(
+                            owner
+                                .compare_exchange(
+                                    0,
+                                    id as usize,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire
+                                )
+                                .is_ok(),
+                            "two purgers held the same slot at once"
+                        );
+                        owner.store(0, Ordering::Release);
+                        bm.set_n(0, 1); // release
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert!(chunk.is_set(0), "slot must be released back to free");
+        });
+    }
 }
