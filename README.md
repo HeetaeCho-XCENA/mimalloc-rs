@@ -137,6 +137,22 @@ the same version:
 MIMALLOC_C_LIB=/path/to/mimalloc/out cargo test --features differential --test differential
 ```
 
+## Contributing
+
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev
+setup (MSRV 1.84), the full gate checklist, the `unsafe` policy, and the
+no-regression rule. Reference docs:
+
+- [`docs/verification.md`](docs/verification.md) — every correctness gate
+  (tests, Miri, loom, differential, fuzz, ASan/TSan, coverage) and how to run it.
+- [`docs/benchmarking.md`](docs/benchmarking.md) — every benchmark (Criterion,
+  `bench_suite`, `rss_spike`, `perf_compare.sh`, `mimalloc-bench.sh`) and the
+  pinned-machine perf protocol.
+- [`docs/perf-hotpath.md`](docs/perf-hotpath.md) — the small-object hot-path
+  analysis and parked/confirmed leads.
+
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 MIT, matching upstream mimalloc. The original C implementation is
