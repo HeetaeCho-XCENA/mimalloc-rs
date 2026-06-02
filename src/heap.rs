@@ -881,10 +881,10 @@ unsafe fn unabandon_if_mapped(page_ptr: *mut Page) {
 
 /// We just claimed a previously-abandoned page by freeing a block into it
 /// (ports `mi_free_try_collect_mt`). With the page exclusively ours: collect, then
-/// (1) free it if now empty, else (3) reabandon-to-mapped if it has space again,
-/// else (4) release ownership. v3's step 2 — reclaim into the originating theap —
-/// is deferred (see `docs/DESIGN-fe1-ownership.md` §7); a freed-into page returns
-/// to the registry and is reclaimed on the next allocation instead.
+/// (1) free it if now empty, else (2) **reclaim** it into the calling thread's
+/// heap if it originated there or still has plenty of free space (preload/`test`
+/// builds only — `reclaim_on_free`, ports `mi_abandoned_page_try_reclaim`), else
+/// (3) reabandon-to-mapped if it has space again, else (4) release ownership.
 ///
 /// `mt_free` is the block the caller just pushed onto `xthread_free` (its head),
 /// letting the first collect use the no-atomic [`Page::collect_partly`] for small

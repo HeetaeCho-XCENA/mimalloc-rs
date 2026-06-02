@@ -187,8 +187,10 @@ pub fn purge_delay() -> i64 {
 }
 
 /// Number of full (small) pages a bin queue retains before the page search
-/// evicts (abandons) them (v3 `page_full_retain`, default 2). `<0` disables
-/// eviction (full pages are never abandoned during the search).
+/// evicts (abandons) them (v3 `page_full_retain`). `<0` disables eviction (full
+/// pages are never abandoned during the search). v3's C default is 2; this crate
+/// defaults to 16 under `override_export` (the preload cdylib) and disabled (-1)
+/// otherwise — see `Opt::PageFullRetain`.
 #[inline]
 pub fn page_full_retain() -> i64 {
     get(Opt::PageFullRetain)
