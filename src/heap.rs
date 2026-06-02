@@ -20,10 +20,10 @@ use crate::bits::{
     MI_LARGE_MAX_OBJ_SIZE, MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_PAGES_DIRECT,
     MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED, MI_THREADID_ABANDONED_MAPPED,
 };
-// Used only by the std free fast path's XOR dispatch (the no_std path is
-// single-owner and never inspects the page flags).
+// Used only by the std free path (the no_std path is single-owner and never
+// takes the XOR dispatch or the cross-thread claim/`collect_partly` path).
 #[cfg(feature = "std")]
-use crate::bits::MI_PAGE_FLAG_MASK;
+use crate::bits::{MI_PAGE_FLAG_MASK, MI_SMALL_SIZE_MAX};
 use crate::layout::align_up;
 use crate::page::Page;
 use crate::page_map;
@@ -610,8 +610,11 @@ pub unsafe fn free(ptr: NonNull<u8>) {
                 // unowned→owned: we now exclusively own it and must collect it,
                 // then free / reabandon / unown (ports mi_free_block_mt →
                 // mi_free_try_collect_mt).
-                // SAFETY: we exclusively own the page now.
-                unsafe { free_try_collect_mt(page_ptr) };
+                // SAFETY: we exclusively own the page now; `block` is the head we
+                // just pushed (enables the no-atomic partial collect).
+                unsafe {
+                    free_try_collect_mt(page_ptr, block.as_ptr() as *mut crate::free_list::Block)
+                };
             }
         }
     }
@@ -749,13 +752,30 @@ unsafe fn unabandon_if_mapped(page_ptr: *mut Page) {
 /// is deferred (see `docs/DESIGN-fe1-ownership.md` §7); a freed-into page returns
 /// to the registry and is reclaimed on the next allocation instead.
 ///
+/// `mt_free` is the block the caller just pushed onto `xthread_free` (its head),
+/// letting the first collect use the no-atomic [`Page::collect_partly`] for small
+/// blocks (ports `mi_free_try_collect_mt`'s `_partly` fast path); larger blocks
+/// and all retries take the full atomic [`Page::collect_free`].
+///
 /// # Safety
-/// The calling thread exclusively owns `page_ptr` (claimed via the ownership bit).
+/// The calling thread exclusively owns `page_ptr` (claimed via the ownership bit);
+/// `mt_free` is the block it just pushed onto `page_ptr`'s `xthread_free`.
 #[cfg(feature = "std")]
-unsafe fn free_try_collect_mt(page_ptr: *mut Page) {
+unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_list::Block) {
+    // SAFETY: const field; small blocks may use the no-atomic partial collect.
+    let small = unsafe { Page::raw_block_size(page_ptr) } <= MI_SMALL_SIZE_MAX;
+    let mut first = true;
     loop {
-        // SAFETY: we own the page; drain cross-thread + local frees (updates used).
-        unsafe { (*page_ptr).collect_free() };
+        if first && small {
+            // First pass: collect the rest of the thread-free list without the
+            // atomic swap (we already hold `mt_free`, the current head).
+            // SAFETY: owner; `mt_free` is the just-pushed head.
+            unsafe { (*page_ptr).collect_partly(mt_free) };
+        } else {
+            // SAFETY: we own the page; drain cross-thread + local frees (used).
+            unsafe { (*page_ptr).collect_free() };
+        }
+        first = false;
 
         // 1. All blocks free → unabandon (clear any registry bit) and return the
         //    slices to the arena.

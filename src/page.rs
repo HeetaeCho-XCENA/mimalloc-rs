@@ -286,6 +286,69 @@ impl Page {
         }
     }
 
+    /// Collect the cross-thread free list **without the atomic swap**, given the
+    /// block `head` we just pushed onto `xthread_free` (now its head) when a free
+    /// claimed an abandoned page. Ports `_mi_page_free_collect_partly`
+    /// (`page.c:243`) — the no-atomic collect that keeps the cross-thread claim
+    /// path cheap.
+    ///
+    /// We must not collect `head` itself: `xthread_free` still points at it and a
+    /// concurrent freer may prepend a new block (writing *that* block's `next`,
+    /// never `head`'s), so `head`'s own `next` is touched only by us. We sever
+    /// `head` from the rest and migrate the rest (`head->next` onward) into the
+    /// local lists with no atomic op; `head` stays queued and is picked up by a
+    /// later full [`Page::collect`]. If only `head` remains live afterwards
+    /// (`used == 1`), we full-collect to finish (the page is then empty).
+    ///
+    /// # Safety
+    /// Owner (claim) path: the caller exclusively owns the page and `head` is the
+    /// block it just pushed onto `xthread_free`.
+    // Only reached from the std cross-thread claim path (`free_try_collect_mt`);
+    // the no_std build is single-owner and never claims an abandoned page.
+    #[cfg(feature = "std")]
+    pub(crate) unsafe fn collect_partly(&self, head: *mut Block) {
+        if head.is_null() {
+            return;
+        }
+        // SAFETY: only the owner touches `head`'s `next`; concurrent pushers
+        // prepend new blocks ahead of `head` and never touch `head`'s `next`.
+        let next = unsafe { (*head).next(self.keys) };
+        if !next.is_null() {
+            // Sever `head` from the rest, then append the current `local_free`
+            // after the captured list's tail and adopt the captured list as the
+            // new `local_free` (ports `mi_page_thread_collect_to_local`), counting
+            // blocks to correct `used` (the cross-thread freer never decremented).
+            // SAFETY: `head` is ours; the `next` chain is now exclusively ours.
+            unsafe { (*head).set_next(core::ptr::null_mut(), self.keys) };
+            let mut count: u32 = 1;
+            let mut last = next;
+            loop {
+                // SAFETY: walking the captured owner-only list.
+                let n = unsafe { (*last).next(self.keys) };
+                if n.is_null() {
+                    break;
+                }
+                count += 1;
+                last = n;
+            }
+            // SAFETY: `last` is the captured list's tail.
+            unsafe { (*last).set_next(self.local_free.get(), self.keys) };
+            self.local_free.set(next);
+            self.used.set(self.used.get() - count);
+            // Common case: `free` empty ⇒ adopt `local_free` wholesale (O(1)).
+            if self.free.get().is_null() {
+                self.free.set(self.local_free.get());
+                self.local_free.set(core::ptr::null_mut());
+            }
+        }
+        if self.used.get() == 1 {
+            // Only `head` remains live ⇒ everything else was freed; full-collect
+            // to grab `head` too (the page is then empty).
+            // SAFETY: owner path.
+            unsafe { self.collect() };
+        }
+    }
+
     /// Stamp the owning thread id on a **freshly initialized** page (flags are 0
     /// and the page is not yet published in the page-map, so no other thread can
     /// observe or mutate it) with a single plain store. This is the per-page
