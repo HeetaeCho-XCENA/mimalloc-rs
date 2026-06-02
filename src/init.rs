@@ -4,12 +4,14 @@
 //!
 //! v1 bootstraps lazily: process-wide free-list encoding keys are computed once
 //! (from OS randomness), and each thread gets its own [`Heap`] in thread-local
-//! storage on first use. The richer lifecycle — `pthread_key` thread-exit page
-//! handoff, reentrancy guards for `#[global_allocator]` init-before-main — is
-//! follow-up work.
+//! storage on first use, with thread-exit page hand-off via the heap's `Drop`.
 //!
 //! The thread-local default heap requires the `std` feature; `no_std` embedders
-//! drive their own [`Heap`] instances directly.
+//! drive their own [`Heap`] instances directly. Under the `nightly` feature the
+//! malloc/free hot path reads the heap pointer (and tid) from a real
+//! `#[thread_local]` slot instead of `thread_local!`'s `.with()` guard; the
+//! owning storage and its `Drop` still live in the `thread_local!`, and the
+//! cache is cleared before the heap is dropped so it can never dangle.
 
 use crate::prim::{DefaultPrim, Prim};
 use crate::sync::OnceBox;
@@ -44,20 +46,44 @@ pub fn current_tid() -> usize {
     // use core atomics directly — they are usable in `static` (and under loom).
     use core::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(1);
-    std::thread_local! {
-        static TID: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    // Shift left by 2 so the low bits stay free for page flags.
+    #[inline]
+    fn fresh() -> usize {
+        NEXT.fetch_add(1, Ordering::Relaxed) << 2
     }
-    TID.with(|t| {
-        let v = t.get();
-        if v != 0 {
-            v
-        } else {
-            // shift left by 2 so the low bits stay free for page flags
-            let id = NEXT.fetch_add(1, Ordering::Relaxed) << 2;
-            t.set(id);
-            id
+
+    // Nightly: a real `#[thread_local]` slot — a direct load with no per-access
+    // init/state guard. A plain `usize` (no `Drop`), so it is sound to read at
+    // any point in the thread's life, including teardown.
+    #[cfg(feature = "nightly")]
+    {
+        #[thread_local]
+        static TID: core::cell::Cell<usize> = core::cell::Cell::new(0);
+        let v = TID.get();
+        if v == 0 {
+            let id = fresh();
+            TID.set(id);
+            return id;
         }
-    })
+        v
+    }
+    // Stable: the std `thread_local!` (its `.with()` carries a state guard).
+    #[cfg(not(feature = "nightly"))]
+    {
+        std::thread_local! {
+            static TID: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+        }
+        TID.with(|t| {
+            let v = t.get();
+            if v != 0 {
+                v
+            } else {
+                let id = fresh();
+                t.set(id);
+                id
+            }
+        })
+    }
 }
 
 #[cfg(feature = "std")]
@@ -66,27 +92,94 @@ mod tls {
     use crate::heap::Heap;
     use core::ptr::NonNull;
 
+    // ---- nightly: a `#[thread_local]` cache of the default-heap pointer -------
+    // The std `thread_local!` `.with()` carries a per-access init/state guard.
+    // On nightly we cache a raw pointer to the (still `thread_local!`-owned) heap
+    // in a real `#[thread_local]` slot so the malloc/free hot path is a direct
+    // load (mirrors mimalloc's `__thread mi_heap_t*`). The owning storage and its
+    // `Drop` (thread-exit page hand-off) stay in `DEFAULT_HEAP`.
+    #[cfg(feature = "nightly")]
+    #[thread_local]
+    static HEAP_PTR: core::cell::Cell<*const Heap> = core::cell::Cell::new(core::ptr::null());
+
+    // Under nightly the heap is wrapped so its `Drop` clears the cache *before*
+    // the heap is dropped — after teardown the cache is null, so the fast path
+    // can never read a dangling pointer (it falls back to `.with()`, which
+    // correctly panics if used during destruction, exactly as on stable).
+    #[cfg(feature = "nightly")]
+    struct Slot(Heap);
+    #[cfg(feature = "nightly")]
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            HEAP_PTR.set(core::ptr::null());
+            // `self.0` (the `Heap`) is dropped right after this — page hand-off.
+        }
+    }
+
+    #[cfg(feature = "nightly")]
+    std::thread_local! {
+        /// The calling thread's default heap (wrapped to clear the cache on drop).
+        static DEFAULT_HEAP: Slot = Slot(Heap::new(process_keys(), current_tid()));
+    }
+    #[cfg(not(feature = "nightly"))]
     std::thread_local! {
         /// The calling thread's default heap.
         static DEFAULT_HEAP: Heap = Heap::new(process_keys(), current_tid());
     }
 
+    /// Run `f` with the calling thread's default heap (lazily initialized).
+    #[cfg(feature = "nightly")]
+    #[inline]
+    fn with_heap<R>(f: impl FnOnce(&Heap) -> R) -> R {
+        let p = HEAP_PTR.get();
+        if !p.is_null() {
+            // SAFETY: a non-null cache value points at this thread's live
+            // `DEFAULT_HEAP` storage; `Slot::drop` nulls it before the heap is
+            // dropped, so it is never dangling.
+            return f(unsafe { &*p });
+        }
+        // First use on this thread: initialize via the owning TLS and cache it.
+        DEFAULT_HEAP.with(|s| {
+            HEAP_PTR.set(&s.0 as *const Heap);
+            f(&s.0)
+        })
+    }
+    #[cfg(not(feature = "nightly"))]
+    #[inline]
+    fn with_heap<R>(f: impl FnOnce(&Heap) -> R) -> R {
+        DEFAULT_HEAP.with(f)
+    }
+
+    /// Like [`with_heap`] but a safe no-op (returns `None`) if the heap TLS is
+    /// being/has been destroyed — for the lifecycle wrappers. Bypasses the
+    /// cache so it never observes a half-torn-down slot.
+    #[cfg(feature = "nightly")]
+    #[inline]
+    fn try_with_heap<R>(f: impl FnOnce(&Heap) -> R) -> Option<R> {
+        DEFAULT_HEAP.try_with(|s| f(&s.0)).ok()
+    }
+    #[cfg(not(feature = "nightly"))]
+    #[inline]
+    fn try_with_heap<R>(f: impl FnOnce(&Heap) -> R) -> Option<R> {
+        DEFAULT_HEAP.try_with(f).ok()
+    }
+
     /// Allocate `size` bytes from the calling thread's default heap.
     #[inline]
     pub fn malloc(size: usize) -> Option<NonNull<u8>> {
-        DEFAULT_HEAP.with(|h| h.alloc(size))
+        with_heap(|h| h.alloc(size))
     }
 
     /// Allocate `size` bytes aligned to `align` from the default heap.
     #[inline]
     pub fn malloc_aligned(size: usize, align: usize) -> Option<NonNull<u8>> {
-        DEFAULT_HEAP.with(|h| h.alloc_aligned(size, align))
+        with_heap(|h| h.alloc_aligned(size, align))
     }
 
     /// Allocate zeroed memory of `size` bytes.
     #[inline]
     pub fn zalloc(size: usize) -> Option<NonNull<u8>> {
-        let p = DEFAULT_HEAP.with(|h| h.alloc(size))?;
+        let p = with_heap(|h| h.alloc(size))?;
         // SAFETY: `p` points to at least `size` writable bytes.
         unsafe {
             core::ptr::write_bytes(p.as_ptr(), 0, size);
@@ -98,10 +191,10 @@ mod tls {
     /// aggressive — see [`crate::heap::Heap::collect`]).
     ///
     /// Documented to run on a live thread (drives `mi_collect`/`init::collect`),
-    /// so it uses `.with` — accessing the TLS during/after destruction would
-    /// panic, which is the correct signal for that misuse.
+    /// so accessing the TLS during/after destruction would panic, which is the
+    /// correct signal for that misuse.
     pub fn collect(force: bool) {
-        DEFAULT_HEAP.with(|h| h.collect(force));
+        with_heap(|h| h.collect(force));
     }
 
     /// Force the calling thread's default heap to be initialized (no-op if it
@@ -110,7 +203,7 @@ mod tls {
     /// Uses `try_with` so a late call (after the thread's TLS destructors have
     /// begun) is a safe no-op rather than a "TLS during destruction" panic.
     pub fn touch() {
-        let _ = DEFAULT_HEAP.try_with(|_| {});
+        let _ = try_with_heap(|_| {});
     }
 
     /// Like [`collect`], but for the lifecycle wrappers (`thread_done`,
@@ -118,7 +211,7 @@ mod tls {
     /// destructors started is a safe no-op instead of a panic. Full page
     /// hand-off still happens via the `Heap` `Drop` at real thread exit.
     pub fn collect_lifecycle(force: bool) {
-        let _ = DEFAULT_HEAP.try_with(|h| h.collect(force));
+        let _ = try_with_heap(|h| h.collect(force));
     }
 }
 
