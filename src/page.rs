@@ -75,9 +75,6 @@ pub struct Page {
     arena: Cell<*mut crate::arena::Arena>,
     /// Size-class bin index this page belongs to (set after init).
     bin: Cell<u32>,
-    /// Intrusive link for a sub-process abandoned-page stack (manipulated only
-    /// under the per-bin abandoned lock; atomic so cross-thread access is sound).
-    abandoned_next: AtomicPtr<Page>,
 }
 
 impl Page {
@@ -130,7 +127,6 @@ impl Page {
                 heap: Cell::new(core::ptr::null_mut()),
                 arena: Cell::new(core::ptr::null_mut()),
                 bin: Cell::new(0),
-                abandoned_next: AtomicPtr::new(core::ptr::null_mut()),
             });
             // No upfront free-list build: the first `alloc` extends it.
             NonNull::new_unchecked(hdr)
@@ -487,17 +483,6 @@ impl Page {
     pub unsafe fn collect_free(&self) {
         // SAFETY: forwarded owner-only contract.
         unsafe { self.collect() }
-    }
-
-    /// Abandoned-stack link accessors (manipulated under the per-bin lock).
-    #[inline]
-    pub fn abandoned_next(&self) -> *mut Page {
-        self.abandoned_next.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub fn set_abandoned_next(&self, p: *mut Page) {
-        self.abandoned_next.store(p, Ordering::Relaxed);
     }
 
     /// Block size served by this page.
