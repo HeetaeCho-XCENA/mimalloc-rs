@@ -96,7 +96,7 @@ vs C `libmimalloc` v3.3.2 (− = rs slower / costlier):
 | rptest | 8T | **≈0%** | |
 | cfrac | 1T | **−4.0%** | pure malloc/free |
 | **xmalloc-test** | 8T | **−10.8%** (was −24%) | producer/consumer cross-thread free — closed by FR2 (below) |
-| **alloc-test** | 8T | **+15% slower** | heavy cross-thread free; not improved by eviction (different bottleneck) |
+| **alloc-test** | 8T | **+13% slower** (was +15%) | **thread-local** alloc/free throughput (no cross-thread); a fast-path instruction-count gap, narrowed by PG1/PG2 (§4.1) |
 
 (All trail or match; rs beats glibc on every workload — e.g. xmalloc-test rs
 274 M vs glibc 63 M free/sec.)
@@ -123,8 +123,49 @@ contention to relieve), it is enabled **only in the preload `cdylib`**
 (`cfg(any(override_export, test))`, runtime `page_full_retain=16`); a static
 `#[global_allocator]` keeps the byte-identical pre-eviction scan.
 
-`alloc-test` (+15%) is *not* helped by eviction — its bottleneck is elsewhere
-(left as future work).
+`alloc-test` (+15%) is *not* helped by eviction — see §4.1.
+
+### 4.1 The alloc-test fast-path gap (PG1/PG2)
+
+`alloc-test` is a **thread-local** alloc/free throughput stress (each thread owns
+its working set; no cross-thread frees), so eviction/reclaim cannot help it. On
+the pinned i7-14700K it is the suite's lone outlier. Re-profiling (2026-06)
+corrected an earlier misattribution: it is **not** a page-map structure gap —
+both rs and C use the **2-level** page-map on x64 (`MI_PAGE_MAP_FLAT` is enabled
+only for `MI_MAX_VABITS <= 40`; x64 is 47), and both suffer the same inherent
+page-header cache miss on free. `perf stat` shows the gap is **instruction
+count**: rs executes ~+29% instructions / +52% branches at *higher* IPC (1.04 vs
+0.92) — i.e. it is not memory-stalled, it just runs more work per op.
+
+Two faithful, idiomatic, no-regression reductions (PG1+PG2) close part of it:
+
+- **PG1 — shared zero-submap** (`page_map.rs`): every unregistered top-table
+  entry points at one shared read-only all-null submap (generalizing C's
+  committed entry-0 `sub0` NULL-resolution, `page-map.c:273-288`), so `lookup`
+  drops its per-call submap-null branch — an unmapped/foreign address still
+  resolves to a null page, safe by construction rather than by a guard.
+- **PG2 — cold-split free fast path** (`heap::free`): the rare arms (owner free
+  into a full/interior page; cross-thread / abandoned free) move to a `cold`
+  `free_cold`, so the common local free is a tight near-leaf — `mi_free`'s
+  prologue drops from 5 callee-saved pushes to 1, and the block-size load leaves
+  the hot path. Mirrors C's register-spill-free `mi_free_ex` (`free.c:185-205`).
+
+Result (fair LD_PRELOAD, interleaved median, branch vs the same pre-PG cdylib):
+alloc-test **3.00 s → 2.94 s (−2.0%, every rep)**, gap to C **+15.4% → +13.1%**;
+no regression on cfrac/espresso/malloc-large/mstress/rptest/larson/xmalloc-test
+nor on the static `perf_compare` suite (worst phase Δ +0.4%).
+
+**Residual (documented, not yet closed).** The remaining gap is dominated by the
+**alloc** fast path (the instruction-count hotspot), whose extra work vs C is
+(a) the std `thread_local!` lazy-init guard on the inline-in-TLS `Heap` (a
+`%fs:`-state check + the `Heap`-base computation, where C reads a `__thread`
+heap *pointer* directly), and (b) prologue register pressure from the cold
+branches. Closing (a) needs an out-of-line heap pointer with an empty-heap
+sentinel (C's model) — a TLS-model change that touches the static
+`#[global_allocator]` hot path and so carries real regression risk; it is left
+as an opt-in follow-up rather than forced. A flat page-map would help only the
+free path (not the alloc hotspot) and diverges from C-on-x64 (a ~2 GB virtual
+reserve), so it stays parked too.
 
 ## 5. Summary
 The core v3 design — segment-less arenas, free-list sharding, the flag-folded
