@@ -28,8 +28,12 @@
 //!
 //! The forwarding logic itself is covered by the existing `capi` `mi_*` tests.
 //!
-//! C++ `operator new`/`operator delete` (mangled `_Znwm`/`_ZdlPv`, …) are a
-//! documented follow-up and intentionally not exported here.
+//! C++ `operator new`/`operator delete` (Itanium-mangled `_Znwm`/`_ZdlPv`, …)
+//! are also exported (bottom of this file), mirroring mimalloc's
+//! `mimalloc-new-delete.h`: without them a preloaded library only intercepts
+//! `malloc`/`free`, so a C++ program's `new`/`delete` fall through to libstdc++'s
+//! operators — an extra call layer into `malloc`/`free`, measurably slower on
+//! `new`-heavy workloads (alloc-test spent ~6% of cycles in libstdc++ before).
 
 use core::ffi::{c_char, c_int, c_void};
 
@@ -187,4 +191,158 @@ pub unsafe extern "C" fn malloc_size(p: *const c_void) -> usize {
 #[no_mangle]
 pub extern "C" fn malloc_good_size(size: usize) -> usize {
     crate::capi::mi_malloc_good_size(size)
+}
+
+// ---------------------------------------------------------------------------
+// C++ `operator new` / `operator delete` (Itanium ABI mangled names)
+//
+// Mirrors mimalloc's `mimalloc-new-delete.h` so a preloaded library intercepts
+// C++ allocations *directly* instead of letting `new`/`delete` route through
+// libstdc++'s operators (an extra call frame into `malloc`/`free`). Each shim
+// forwards to a `capi::mi_*` entry that already does the work. In the ABI,
+// `std::align_val_t` is a `size_t` and `const std::nothrow_t&` is an ignored
+// pointer argument.
+//
+// `operator new` follows this crate's `mi_new` contract: it **aborts** on OOM
+// (it cannot throw `std::bad_alloc` across the C ABI) — a documented divergence
+// from the C++ standard's throwing `new`, unobservable unless allocation fails.
+//
+// `#[allow(non_snake_case)]`: the names are fixed by the C++ ABI mangling.
+#[allow(non_snake_case)]
+mod cxx {
+    use core::ffi::c_void;
+
+    // operator new(size_t) / operator new[](size_t) — throwing (abort on OOM).
+    #[no_mangle]
+    pub extern "C" fn _Znwm(size: usize) -> *mut c_void {
+        crate::capi::mi_new(size)
+    }
+    #[no_mangle]
+    pub extern "C" fn _Znam(size: usize) -> *mut c_void {
+        crate::capi::mi_new(size)
+    }
+
+    // nothrow new — null on OOM (the `nothrow_t&` argument is ignored).
+    #[no_mangle]
+    pub extern "C" fn _ZnwmRKSt9nothrow_t(size: usize, _nt: *const c_void) -> *mut c_void {
+        crate::capi::mi_new_nothrow(size)
+    }
+    #[no_mangle]
+    pub extern "C" fn _ZnamRKSt9nothrow_t(size: usize, _nt: *const c_void) -> *mut c_void {
+        crate::capi::mi_new_nothrow(size)
+    }
+
+    // aligned new (C++17) — `align_val_t` is a `size_t`.
+    #[no_mangle]
+    pub extern "C" fn _ZnwmSt11align_val_t(size: usize, align: usize) -> *mut c_void {
+        crate::capi::mi_new_aligned(size, align)
+    }
+    #[no_mangle]
+    pub extern "C" fn _ZnamSt11align_val_t(size: usize, align: usize) -> *mut c_void {
+        crate::capi::mi_new_aligned(size, align)
+    }
+
+    // aligned nothrow new.
+    #[no_mangle]
+    pub extern "C" fn _ZnwmSt11align_val_tRKSt9nothrow_t(
+        size: usize,
+        align: usize,
+        _nt: *const c_void,
+    ) -> *mut c_void {
+        crate::capi::mi_new_aligned_nothrow(size, align)
+    }
+    #[no_mangle]
+    pub extern "C" fn _ZnamSt11align_val_tRKSt9nothrow_t(
+        size: usize,
+        align: usize,
+        _nt: *const c_void,
+    ) -> *mut c_void {
+        crate::capi::mi_new_aligned_nothrow(size, align)
+    }
+
+    // operator delete(void*) / delete[](void*).
+    //
+    // # Safety
+    // `p` is null or a live allocation from this allocator.
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdlPv(p: *mut c_void) {
+        unsafe { crate::capi::mi_free(p) }
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdaPv(p: *mut c_void) {
+        unsafe { crate::capi::mi_free(p) }
+    }
+
+    // nothrow delete (the `nothrow_t&` argument is ignored).
+    //
+    // # Safety
+    // As `_ZdlPv`.
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdlPvRKSt9nothrow_t(p: *mut c_void, _nt: *const c_void) {
+        unsafe { crate::capi::mi_free(p) }
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdaPvRKSt9nothrow_t(p: *mut c_void, _nt: *const c_void) {
+        unsafe { crate::capi::mi_free(p) }
+    }
+
+    // sized delete (C++14).
+    //
+    // # Safety
+    // As `_ZdlPv`; `size` is the type's size (only used as a hint).
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdlPvm(p: *mut c_void, size: usize) {
+        unsafe { crate::capi::mi_free_size(p, size) }
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdaPvm(p: *mut c_void, size: usize) {
+        unsafe { crate::capi::mi_free_size(p, size) }
+    }
+
+    // aligned delete.
+    //
+    // # Safety
+    // As `_ZdlPv`.
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdlPvSt11align_val_t(p: *mut c_void, align: usize) {
+        unsafe { crate::capi::mi_free_aligned(p, 0, align) }
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdaPvSt11align_val_t(p: *mut c_void, align: usize) {
+        unsafe { crate::capi::mi_free_aligned(p, 0, align) }
+    }
+
+    // aligned nothrow delete.
+    //
+    // # Safety
+    // As `_ZdlPv`.
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdlPvSt11align_val_tRKSt9nothrow_t(
+        p: *mut c_void,
+        align: usize,
+        _nt: *const c_void,
+    ) {
+        unsafe { crate::capi::mi_free_aligned(p, 0, align) }
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdaPvSt11align_val_tRKSt9nothrow_t(
+        p: *mut c_void,
+        align: usize,
+        _nt: *const c_void,
+    ) {
+        unsafe { crate::capi::mi_free_aligned(p, 0, align) }
+    }
+
+    // sized aligned delete (C++17).
+    //
+    // # Safety
+    // As `_ZdlPv`.
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdlPvmSt11align_val_t(p: *mut c_void, size: usize, align: usize) {
+        unsafe { crate::capi::mi_free_size_aligned(p, size, align) }
+    }
+    #[no_mangle]
+    pub unsafe extern "C" fn _ZdaPvmSt11align_val_t(p: *mut c_void, size: usize, align: usize) {
+        unsafe { crate::capi::mi_free_size_aligned(p, size, align) }
+    }
 }
