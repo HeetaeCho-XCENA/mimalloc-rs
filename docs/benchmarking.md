@@ -16,6 +16,38 @@ take the best of several runs.
 | `examples/rss_spike.rs` | proves delayed purge returns memory to the OS (RSS) | `cargo run --release --example rss_spike` |
 | `scripts/mimalloc-bench.sh` | the standard cross-allocator suite (cfrac, larson, mstress, …) vs system + C | `MIMALLOC_C_LIB=<dir> scripts/mimalloc-bench.sh` |
 | `examples/profile_alloc.rs` | rs-only hot loop for flamegraphs / `perf record` | see `docs/perf-hotpath.md` |
+| `examples/stress.rs` | **peak-vs-peak** — Rust port of mimalloc's official `test/test-stress.c`, run with rs as the static `#[global_allocator]` (best case) | `cargo build --release --example stress && ./target/release/examples/stress [THREADS] [SCALE] [ITER] [NUMA_NODE]` |
+
+## Peak-vs-peak: the official `test-stress` workload (`examples/stress.rs`)
+
+`examples/stress.rs` is a faithful Rust port of mimalloc's own
+`test/test-stress.c` (same `splitmix64` PRNG, `pick`/`chance` distribution,
+cookie-verified `alloc_items`, shared transfer buffer, retained objects, and
+`ITER` thread re-creation rounds). Running it with mimalloc-rs as the static
+`#[global_allocator]` (LTO, fully inlined) measures the allocator in its **best**
+environment — unlike the `LD_PRELOAD` cdylib, which crosses a `.so` export
+boundary and so cannot inline into the caller.
+
+For a fair best-vs-best vs C, build a `test-stress` binary that links mimalloc
+statically with LTO (so `mi_malloc` likewise inlines), e.g.:
+
+```sh
+# C peak: test-stress.c + mimalloc's single-source static.c, inlined via LTO
+gcc -O3 -DNDEBUG -flto -I <mimalloc>/include \
+    <mimalloc>/test/test-stress.c <mimalloc>/src/static.c -lpthread -latomic -o stress_c
+# rs peak:
+cargo build --release --example stress
+# Compare (pin + interleave; both use the default per-thread heap — disable the
+# C build's MI_USE_HEAPS for parity):
+taskset -c 2-9 ./stress_c              8 50 50
+taskset -c 2-9 ./target/release/examples/stress 8 50 50
+```
+
+Args: `THREADS SCALE ITER [NUMA_NODE]`. `SCALE > 100` enables very large
+objects. `NUMA_NODE` (Linux) binds memory (`set_mempolicy(MPOL_BIND)`) and thread
+CPU affinity to that node. On the pinned i7-14700K, rs-peak lands within ~±1.5%
+of C-peak across thread counts (slightly faster at 8T) — confirming the two
+allocators are on par when each runs in its native best-case build.
 
 ## The no-regression protocol (required for perf-affecting changes)
 
