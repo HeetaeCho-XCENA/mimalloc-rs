@@ -96,7 +96,7 @@ vs C `libmimalloc` v3.3.2 (− = rs slower / costlier):
 | rptest | 8T | **≈0%** | |
 | cfrac | 1T | **−4.0%** | pure malloc/free |
 | **xmalloc-test** | 8T | **−10.8%** (was −24%) | producer/consumer cross-thread free — closed by FR2 (below) |
-| **alloc-test** | 8T | **+13% slower** (was +15%) | **thread-local** alloc/free throughput (no cross-thread); a fast-path instruction-count gap, narrowed by PG1/PG2 (§4.1) |
+| **alloc-test** | 8T | **+5.4% slower** (was +15%) | **thread-local** alloc/free; closed mostly by exporting C++ `operator new`/`delete` + PG1/PG2 (§4.1) |
 
 (All trail or match; rs beats glibc on every workload — e.g. xmalloc-test rs
 274 M vs glibc 63 M free/sec.)
@@ -155,17 +155,35 @@ alloc-test **3.00 s → 2.94 s (−2.0%, every rep)**, gap to C **+15.4% → +13
 no regression on cfrac/espresso/malloc-large/mstress/rptest/larson/xmalloc-test
 nor on the static `perf_compare` suite (worst phase Δ +0.4%).
 
-**Residual (documented, not yet closed).** The remaining gap is dominated by the
-**alloc** fast path (the instruction-count hotspot), whose extra work vs C is
-(a) the std `thread_local!` lazy-init guard on the inline-in-TLS `Heap` (a
-`%fs:`-state check + the `Heap`-base computation, where C reads a `__thread`
-heap *pointer* directly), and (b) prologue register pressure from the cold
-branches. Closing (a) needs an out-of-line heap pointer with an empty-heap
-sentinel (C's model) — a TLS-model change that touches the static
-`#[global_allocator]` hot path and so carries real regression risk; it is left
-as an opt-in follow-up rather than forced. A flat page-map would help only the
-free path (not the alloc hotspot) and diverges from C-on-x64 (a ~2 GB virtual
-reserve), so it stays parked too.
+**The dominant cause — missing C++ `operator new`/`delete` exports.** A per-DSO
+cycle breakdown was decisive: rs's *benchmark-binary* cycles equalled C's (so it
+is **not** allocation placement/locality), and the allocator-library share was
+near-equal — but rs spent **~6 % of total cycles in `libstdc++`** that C spent
+**zero**. Cause: mimalloc-C exports the C++ `operator new`/`delete` family, so a
+preloaded library intercepts `new`/`delete` directly; rs exported only
+`malloc`/`free`, so the benchmark's `new[]`/`delete[]` fell through to
+**libstdc++'s operators**, which then call `malloc`/`free` — an extra call layer
+on every C++ allocation. Exporting the full Itanium-mangled set (20 shims to
+`capi::mi_new*` / `mi_free*`, mirroring `mimalloc-new-delete.h`; preload-only)
+removed that layer: alloc-test **2.94 s → 2.74 s**, gap to C **+13.1 % → +5.4 %**,
+instructions +29 % → **+10 %**, libstdc++ → ~0. This was the bulk of the gap —
+not a Rust-vs-C language cost but a missing override symbol.
+
+**Rejected lever — out-of-line TLS heap (MG-B).** The earlier hypothesis (the std
+`thread_local!` guard on the inline-in-TLS `Heap` vs C's `__thread mi_heap_t*`)
+was **tested and rejected**: a spike with a raw nightly `#[thread_local]`
+heap-pointer cache (guard-free `mov %fs:(ptr)`, mirroring C; disassembly
+confirmed the guard gone) gave **0 % on alloc-test** (2.93 vs 2.94, noise). The
+out-of-order core hides a couple of saved instructions (rs runs at higher IPC),
+so the TLS model is not the bottleneck — consistent with the prior
+`archive/a1a-thread-local-cache` parking. Don't re-attempt without new evidence.
+
+**Residual (~5 %, in-family).** What's left is the **free** path's inherent
+2-level page-map walk + page-header cache miss — present identically in C — plus
+a small fast-path instruction margin. alloc-test is now in line with the rest of
+the suite (malloc-large −3 %, cfrac −2 %), no longer an outlier. A flat page-map
+would touch only this and diverges from C-on-x64 (~2 GB reserve), so it stays
+parked.
 
 ## 5. Summary
 The core v3 design — segment-less arenas, free-list sharding, the flag-folded
@@ -175,5 +193,8 @@ faithfully and verified differentially against C v3.3.2. The port leans on Rust'
 type system, RAII, strict provenance, compile-time evaluation, and a
 static-vs-preload `cfg` split where they are strict improvements, and documents
 each divergence. On a fair LD_PRELOAD comparison it is within ~2–11% of the C
-reference across the suite; the one remaining outlier is `alloc-test` (+15%),
-identified as a non-eviction bottleneck and left for future work.
+reference across the suite. The former `alloc-test` outlier (+15%) was traced —
+via per-DSO profiling — not to a Rust-vs-C language cost but to a missing C++
+`operator new`/`delete` override (allocations leaking through libstdc++); adding
+those exports plus the PG1/PG2 free-path trims brought it to **+5.4%**, in line
+with the rest of the suite.
