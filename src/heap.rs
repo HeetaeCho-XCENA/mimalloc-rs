@@ -667,102 +667,152 @@ pub unsafe fn free(ptr: NonNull<u8>) {
         // SAFETY: forwarded; the cold path re-checks ownership before acting.
         return unsafe { free_foreign_or_invalid(ptr) };
     }
-    // The page's const fields (block size, area start) are immutable after init,
-    // so they are sound to read from any thread.
-    // SAFETY: the page-map only stores valid page headers.
-    let bs = unsafe { Page::raw_block_size(page_ptr) };
-    crate::stats::on_free(bs);
-
-    // Recover the block start from a (possibly interior) pointer. A block-start
-    // pointer (`off == 0`, the overwhelmingly common case) skips the divide; only
-    // an interior pointer from a large-alignment `alloc_aligned` — which sets the
-    // page's `has_interior` flag — needs the normalization.
-    let recover_block = |p: NonNull<u8>| -> NonNull<u8> {
-        // SAFETY: `page_ptr` is a live header; const field read.
-        let pstart = unsafe { Page::raw_page_start(page_ptr) };
-        let off = p.addr().get() - pstart.addr();
-        let bstart = if off == 0 {
-            p.as_ptr()
-        } else {
-            pstart.wrapping_add((off / bs) * bs)
-        };
-        // SAFETY: the recovered address is the start of a live block in this page.
-        unsafe { NonNull::new_unchecked(bstart) }
-    };
-
     #[cfg(feature = "std")]
     {
         // Fold the owner-vs-cross-thread decision and the page flag check into a
         // single XOR (ports `mi_free_ex`, `free.c:185-205`): `xtid == 0` means we
-        // own the page *and* it carries no flags (not full, no interior) — the
-        // fast local path; the flag bits route the rare full/interior cases to the
-        // generic paths at no extra cost on the common path. Two distinct thread
-        // ids differ above the flag mask (ids have clear low bits), so
-        // `xtid & !MI_PAGE_FLAG_MASK == 0` iff we are the owner.
+        // own the page *and* it carries no flags (not full, no interior) *and* the
+        // pointer is a block start — the hot local path. Every other case (an
+        // owner free into a full/interior-flagged page, or a cross-thread /
+        // abandoned-page free) is rare and handled out of line in [`free_cold`],
+        // so this path touches only the page header + free list and stays a tight
+        // near-leaf (no callee-saved spills, no block-size load), matching C's
+        // "written carefully to prevent register spilling" `mi_free_ex` fast path.
         // SAFETY: reads the raw xthread_id atomically without forming `&Page`.
         let raw = unsafe { Page::xthread_id_raw(page_ptr) };
         let xtid = crate::init::current_tid() ^ raw;
-        if xtid & !MI_PAGE_FLAG_MASK == 0 {
-            // Local (we own the page). `xtid == 0` ⇒ block-start pointer;
-            // otherwise an interior/full-flagged page → recover the block start.
-            let block = if xtid == 0 { ptr } else { recover_block(ptr) };
+        if xtid == 0 {
+            // Hardened builds: detect frees of pointers outside the block area and
+            // double frees before mutating the free list. (`xtid == 0` ⇒ the page
+            // carries no flags, so `ptr` is already the block start.)
+            #[cfg(any(feature = "secure", feature = "debug"))]
             // SAFETY: this thread owns the page.
             unsafe {
-                // Hardened builds: detect frees of pointers outside the block
-                // area and double frees before mutating the free list.
-                #[cfg(any(feature = "secure", feature = "debug"))]
-                {
-                    let page = &*page_ptr;
-                    if !page.contains(block.as_ptr()) {
-                        report_corruption_and_abort(
-                            "mimalloc-rs: invalid free (pointer outside page block area)\n",
-                        );
-                    }
-                    if page.owner_lists_contain(block.as_ptr() as *mut crate::free_list::Block) {
-                        report_corruption_and_abort("mimalloc-rs: double free detected\n");
-                    }
+                let page = &*page_ptr;
+                if !page.contains(ptr.as_ptr()) {
+                    report_corruption_and_abort(
+                        "mimalloc-rs: invalid free (pointer outside page block area)\n",
+                    );
                 }
-                (*page_ptr).free_local(block);
+                if page.owner_lists_contain(ptr.as_ptr() as *mut crate::free_list::Block) {
+                    report_corruption_and_abort("mimalloc-rs: double free detected\n");
+                }
+            }
+            // Block size only feeds the stats counter; with `stats` off the load
+            // is dead and is eliminated, keeping the header's first touch the only
+            // page-header access on this path.
+            // SAFETY: live header; const field read.
+            crate::stats::on_free(unsafe { Page::raw_block_size(page_ptr) });
+            // SAFETY: this thread owns the page; `ptr` is a block start.
+            unsafe {
+                (*page_ptr).free_local(ptr);
                 // If the page is now fully free, retire it (return its slices).
                 if (*page_ptr).is_all_free() {
                     retire_page(page_ptr);
                 }
             }
         } else {
-            // Cross-thread (or abandoned) page: atomic Treiber push (touches only
-            // the atomic + block). `xtid & FLAG_MASK == 0` ⇒ block-start pointer;
-            // a flagged page → recover the block start.
-            let block = if xtid & MI_PAGE_FLAG_MASK == 0 {
-                ptr
-            } else {
-                recover_block(ptr)
-            };
-            // SAFETY: live page and block.
-            let claimed = unsafe { Page::thread_free_push(page_ptr, block) };
-            if claimed {
-                // The page was abandoned and this push transitioned it
-                // unowned→owned: we now exclusively own it and must collect it,
-                // then free / reabandon / unown (ports mi_free_block_mt →
-                // mi_free_try_collect_mt).
-                // SAFETY: we exclusively own the page now; `block` is the head we
-                // just pushed (enables the no-atomic partial collect).
-                unsafe {
-                    free_try_collect_mt(page_ptr, block.as_ptr() as *mut crate::free_list::Block)
-                };
-            }
+            // SAFETY: live page; forwarded with the folded dispatch word.
+            unsafe { free_cold(ptr, page_ptr, xtid) };
         }
     }
     #[cfg(not(feature = "std"))]
     {
         // Without std TLS we assume single-owner frees; embedders that share
         // heaps across tasks must route cross-task frees themselves.
-        let block = recover_block(ptr);
+        // SAFETY: live header; const field read.
+        let bs = unsafe { Page::raw_block_size(page_ptr) };
+        crate::stats::on_free(bs);
+        let block = unsafe { recover_block_start(page_ptr, ptr, bs) };
         // SAFETY: single-owner assumption.
         unsafe {
             (*page_ptr).free_local(block);
             if (*page_ptr).is_all_free() {
                 retire_page(page_ptr);
             }
+        }
+    }
+}
+
+/// Recover the block start from a (possibly interior) pointer. A block-start
+/// pointer (`off == 0`, the overwhelmingly common case) skips the divide; only an
+/// interior pointer from a large-alignment `alloc_aligned` — which sets the page's
+/// `has_interior` flag — needs the normalization.
+///
+/// # Safety
+/// `page_ptr` is a live header; `p` lies within its block area; `bs` is the page's
+/// block size.
+#[inline]
+unsafe fn recover_block_start(page_ptr: *mut Page, p: NonNull<u8>, bs: usize) -> NonNull<u8> {
+    // SAFETY: `page_ptr` is a live header; const field read.
+    let pstart = unsafe { Page::raw_page_start(page_ptr) };
+    let off = p.addr().get() - pstart.addr();
+    let bstart = if off == 0 {
+        p.as_ptr()
+    } else {
+        pstart.wrapping_add((off / bs) * bs)
+    };
+    // SAFETY: the recovered address is the start of a live block in this page.
+    unsafe { NonNull::new_unchecked(bstart) }
+}
+
+/// Cold free paths split out of [`free`] so the common local free stays a tight
+/// near-leaf: an **owner** free into a full / interior-flagged page (`xtid` within
+/// the flag mask), or a **cross-thread / abandoned-page** free (`xtid` above the
+/// mask). Ports the non-fast arms of `mi_free_ex` (`free.c:185-205`). Marked
+/// `cold` only in the preload cdylib (`override_export`); a static
+/// `#[global_allocator]` build lets the optimizer fold it back holistically.
+#[cfg(feature = "std")]
+#[cfg_attr(override_export, cold)]
+unsafe fn free_cold(ptr: NonNull<u8>, page_ptr: *mut Page, xtid: usize) {
+    // SAFETY: live header; const field read.
+    let bs = unsafe { Page::raw_block_size(page_ptr) };
+    crate::stats::on_free(bs);
+    if xtid & !MI_PAGE_FLAG_MASK == 0 {
+        // Owner, but the page is full / holds interior pointers: recover the start.
+        // SAFETY: live page owned by this thread.
+        let block = unsafe { recover_block_start(page_ptr, ptr, bs) };
+        #[cfg(any(feature = "secure", feature = "debug"))]
+        // SAFETY: owner.
+        unsafe {
+            let page = &*page_ptr;
+            if !page.contains(block.as_ptr()) {
+                report_corruption_and_abort(
+                    "mimalloc-rs: invalid free (pointer outside page block area)\n",
+                );
+            }
+            if page.owner_lists_contain(block.as_ptr() as *mut crate::free_list::Block) {
+                report_corruption_and_abort("mimalloc-rs: double free detected\n");
+            }
+        }
+        // SAFETY: owner.
+        unsafe {
+            (*page_ptr).free_local(block);
+            if (*page_ptr).is_all_free() {
+                retire_page(page_ptr);
+            }
+        }
+    } else {
+        // Cross-thread (or abandoned) page: atomic Treiber push (touches only the
+        // atomic + block). `xtid & FLAG_MASK == 0` ⇒ block-start pointer; a flagged
+        // page → recover the block start.
+        let block = if xtid & MI_PAGE_FLAG_MASK == 0 {
+            ptr
+        } else {
+            // SAFETY: live page.
+            unsafe { recover_block_start(page_ptr, ptr, bs) }
+        };
+        // SAFETY: live page and block.
+        let claimed = unsafe { Page::thread_free_push(page_ptr, block) };
+        if claimed {
+            // The page was abandoned and this push transitioned it unowned→owned:
+            // we now exclusively own it and must collect it, then free / reabandon /
+            // unown (ports mi_free_block_mt → mi_free_try_collect_mt).
+            // SAFETY: we exclusively own the page now; `block` is the head we just
+            // pushed (enables the no-atomic partial collect).
+            unsafe {
+                free_try_collect_mt(page_ptr, block.as_ptr() as *mut crate::free_list::Block)
+            };
         }
     }
 }
