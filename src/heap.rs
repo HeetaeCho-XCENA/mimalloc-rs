@@ -3,6 +3,7 @@
 
 use core::cell::Cell;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::arena_meta::{meta_free, meta_zalloc};
 use crate::bits::{
@@ -74,11 +75,20 @@ fn page_slices_for(block_size: usize) -> usize {
     }
 }
 
-/// A first-class heap.
-pub struct Heap {
+/// A thread-local execution heap (`mi_theap_t`, types.h:504): owns this thread's
+/// pages, bin queues, and fast-path caches — where allocation and freeing run.
+/// The logical/shared identity (subprocess binding, encoding keys, the theaps
+/// list) lives in [`Heap`]. `subproc`/`keys` are cached here (the tld pattern):
+/// both are immutable and process-global, so the hot path never derefs the heap.
+pub struct ThreadHeap {
+    /// Subprocess this theap allocates from. Cached from the logical heap (the
+    /// tld pattern); immutable and process-global. Keeping `subproc`/`keys` here
+    /// makes the struct layout byte-identical to the pre-split heap, so the hot
+    /// path never derefs the logical heap.
     subproc: &'static Subproc,
+    /// Free-list encoding keys (cached from the logical heap; immutable).
     keys: [usize; 2],
-    /// Owning thread id stamped on this heap's pages (low 2 bits clear).
+    /// Owning thread id stamped on this theap's pages (low 2 bits clear).
     tid: usize,
     /// Counter spreading arena searches across threads.
     tseq: Cell<usize>,
@@ -86,7 +96,7 @@ pub struct Heap {
     pages: [PageQueue; MI_BIN_COUNT],
     /// `mi_theap_t.pages_free_direct`: per small word size, the page that last
     /// served it. Invariant: a non-null entry points at a live page owned by
-    /// this heap (entries are cleared in `retire_page` before slices are freed).
+    /// this theap (entries are cleared in `retire_page` before slices are freed).
     pages_free_direct: [Cell<*mut Page>; MI_PAGES_DIRECT],
     /// Inclusive bin range that may hold a retired (emptied-but-kept) sole page,
     /// so `collect_retired` scans only the touched bins (`mi_theap_t`'s
@@ -95,11 +105,12 @@ pub struct Heap {
     page_retired_max: Cell<usize>,
 }
 
-impl Heap {
-    /// Create a heap bound to the main sub-process with the given encoding keys
-    /// and owner thread id (`tid`, low 2 bits clear, non-zero).
+impl ThreadHeap {
+    /// Create a theap with the given encoding keys, owned by thread `tid` (low 2
+    /// bits clear, non-zero), bound to the main subprocess. (HT2 will link each
+    /// theap to its logical [`Heap`] and shared theaps list.)
     pub fn new(keys: [usize; 2], tid: usize) -> Self {
-        Heap {
+        ThreadHeap {
             subproc: subproc_main(),
             keys,
             tid,
@@ -110,57 +121,6 @@ impl Heap {
             page_retired_min: Cell::new(MI_BIN_FULL),
             page_retired_max: Cell::new(0),
         }
-    }
-
-    /// Allocate a first-class heap from metadata memory (`mi_heap_new`). Release
-    /// with [`Heap::delete`] or [`Heap::destroy`]. Returns `None` on metadata OOM.
-    pub fn new_boxed(keys: [usize; 2], tid: usize) -> Option<NonNull<Heap>> {
-        let mem = meta_zalloc(core::mem::size_of::<Heap>())?;
-        let p = mem.as_ptr() as *mut Heap;
-        // SAFETY: `mem` is a zeroed, suitably sized/aligned metadata block.
-        unsafe { p.write(Heap::new(keys, tid)) };
-        NonNull::new(p)
-    }
-
-    /// Delete a first-class heap (`mi_heap_delete`): hand off its pages via the
-    /// drop path (live blocks stay valid), then free the heap.
-    ///
-    /// # Safety
-    /// `heap` must come from [`Heap::new_boxed`] and not be used afterwards.
-    pub unsafe fn delete(heap: NonNull<Heap>) {
-        // SAFETY: runs Heap::drop (abandon/release), then frees the struct.
-        unsafe {
-            core::ptr::drop_in_place(heap.as_ptr());
-            meta_free(heap.cast::<u8>(), core::mem::size_of::<Heap>());
-        }
-    }
-
-    /// Destroy a first-class heap (`mi_heap_destroy`): free **all** of its pages
-    /// and blocks in bulk, then free the heap. All pointers from it become invalid.
-    ///
-    /// # Safety
-    /// `heap` must come from [`Heap::new_boxed`], no block of it may be used
-    /// afterwards, and no other thread may touch it.
-    pub unsafe fn destroy(heap: NonNull<Heap>) {
-        // SAFETY: caller guarantees exclusive, final access.
-        let h = unsafe { heap.as_ref() };
-        for b in 0..MI_BIN_COUNT {
-            let mut cur = h.pages[b].first();
-            while !cur.is_null() {
-                // SAFETY: queue holds valid pages owned by this heap; interior-
-                // mutable, so a shared borrow suffices.
-                let p = unsafe { &*cur };
-                let next = p.next.get();
-                // SAFETY: bulk free — return the slices regardless of `used`.
-                unsafe {
-                    h.pages[b].remove(cur);
-                    release_page_slices(cur);
-                }
-                cur = next;
-            }
-        }
-        // SAFETY: heap memory is a metadata block no longer referenced.
-        unsafe { meta_free(heap.cast::<u8>(), core::mem::size_of::<Heap>()) };
     }
 
     #[inline]
@@ -273,7 +233,7 @@ impl Heap {
         debug_assert_eq!(
             self.tid,
             crate::init::current_tid(),
-            "Heap::collect_retired called from a non-owning thread"
+            "ThreadHeap::collect_retired called from a non-owning thread"
         );
         let lo = self.page_retired_min.get();
         let hi = self.page_retired_max.get();
@@ -336,7 +296,11 @@ impl Heap {
         page.set_owner(self.tid);
         // A reclaimed page has been used; its free blocks are no longer zero.
         page.mark_reused();
-        page.set_provenance(self as *const Heap as *mut Heap, arena, bin as u32);
+        page.set_provenance(
+            self as *const ThreadHeap as *mut ThreadHeap,
+            arena,
+            bin as u32,
+        );
         // SAFETY: owner now; drain cross-thread frees, then link into our queue.
         unsafe {
             page.collect_free();
@@ -426,7 +390,7 @@ impl Heap {
         unsafe {
             page.as_ref().set_owner_fresh(self.tid);
             page.as_ref().set_provenance(
-                self as *const Heap as *mut Heap,
+                self as *const ThreadHeap as *mut ThreadHeap,
                 arena.as_ptr(),
                 MI_BIN_HUGE as u32,
             );
@@ -459,7 +423,7 @@ impl Heap {
             // used when reclaiming a live page.
             page.as_ref().set_owner_fresh(self.tid);
             page.as_ref().set_provenance(
-                self as *const Heap as *mut Heap,
+                self as *const ThreadHeap as *mut ThreadHeap,
                 arena.as_ptr(),
                 bin as u32,
             );
@@ -486,12 +450,6 @@ impl Heap {
         Some(page_ptr)
     }
 
-    /// Encoding keys (for diagnostics/tests).
-    #[inline]
-    pub fn keys(&self) -> [usize; 2] {
-        self.keys
-    }
-
     /// Reclaim memory held by this heap (`mi_heap_collect`): drain each page's
     /// cross-thread + local frees and return now-empty pages to the arena.
     /// `force` also releases the sole kept page of a bin (see [`retire_page`]).
@@ -504,7 +462,7 @@ impl Heap {
         debug_assert_eq!(
             self.tid,
             crate::init::current_tid(),
-            "Heap::collect called from a non-owning thread (mi_heap_* is owner-thread-only)"
+            "ThreadHeap::collect called from a non-owning thread (mi_heap_* is owner-thread-only)"
         );
         #[cfg(feature = "std")]
         crate::init::run_deferred_free(force);
@@ -550,6 +508,159 @@ impl Heap {
         }
         // Heartbeat that drives delayed purging back to the OS.
         self.subproc.try_purge(force);
+    }
+}
+
+/// A logical heap (`mi_heap_t`, types.h:556): the shareable identity that owns a
+/// set of thread-local [`ThreadHeap`]s. A first-class heap (`mi_heap_new`) owns
+/// one single-thread `ThreadHeap`; the process default heap is driven directly
+/// through the per-thread `ThreadHeap` in TLS. (The shared default-heap object,
+/// the theaps list, and per-heap cross-thread theaps are layered on next.)
+pub struct Heap {
+    /// Free-list encoding keys for this heap's pages.
+    keys: [usize; 2],
+    /// Unique id among heaps of this subprocess (`mi_heap_t.heap_seq`).
+    heap_seq: usize,
+    /// The single-thread theap backing this first-class heap (metadata-allocated).
+    /// (HT2 generalizes this to the per-heap theaps list for cross-thread sharing.)
+    theap: AtomicPtr<ThreadHeap>,
+}
+
+/// Monotonic source for [`Heap::heap_seq`].
+fn next_heap_seq() -> usize {
+    static SEQ: AtomicUsize = AtomicUsize::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Heap {
+    /// Allocate a first-class heap from metadata memory (`mi_heap_new`): a logical
+    /// `Heap` plus the single-thread `ThreadHeap` that backs it. Release with
+    /// [`Heap::delete`] or [`Heap::destroy`]. Returns `None` on metadata OOM.
+    pub fn new_boxed(keys: [usize; 2], tid: usize) -> Option<NonNull<Heap>> {
+        let hmem = meta_zalloc(core::mem::size_of::<Heap>())?;
+        let tmem = match meta_zalloc(core::mem::size_of::<ThreadHeap>()) {
+            Some(m) => m,
+            None => {
+                // SAFETY: just allocated above, unreferenced.
+                unsafe { meta_free(hmem, core::mem::size_of::<Heap>()) };
+                return None;
+            }
+        };
+        let hp = hmem.as_ptr() as *mut Heap;
+        let tp = tmem.as_ptr() as *mut ThreadHeap;
+        // SAFETY: both are zeroed, suitably sized/aligned metadata blocks.
+        unsafe {
+            tp.write(ThreadHeap::new(keys, tid));
+            hp.write(Heap {
+                keys,
+                heap_seq: next_heap_seq(),
+                theap: AtomicPtr::new(tp),
+            });
+        }
+        NonNull::new(hp)
+    }
+
+    /// The thread-local heap backing this first-class heap.
+    #[inline]
+    fn theap(&self) -> &ThreadHeap {
+        // SAFETY: set at `new_boxed` and live until `delete`/`destroy`.
+        unsafe { &*self.theap.load(Ordering::Acquire) }
+    }
+
+    /// Encoding keys (diagnostics/tests).
+    #[inline]
+    pub fn keys(&self) -> [usize; 2] {
+        self.keys
+    }
+
+    /// This heap's unique sequence id within its subprocess (`mi_heap_t.heap_seq`).
+    #[inline]
+    pub fn heap_seq(&self) -> usize {
+        self.heap_seq
+    }
+
+    /// Allocate `size` bytes from this heap (`mi_heap_malloc`).
+    #[inline]
+    pub fn alloc(&self, size: usize) -> Option<NonNull<u8>> {
+        self.theap().alloc(size)
+    }
+
+    /// Allocate `size` bytes aligned to `align` (`mi_heap_malloc_aligned`).
+    #[inline]
+    pub fn alloc_aligned(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+        self.theap().alloc_aligned(size, align)
+    }
+
+    /// Allocate `size` zeroed bytes (`mi_heap_zalloc`).
+    #[inline]
+    pub fn alloc_zeroed(&self, size: usize) -> Option<NonNull<u8>> {
+        self.theap().alloc_zeroed(size)
+    }
+
+    /// Allocate `size` zeroed bytes aligned to `align`.
+    #[inline]
+    pub fn alloc_zeroed_aligned(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+        self.theap().alloc_zeroed_aligned(size, align)
+    }
+
+    /// Reclaim memory held by this heap (`mi_heap_collect`).
+    pub fn collect(&self, force: bool) {
+        self.theap().collect(force);
+    }
+
+    /// Delete a first-class heap (`mi_heap_delete`): hand off its pages via the
+    /// theap drop path (live blocks stay valid), then free the theap and the heap.
+    ///
+    /// # Safety
+    /// `heap` must come from [`Heap::new_boxed`] and not be used afterwards.
+    pub unsafe fn delete(heap: NonNull<Heap>) {
+        // SAFETY: caller guarantees exclusive, final access.
+        unsafe {
+            let tp = heap.as_ref().theap.load(Ordering::Acquire);
+            if !tp.is_null() {
+                // `ThreadHeap::drop` abandons/releases the pages.
+                core::ptr::drop_in_place(tp);
+                meta_free(
+                    NonNull::new_unchecked(tp as *mut u8),
+                    core::mem::size_of::<ThreadHeap>(),
+                );
+            }
+            meta_free(heap.cast::<u8>(), core::mem::size_of::<Heap>());
+        }
+    }
+
+    /// Destroy a first-class heap (`mi_heap_destroy`): free **all** of its pages
+    /// and blocks in bulk, then free the theap and heap. All its pointers become
+    /// invalid.
+    ///
+    /// # Safety
+    /// `heap` must come from [`Heap::new_boxed`], no block of it may be used
+    /// afterwards, and no other thread may touch it.
+    pub unsafe fn destroy(heap: NonNull<Heap>) {
+        // SAFETY: caller guarantees exclusive, final access.
+        unsafe {
+            let tp = heap.as_ref().theap.load(Ordering::Acquire);
+            if !tp.is_null() {
+                let th = &*tp;
+                for b in 0..MI_BIN_COUNT {
+                    let mut cur = th.pages[b].first();
+                    while !cur.is_null() {
+                        let next = (*cur).next.get();
+                        // SAFETY: bulk free — return the slices regardless of `used`.
+                        th.pages[b].remove(cur);
+                        release_page_slices(cur);
+                        cur = next;
+                    }
+                }
+                // Free the theap's raw metadata without running its `Drop` (the
+                // pages are already released; we must not abandon them).
+                meta_free(
+                    NonNull::new_unchecked(tp as *mut u8),
+                    core::mem::size_of::<ThreadHeap>(),
+                );
+            }
+            meta_free(heap.cast::<u8>(), core::mem::size_of::<Heap>());
+        }
     }
 }
 
@@ -743,13 +854,13 @@ fn report_corruption_and_abort(msg: &str) -> ! {
 unsafe fn retire_page(page_ptr: *mut Page) {
     // SAFETY: owner thread holds the page; provenance was set at creation.
     let page = unsafe { &*page_ptr };
-    let heap = page.owning_heap();
+    let theap = page.owning_theap();
     let bin = page.bin() as usize;
-    if heap.is_null() || page.owning_arena().is_null() {
-        return; // not a heap-managed page (e.g. a synthetic test page)
+    if theap.is_null() || page.owning_arena().is_null() {
+        return; // not a theap-managed page (e.g. a synthetic test page)
     }
-    // SAFETY: heap is this thread's heap (owner-only access is safe here).
-    let heap = unsafe { &*heap };
+    // SAFETY: `theap` is this thread's theap (owner-only access is safe here).
+    let theap = unsafe { &*theap };
     // Already retired (countdown running): keep it retired (ports page.c:437).
     if page.retire_expire() != 0 {
         return;
@@ -759,31 +870,31 @@ unsafe fn retire_page(page_ptr: *mut Page) {
     // size class stays idle. This avoids retire/re-allocate churn when a workload
     // empties a bin then immediately allocates from it again (ports page.c:446-463).
     // Huge pages have no size class to keep, so they always release.
-    if bin != MI_BIN_HUGE && heap.pages[bin].len() <= 1 {
+    if bin != MI_BIN_HUGE && theap.pages[bin].len() <= 1 {
         let cycles = if page.block_size() <= MI_SMALL_MAX_OBJ_SIZE {
             MI_RETIRE_CYCLES
         } else {
             MI_RETIRE_CYCLES / 4
         };
         page.set_retire_expire(cycles);
-        if bin < heap.page_retired_min.get() {
-            heap.page_retired_min.set(bin);
+        if bin < theap.page_retired_min.get() {
+            theap.page_retired_min.set(bin);
         }
-        if bin > heap.page_retired_max.get() {
-            heap.page_retired_max.set(bin);
+        if bin > theap.page_retired_max.get() {
+            theap.page_retired_max.set(bin);
         }
         return;
     }
     // Otherwise release immediately. Clear fast-path entries pointing at this
     // page before release.
-    for slot in heap.pages_free_direct.iter() {
+    for slot in theap.pages_free_direct.iter() {
         if slot.get() == page_ptr {
             slot.set(core::ptr::null_mut());
         }
     }
     // SAFETY: page is linked in this bin queue; range was registered for it.
     unsafe {
-        heap.pages[bin].remove(page_ptr);
+        theap.pages[bin].remove(page_ptr);
         release_page_slices(page_ptr);
     }
     // Purge is no longer driven here. The old per-retire `try_purge` scanned
@@ -945,8 +1056,8 @@ unsafe fn abandon_owned_page(subproc: &Subproc, page_ptr: *mut Page, bin: usize)
     }
 }
 
-impl Drop for Heap {
-    /// On thread exit, hand off this heap's pages: empty pages are released to
+impl Drop for ThreadHeap {
+    /// On thread exit, hand off this theap's pages: empty pages are released to
     /// the arena, pages with live blocks are abandoned for another thread.
     fn drop(&mut self) {
         for b in 0..MI_BIN_COUNT {
@@ -992,12 +1103,47 @@ pub unsafe fn usable_size(ptr: NonNull<u8>) -> usize {
 mod tests {
     use super::*;
 
-    fn test_heap() -> Heap {
+    fn test_heap() -> ThreadHeap {
         // Use the real thread id so owner-vs-cross-thread free routing is correct.
-        Heap::new(
+        ThreadHeap::new(
             [0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321],
             crate::init::current_tid(),
         )
+    }
+
+    #[test]
+    fn first_class_heap_alloc_free_destroy() {
+        // A first-class `Heap` (mi_heap_t) backed by its own single-thread
+        // `ThreadHeap`: distinct identity, allocates/frees through the handle,
+        // and both teardown paths (delete = hand off, destroy = bulk free) work.
+        // SAFETY: handles come from `new_boxed`; pointers are freed here.
+        unsafe {
+            let keys = crate::init::process_keys();
+            let tid = crate::init::current_tid();
+            let h1 = Heap::new_boxed(keys, tid).unwrap();
+            let h2 = Heap::new_boxed(keys, tid).unwrap();
+            assert_ne!(
+                h1.as_ref().heap_seq(),
+                h2.as_ref().heap_seq(),
+                "first-class heaps get distinct sequence ids"
+            );
+            // Alloc + free a block through the handle.
+            let p = h1.as_ref().alloc(128).unwrap();
+            core::ptr::write_bytes(p.as_ptr(), 0xAB, 128);
+            assert_eq!(*p.as_ptr(), 0xAB);
+            free(p);
+            // Zeroed allocation through the handle.
+            let z = h1.as_ref().alloc_zeroed(2048).unwrap();
+            for i in 0..2048 {
+                assert_eq!(*z.as_ptr().add(i), 0, "alloc_zeroed must zero");
+            }
+            free(z);
+            // delete hands off (live blocks stay valid); destroy bulk-frees even
+            // with a live block outstanding.
+            let _live = h2.as_ref().alloc(64).unwrap();
+            Heap::delete(h1);
+            Heap::destroy(h2); // `_live` is now invalid — never touched again
+        }
     }
 
     #[test]

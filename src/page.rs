@@ -78,8 +78,10 @@ pub struct Page {
     /// Provenance of the page within its arena.
     pub slice_index: usize,
     pub slice_count: usize,
-    /// Owning heap (set after init; owner-only access).
-    heap: Cell<*mut crate::heap::Heap>,
+    /// Owning thread-local heap (`mi_page_t.theap`; set after init; owner-only
+    /// access). The page's primary owner is the theap; the logical heap is
+    /// reached via `theap.heap` on cold paths only.
+    theap: Cell<*mut crate::heap::ThreadHeap>,
     /// Owning arena (set after init). Slices return here on retire.
     arena: Cell<*mut crate::arena::Arena>,
     /// Size-class bin index this page belongs to (set after init).
@@ -140,7 +142,7 @@ impl Page {
                 prev: Cell::new(core::ptr::null_mut()),
                 slice_index,
                 slice_count,
-                heap: Cell::new(core::ptr::null_mut()),
+                theap: Cell::new(core::ptr::null_mut()),
                 arena: Cell::new(core::ptr::null_mut()),
                 bin: Cell::new(0),
                 free_is_zero: Cell::new(is_zero),
@@ -190,7 +192,7 @@ impl Page {
                 prev: Cell::new(core::ptr::null_mut()),
                 slice_index,
                 slice_count,
-                heap: Cell::new(core::ptr::null_mut()),
+                theap: Cell::new(core::ptr::null_mut()),
                 arena: Cell::new(core::ptr::null_mut()),
                 bin: Cell::new(0),
                 free_is_zero: Cell::new(is_zero),
@@ -630,19 +632,19 @@ impl Page {
     #[inline]
     pub fn set_provenance(
         &self,
-        heap: *mut crate::heap::Heap,
+        theap: *mut crate::heap::ThreadHeap,
         arena: *mut crate::arena::Arena,
         bin: u32,
     ) {
-        self.heap.set(heap);
+        self.theap.set(theap);
         self.arena.set(arena);
         self.bin.set(bin);
     }
 
-    /// Owning heap pointer (owner-only).
+    /// Owning thread-local heap pointer (owner-only).
     #[inline]
-    pub fn owning_heap(&self) -> *mut crate::heap::Heap {
-        self.heap.get()
+    pub fn owning_theap(&self) -> *mut crate::heap::ThreadHeap {
+        self.theap.get()
     }
 
     /// Owning arena pointer.

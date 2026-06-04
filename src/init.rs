@@ -56,56 +56,56 @@ pub fn current_tid() -> usize {
 #[cfg(feature = "std")]
 mod tls {
     use super::{current_tid, process_keys};
-    use crate::heap::Heap;
+    use crate::heap::ThreadHeap;
     use core::ptr::NonNull;
 
-    // Rust: the whole `Heap` lives inline in a `thread_local!` (vs C's
-    // `__thread mi_heap_t*`); an out-of-line pointer cache showed no win.
+    // Rust: the whole `ThreadHeap` (mi_theap_t) lives inline in a `thread_local!`
+    // (vs C's `__thread mi_theap_t*`); an out-of-line pointer cache showed no win.
     std::thread_local! {
-        /// The calling thread's default heap.
-        static DEFAULT_HEAP: Heap = Heap::new(process_keys(), current_tid());
+        /// The calling thread's default thread-local heap.
+        static DEFAULT_THEAP: ThreadHeap = ThreadHeap::new(process_keys(), current_tid());
     }
 
-    /// Allocate `size` bytes from the calling thread's default heap.
+    /// Allocate `size` bytes from the calling thread's default theap.
     #[inline]
     pub fn malloc(size: usize) -> Option<NonNull<u8>> {
-        DEFAULT_HEAP.with(|h| h.alloc(size))
+        DEFAULT_THEAP.with(|th| th.alloc(size))
     }
 
-    /// Allocate `size` bytes aligned to `align` from the default heap.
+    /// Allocate `size` bytes aligned to `align` from the default theap.
     #[inline]
     pub fn malloc_aligned(size: usize, align: usize) -> Option<NonNull<u8>> {
-        DEFAULT_HEAP.with(|h| h.alloc_aligned(size, align))
+        DEFAULT_THEAP.with(|th| th.alloc_aligned(size, align))
     }
 
     /// Allocate zeroed memory of `size` bytes.
     #[inline]
     pub fn zalloc(size: usize) -> Option<NonNull<u8>> {
-        DEFAULT_HEAP.with(|h| h.alloc_zeroed(size))
+        DEFAULT_THEAP.with(|th| th.alloc_zeroed(size))
     }
 
-    /// Allocate `size` zeroed bytes aligned to `align` from the default heap.
+    /// Allocate `size` zeroed bytes aligned to `align` from the default theap.
     #[inline]
     pub fn zalloc_aligned(size: usize, align: usize) -> Option<NonNull<u8>> {
-        DEFAULT_HEAP.with(|h| h.alloc_zeroed_aligned(size, align))
+        DEFAULT_THEAP.with(|th| th.alloc_zeroed_aligned(size, align))
     }
 
-    /// Reclaim memory in the calling thread's default heap (see
-    /// [`crate::heap::Heap::collect`]). Uses `.with` — must run on a live thread.
+    /// Reclaim memory in the calling thread's default theap (see
+    /// [`crate::heap::ThreadHeap::collect`]). Uses `.with` — must run on a live thread.
     pub fn collect(force: bool) {
-        DEFAULT_HEAP.with(|h| h.collect(force));
+        DEFAULT_THEAP.with(|th| th.collect(force));
     }
 
-    /// Force-initialize the calling thread's default heap (no-op if already).
+    /// Force-initialize the calling thread's default theap (no-op if already).
     /// `try_with` makes a call during TLS teardown a safe no-op.
     pub fn touch() {
-        let _ = DEFAULT_HEAP.try_with(|_| {});
+        let _ = DEFAULT_THEAP.try_with(|_| {});
     }
 
     /// Like [`collect`] but for the lifecycle wrappers: `try_with` makes a late
     /// call (TLS teardown) a safe no-op. Page hand-off still happens via `Drop`.
     pub fn collect_lifecycle(force: bool) {
-        let _ = DEFAULT_HEAP.try_with(|h| h.collect(force));
+        let _ = DEFAULT_THEAP.try_with(|th| th.collect(force));
     }
 }
 
