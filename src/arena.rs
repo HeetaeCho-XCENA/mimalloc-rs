@@ -76,18 +76,6 @@ impl Arena {
     /// region is only reserved and committed per allocation.
     ///
     /// Returns a pointer to the descriptor (in metadata memory), or `None` on OOM.
-    /// Number of contiguous hot bitmaps (free, commit, purge, dirty), each
-    /// `[chunkmap][chunks]`. `create` allocates this many and `destroy` frees the
-    /// same amount — keep them in lockstep via [`Arena::hot_bitmap_bytes`].
-    const HOT_BITMAPS: usize = 4;
-
-    /// Bytes of metadata backing all hot bitmaps for an arena of `chunk_count`
-    /// chunks. Single source of truth so `create`/`destroy` cannot drift.
-    #[inline]
-    const fn hot_bitmap_bytes(chunk_count: usize) -> usize {
-        Self::HOT_BITMAPS * (chunk_count + 1) * core::mem::size_of::<BChunk>()
-    }
-
     pub fn create(slice_count: usize, commit: bool) -> Option<NonNull<Arena>> {
         debug_assert!(slice_count > 0);
         let chunk_count = chunks_for(slice_count);
@@ -184,6 +172,18 @@ impl Arena {
             }
         }
         NonNull::new(arena)
+    }
+
+    /// Number of contiguous hot bitmaps (free, commit, purge, dirty), each
+    /// `[chunkmap][chunks]`. `create` allocates this many and `destroy` frees the
+    /// same amount — keep them in lockstep via [`Arena::hot_bitmap_bytes`].
+    const HOT_BITMAPS: usize = 4;
+
+    /// Bytes of metadata backing all hot bitmaps for an arena of `chunk_count`
+    /// chunks. Single source of truth so `create`/`destroy` cannot drift.
+    #[inline]
+    const fn hot_bitmap_bytes(chunk_count: usize) -> usize {
+        Self::HOT_BITMAPS * (chunk_count + 1) * core::mem::size_of::<BChunk>()
     }
 
     #[inline]
