@@ -49,6 +49,32 @@ taskset -c 2-9 ./stress_c                        8 50 50
 `examples/stress.rs` takes `THREADS SCALE ITER [NUMA_NODE]`; it prints
 `STRESS_SECONDS <n>` to stderr and binds memory + CPU to `NUMA_NODE` on Linux.
 
+## Microbenchmark suite (`benchmark/`)
+
+`benchmark/` is an isolated cargo project with faithful Rust ports of five
+mimalloc-bench microbenchmarks, run with mimalloc-rs as the static
+`#[global_allocator]` (peak). A `bench-system` feature rebuilds the *same*
+binaries on Rust's `System` (glibc) allocator, and `benchmark/run.sh` adds the
+mimalloc-c peak (original C bench + `src/static.c -O3 -flto`) for a 3-way table:
+
+```sh
+MI_SRC=~/repos/mimalloc-v3 CBENCH=/path/to/mimalloc-bench/bench bash benchmark/run.sh
+```
+
+Results (pinned i7-14700K, cores 2–9, interleaved median ×5, 8 threads):
+
+| workload | metric | mimalloc-rs | system (glibc) | mimalloc-c |
+|---|---|---|---|---|
+| xmalloc-test (producer/consumer cross-thread free) | free/sec ↑ | **235 M** | 60 M | 62 M |
+| larson (server MT) | ops/sec ↑ | **304 M** | 94 M | 87 M |
+| alloc-test (fast path) | sec ↓ | **0.12** | 0.14 | — |
+| cache-thrash (false-share, 1 B) | sec ↓ | 0.11 | 0.09 | 0.09 |
+| malloc-large (5–25 MiB) | sec ↓ | 2.06 | 1.97 | 2.33 |
+
+On the multi-threaded / contended patterns mimalloc-rs is **~3–4× glibc** and
+**on par with or ahead of mimalloc-c**; glibc's direct `mmap` edges it on pure
+huge allocation. See `benchmark/README.md` for per-bench detail and caveats.
+
 ## Criterion micro-benchmarks
 
 `benches/alloc.rs` tracks the allocator's own alloc/free cost across size classes

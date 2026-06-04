@@ -13,3 +13,6 @@ perf.data
 perf.data.old
 *.perf
 flamegraph.svg
+
+# Benchmark workspace build artifacts
+/benchmark/target
