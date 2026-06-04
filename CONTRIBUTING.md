@@ -30,10 +30,10 @@ cargo test                                                # default
 cargo test --features secure,debug,stats,track            # hardened + stats
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features capi,secure,debug,stats,track -- -D warnings
+cargo clippy --all-targets --features secure,debug,stats,track -- -D warnings
 ```
 
-Concurrency / UB / contract (see `docs/verification.md` for the full matrix):
+Concurrency / UB / contract:
 
 ```sh
 RUSTFLAGS="--cfg loom" cargo test --lib loom_tests        # loom models
@@ -49,17 +49,19 @@ running the hardened test suite; CI runs ASan + ThreadSanitizer jobs too.
 
 Performance is **never gated in CI** (shared runners are too noisy). The bar is:
 
-> A change must show **no regression on any `bench_suite` phase** vs `main`,
-> measured on a quiet, **pinned machine**.
+> A change must show **no regression** vs `main`, measured on a quiet,
+> **pinned machine**.
 
 ```sh
-MIMALLOC_C_LIB=<dir> scripts/perf_compare.sh 9 2          # branch vs main, per-phase
+# Build examples/stress on the branch and on main, run both interleaved (median):
+cargo build --release --example stress
+taskset -c 2-9 ./target/release/examples/stress 8 50 50    # vs the same build on main
+cargo bench --bench alloc -- --baseline before             # Criterion micro-gate
 ```
 
-Merge a perf-affecting change only after a clean pinned-machine run. For the
-standard cross-allocator suite and RSS, see `docs/benchmarking.md`
-(`scripts/mimalloc-bench.sh`, `examples/rss_spike.rs`). When a perf idea turns
-out neutral or worse, **park it and record why** (see `docs/perf-hotpath.md`).
+Merge a perf-affecting change only after a clean pinned-machine run. When a perf
+idea turns out neutral or worse, **park it and record why**. See
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## `unsafe` policy
 
@@ -78,4 +80,4 @@ out neutral or worse, **park it and record why** (see `docs/perf-hotpath.md`).
   concurrent) a loom model and/or a TSan-covered stress test.
 - Fill in the PR template (what / why / verification).
 
-See also: `docs/verification.md`, `docs/benchmarking.md`, `docs/perf-hotpath.md`.
+See also: [`docs/FIDELITY.md`](docs/FIDELITY.md), [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
