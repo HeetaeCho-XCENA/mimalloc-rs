@@ -705,6 +705,13 @@ impl Heap {
     /// Each ref (the alive ref + one per [`Heap::new_theap_for`]) is released
     /// exactly once; after this returns the heap may be freed and must not be used.
     unsafe fn release_ref(&self) {
+        // The 'static default heap is uncounted (refcount 0) and must never be
+        // released — guard the invariant (a stray release would wrap 0->MAX or
+        // free non-meta memory).
+        debug_assert!(
+            self.refcount.load(Ordering::Relaxed) != 0,
+            "release_ref on an uncounted heap (the default heap is never released)"
+        );
         if self.refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
             // Last reference: no theap and no handle remain.
             // SAFETY: refcount reached 0, so nothing references this heap; the
