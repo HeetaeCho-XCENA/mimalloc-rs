@@ -10,7 +10,7 @@
 
 ## Verification
 
-<!-- Tick what you ran (see CONTRIBUTING.md / docs/verification.md). -->
+<!-- Tick what you ran (see CONTRIBUTING.md). -->
 
 - [ ] `cargo test` + `cargo test --features secure,debug,stats,track`
 - [ ] `cargo fmt --all -- --check` + `cargo clippy --all-targets -- -D warnings`

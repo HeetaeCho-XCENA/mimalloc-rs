@@ -49,50 +49,13 @@ use allocator_api2::boxed::Box;
 let b = Box::new_in(42u64, MiMalloc);
 ```
 
-As a **C library** (`capi` feature): build a `cdylib`/`staticlib` exporting the
-mimalloc-compatible C ABI (`mi_malloc`/`mi_free`/`mi_calloc`/`mi_realloc`/aligned
-variants/`mi_posix_memalign`/`mi_new*`/`mi_heap_*`/`mi_option_*`/`mi_stats_*`/…):
-
-```sh
-cargo rustc --release --features capi --crate-type cdylib   # → libmimalloc_rs.so
-```
-
 First-class heaps from Rust: `Heap::new_boxed`, `Heap::{delete,destroy}`.
 
-As a **transparent `LD_PRELOAD` drop-in** (`override` feature): also export the
-standard libc symbols (`malloc`/`free`/`calloc`/`realloc`/`aligned_alloc`/
-`posix_memalign`/`valloc`/…) so an unmodified program uses this allocator. The
-raw symbols are emitted only when the explicit `override_export` cfg is set (so
-they never leak into `cargo test`/`build`):
-
-```sh
-RUSTFLAGS="--cfg override_export" \
-  cargo rustc --release --features override --crate-type cdylib   # → libmimalloc_rs.so
-LD_PRELOAD=./target/release/libmimalloc_rs.so  ./your_program
-```
-
-Pointers allocated before interposition (or by paths we don't intercept) are
-detected by arena-membership and forwarded to the real system allocator, so
-mixing is safe.
-
-#### Verifying
-
-`scripts/preload-check.sh` is the end-to-end proof: it builds the override
-cdylib (into an isolated `target/preload`), compiles an unmodified C probe, and
-asserts that under `LD_PRELOAD` **every** `malloc` is served by this allocator
-(`mi_is_in_heap_region(p) == true` for all of them — `ours == total`). It also
-smoke-tests a real system binary (`/bin/ls`) under preload to confirm
-transparent replacement doesn't crash it. It exits non-zero on any failure, and
-is a clean no-op (exit 0, "SKIP") on machines without a C compiler.
-
-```sh
-bash scripts/preload-check.sh   # → PRELOAD CHECK: PASS
-```
-
-The `preload` CI job runs this on every push, so transparent override is
-validated continuously. (A `#[ignore]`d `tests/preload.rs` wraps the same
-script for local convenience — run with
-`cargo test --features override --test preload -- --ignored`.)
+> **C ABI / `LD_PRELOAD` drop-in.** mimalloc-rs is a *rust-native* engine — its
+> intended use is the static `#[global_allocator]` above, where it is on par with
+> mimalloc-c (see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)). The C-ABI (`mi_*`)
+> and transparent libc / `LD_PRELOAD` override build (which pays an unavoidable
+> `.so`-boundary cost) live on the **`export`** branch.
 
 ## Features
 
@@ -104,8 +67,7 @@ script for local convenience — run with
 | `debug`   |         | padding/canaries + extra checks (`MI_PADDING`/`MI_DEBUG`)     |
 | `stats`   |         | process-wide allocation counters (`mi_stats_*`)              |
 | `track`   |         | Valgrind/ASan tracking hooks                                  |
-| `capi`    |         | export the C-ABI `mi_*` symbols (`#[no_mangle] extern "C"`)   |
-| `differential` |    | enable the `libmimalloc` FFI differential test (see below)   |
+| `differential` |    | enable the `libmimalloc` FFI differential test (`MIMALLOC_C_LIB`) |
 
 ## Building & testing
 
@@ -140,16 +102,13 @@ MIMALLOC_C_LIB=/path/to/mimalloc/out cargo test --features differential --test d
 ## Contributing
 
 Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev
-setup (MSRV 1.84), the full gate checklist, the `unsafe` policy, and the
-no-regression rule. Reference docs:
+setup (MSRV 1.84), the gate checklist, the `unsafe` policy, and the no-regression
+rule. Reference docs:
 
-- [`docs/verification.md`](docs/verification.md) — every correctness gate
-  (tests, Miri, loom, differential, fuzz, ASan/TSan, coverage) and how to run it.
-- [`docs/benchmarking.md`](docs/benchmarking.md) — every benchmark (Criterion,
-  `bench_suite`, `rss_spike`, `perf_compare.sh`, `mimalloc-bench.sh`) and the
-  pinned-machine perf protocol.
-- [`docs/perf-hotpath.md`](docs/perf-hotpath.md) — the small-object hot-path
-  analysis and parked/confirmed leads.
+- [`docs/FIDELITY.md`](docs/FIDELITY.md) — engine compatibility with mimalloc v3:
+  which mechanisms are ported faithfully and where the port is Rust-idiomatic.
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — peak-vs-peak results vs mimalloc-c
+  and how to reproduce.
 
 Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
 
