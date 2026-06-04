@@ -66,6 +66,18 @@ row alloc-test  rs_alloc_test  sys_alloc_test  alloc-test   $T
 row malloc-large rs_malloc_large sys_malloc_large malloc-large
 row cache-thrash rs_cache_thrash sys_cache_thrash cache-thrash $T 1000 1 1000000 $T
 
+# Ports with no official C counterpart (calloc/realloc): the mi-c column is our
+# *system* binary run under LD_PRELOAD of a real mimalloc .so — a clean
+# same-binary glibc-vs-mimalloc swap.
+row_ours(){ local n="$1" rb="$2" sb="$3"; shift 3
+  local r=$(medwall "$OUT/$rb" "$@") s=$(medwall "$OUT/$sb" "$@")
+  local cm="-" cmx=0
+  if [ $HAVE_C = 1 ]; then cmx=$(medwallp "$OUT/$sb" "$@"); cm=$cmx; fi
+  printf "%-13s %-7s %9s %9s %5s %9s %9s %5s\n" "$n" "sec↓" "$r" "$s" "$(sp $s $r)" "$cm" "$s" "$(sp $s $cmx)"
+}
+row_ours calloc-test  rs_calloc_test  sys_calloc_test  $T 100000 64
+row_ours realloc-test rs_realloc_test sys_realloc_test $T 3000000
+
 echo
 echo "Each allocator is compared to glibc on its OWN faithful harness (same-binary"
 echo "swap). Cross-language: compare the 'x' (speedup over glibc) columns, not the"

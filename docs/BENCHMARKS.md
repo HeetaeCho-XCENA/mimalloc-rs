@@ -51,8 +51,9 @@ taskset -c 2-9 ./stress_c                        8 50 50
 
 ## Microbenchmark suite (`benchmark/`)
 
-`benchmark/` is an isolated cargo project with faithful Rust ports of five
-mimalloc-bench microbenchmarks, run with mimalloc-rs as the static
+`benchmark/` is an isolated cargo project of allocator microbenchmarks (five
+faithful mimalloc-bench ports plus `calloc_test`/`realloc_test`, which have no
+upstream counterpart), run with mimalloc-rs as the static
 `#[global_allocator]` (peak). A `bench-system` feature rebuilds the *same*
 binaries on Rust's `System` (glibc) allocator, and `benchmark/run.sh` adds the
 mimalloc-c peak (original C bench + `src/static.c -O3 -flto`) for a 3-way table:
@@ -69,17 +70,23 @@ mimalloc-bench binaries (i7-14700K, cores 2–9, 8T, median):
 
 | pattern | mimalloc-rs / glibc | mimalloc-c / glibc |
 |---|---|---|
-| xmalloc-test (producer/consumer cross-thread free) | **3.9×** | **4.8×** |
-| alloc-test (fast path) | **1.27×** | **1.27×** |
-| larson (server MT) | **1.19×** | 1.04× |
-| malloc-large (5–25 MiB) | **0.95×** | 1.11× |
-| cache-thrash (false-share, 1 B) | **0.82×** | 1.00× |
+| xmalloc-test (producer/consumer cross-thread free) | **3.8×** | **4.9×** |
+| alloc-test (fast path) | **1.17×** | **1.28×** |
+| larson (server MT) | **1.20×** | 1.08× |
+| malloc-large (5–25 MiB) | **0.97×** | 1.11× |
+| cache-thrash (false-share, 1 B) | **0.91×** | 1.00× |
+| calloc-test (zeroed + touch) | **0.88×** | 1.00× |
+| realloc-test (grow churn) | **0.86×** | 0.86× |
 
 mimalloc-rs and mimalloc-c are in the same league vs glibc; the big shared win is
-xmalloc-test (cross-thread free). mimalloc-rs is **slower than glibc** on
-malloc-large and cache-thrash (where mimalloc-c stays ≥ glibc) — genuine rs weak
-spots. See `benchmark/README.md` for per-bench detail, the methodology, and the
-caveat about not static-linking `static.c` (it silently makes the C column glibc).
+xmalloc-test (cross-thread free). rs sits at or just under glibc on malloc-large,
+cache-thrash, calloc, and realloc — and tracks mimalloc-c there (e.g. realloc
+0.86× = mi-c), so these are not Rust-specific costs. `calloc_test`/`realloc_test`
+have no upstream C bench, so their mimalloc-c column is the *same* system binary
+under `LD_PRELOAD` of a real mimalloc `.so`. `calloc_test` **touches every page**
+so the kernel's first-touch faulting (the real cost) is counted rather than hidden
+behind never-used zeroed memory. See `benchmark/README.md` for the coverage matrix,
+per-bench detail, and the caveat about not static-linking `static.c`.
 
 ## Criterion micro-benchmarks
 
