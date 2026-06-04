@@ -28,6 +28,8 @@ vs C v3.3.2 in CI) plus loom, Miri (strict-provenance), and TSan.
 | Lazy page extend (capacity vs reserved), bounded batch | `page.c` `mi_page_extend_free` | `page.rs::extend_free` |
 | Delayed purge (`MADV_DONTNEED`) with per-arena purge bitmap + expiry | `arena.c` purge | `arena.rs`, `os.rs::purge_ex` |
 | Delayed retire: `retire_expire` countdown on emptied sole pages + `collect_retired` cadence | `page.c:422-496` | `page.rs` `retire_expire`, `heap.rs::collect_retired` |
+| `mi_heap_t` / `mi_theap_t` split: logical heap vs thread-local execution; `page->theap`; per-heap theaps list | `types.h:504-577`, `page.c:696`, `theap.c` | `heap.rs` `Heap` / `ThreadHeap`, `Page.theap` |
+| True shared first-class heap: per-thread theap via `mi_heap_get_theap`, refcounted lifecycle | `theap.c`, `types.h:507` | `heap.rs` `theap_for`/`refcount`, `init.rs` registry |
 | Size→bin mapping, `MI_BIN_HUGE=73`/`FULL=74`/`COUNT=75`, `MI_SMALL_MAX_OBJ_SIZE=10240` | `types.h`, `page-queue.c` | `bits.rs`, `page_queue.rs` |
 | Option table + `MIMALLOC_*` env, v3 defaults (`purge_delay=1000`, …) | `options.c` | `options.rs` |
 | Secure/debug hardening: invalid/double-free detection, abort gate | `free.c` | `heap.rs` (`#[cfg(secure/debug)]`) |
@@ -63,15 +65,16 @@ vs C v3.3.2 in CI) plus loom, Miri (strict-provenance), and TSan.
 | Divergence | v3 behavior | mimalloc-rs | Rationale |
 |---|---|---|---|
 | **Full-page eviction** | full pages are abandoned out of the bin queue (`page_full_retain`) so cross-thread freers can claim them | not ported | It only paid off for the `LD_PRELOAD`/C-replacement build (it regresses the single/intra-thread small-alloc path with no contention to relieve); that build lives on the `export` branch. Thread-exit abandon + reclaim-on-alloc remain. |
-| **TLS storage** | `__thread mi_heap_t*` pointer; heap allocated out of line | whole `Heap` stored inline in TLS | Faster for the static `#[global_allocator]` (direct TLS address, no deref); an out-of-line pointer cache was measured and showed no win. |
+| **TLS storage** | `__thread mi_theap_t*` pointer; theap allocated out of line | whole default `ThreadHeap` stored inline in TLS | Faster for the static `#[global_allocator]` (direct TLS address, no deref); an out-of-line pointer cache was measured and showed no win. |
 | **subproc / NUMA / Windows·macOS** | full multi-subproc, all platforms | single main subproc, Linux-first | Scoped for v1; follow-up. |
 
 ## 4. Summary
 
 The core v3 design — segment-less arenas, free-list sharding, the flag-folded
 free fast path, ownership-tagged cross-thread frees, the O(1) collect, delayed
-purge, delayed retire (`retire_expire` + `collect_retired` cadence), and
-abandoned-page reclaim — is ported faithfully and verified
+purge, delayed retire (`retire_expire` + `collect_retired` cadence), the
+`mi_heap_t` / `mi_theap_t` split with true cross-thread shared first-class heaps,
+and abandoned-page reclaim — is ported faithfully and verified
 differentially against C v3.3.2. The port leans on Rust's type system, RAII,
 strict provenance, and compile-time evaluation where they are strict
 improvements, and documents each divergence. Built as a Rust-native static
