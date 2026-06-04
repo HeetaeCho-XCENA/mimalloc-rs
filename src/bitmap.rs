@@ -621,6 +621,7 @@ mod tests {
         let (cm, chunks) = make(2);
         let bm = Bitmap::from_parts(&cm, &chunks);
         // mark everything free
+        // SAFETY: single-threaded test; `bm` is exclusively owned here.
         unsafe { bm.unsafe_set_n(0, bm.max_bits()) };
         assert_eq!(bm.popcount(), bm.max_bits());
         let a = bm.try_find_and_clear(0).unwrap();
@@ -635,6 +636,7 @@ mod tests {
     fn contiguous_run_within_field() {
         let (cm, chunks) = make(1);
         let bm = Bitmap::from_parts(&cm, &chunks);
+        // SAFETY: single-threaded test; `bm` is exclusively owned here.
         unsafe { bm.unsafe_set_n(0, CHUNK_BITS) };
         let idx = bm.try_find_and_clear_n(8, 0).unwrap();
         assert!(bm.is_clear_n(idx, 8));
@@ -647,6 +649,7 @@ mod tests {
     fn contiguous_run_spanning_fields() {
         let (cm, chunks) = make(1);
         let bm = Bitmap::from_parts(&cm, &chunks);
+        // SAFETY: single-threaded test; `bm` is exclusively owned here.
         unsafe { bm.unsafe_set_n(0, CHUNK_BITS) };
         // allocate one field, then a 64-bit run must straddle into the next field
         let _ = bm.try_find_and_clear_n(FIELD_BITS, 0).unwrap();
@@ -658,6 +661,7 @@ mod tests {
     fn full_then_empty() {
         let (cm, chunks) = make(1);
         let bm = Bitmap::from_parts(&cm, &chunks);
+        // SAFETY: single-threaded test; `bm` is exclusively owned here.
         unsafe { bm.unsafe_set_n(0, CHUNK_BITS) };
         // allocate all single bits
         let mut seen = Vec::new();
@@ -677,6 +681,7 @@ mod tests {
     fn huge_cross_chunk_run() {
         let (cm, chunks) = make(3);
         let bm = Bitmap::from_parts(&cm, &chunks);
+        // SAFETY: single-threaded test; `bm` is exclusively owned here.
         unsafe { bm.unsafe_set_n(0, bm.max_bits()) };
         let n = CHUNK_BITS + 100; // spans two chunks
         let idx = bm.try_find_and_clear_n(n, 0).unwrap();

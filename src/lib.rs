@@ -24,14 +24,27 @@
 //!
 //! ## Unsafe policy
 //!
-//! `#![forbid(unsafe_code)]` is impossible for an allocator. Instead:
-//! * `unsafe` is confined to the low-level cores (`atomic`, `bitmap`,
-//!   `free_list`, `page_map`, `os`, `prim`) and the public API shims.
-//! * Every `unsafe` block carries a `// SAFETY:` comment justifying it.
-//! * The allocation fast paths are **panic-free**: out-of-memory returns
-//!   `None`/null; internal invariant violations `abort()` rather than unwind.
-//! * Pointer/integer round-trips use the strict-provenance APIs
-//!   (`with_addr`, `map_addr`, `expose_provenance`, `with_exposed_provenance`).
+//! `#![forbid(unsafe_code)]` is impossible for an allocator, and the `unsafe`
+//! surface is largely **irreducible** — it marks the invariants the engine
+//! upholds that the type system cannot. The goal is not *few* `unsafe` blocks
+//! but that **every one is necessary and `// SAFETY:`-justified**. The
+//! irreducible `unsafe` is of four kinds:
+//! * **Owner-exclusive interior mutability** — a [`page::Page`]'s owner-only
+//!   fields are `Cell` (`free`/`local_free`/`used`/…); the owning thread has
+//!   exclusive access, which `Cell: !Sync` cannot prove, so the mutators are
+//!   `unsafe fn`. (A shared `&Page` is itself sound — every field is
+//!   `Cell`/atomic — so derefs are hoisted to one borrow per scope.)
+//! * **OS / FFI** — `prim`/`os` wrap libc; the `Prim` methods are `unsafe fn`
+//!   by contract (mirroring the C `prim.h`).
+//! * **Free-list / page-map pointer encoding** — `free_list`/`page_map` encode
+//!   and traverse raw block/page pointers (strict-provenance preserved).
+//! * **Atomics over OS-backed storage** — `bitmap`/`arena` view OS bytes as
+//!   atomics via `from_raw_parts`.
+//!
+//! Every `unsafe` block carries a `// SAFETY:` comment; the allocation fast
+//! paths are **panic-free** (OOM → `None`/null, invariant violations `abort()`
+//! rather than unwind); pointer/integer round-trips use the strict-provenance
+//! APIs (`with_addr`, `map_addr`, `expose_provenance`, `with_exposed_provenance`).
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(feature = "nightly", feature(allocator_api))]
