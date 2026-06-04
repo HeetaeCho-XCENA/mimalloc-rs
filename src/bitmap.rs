@@ -88,6 +88,12 @@ fn bf_find_and_clear_run(a: &AtomicUsize, n: usize) -> Option<usize> {
     let m = mask_n(n);
     let mut old = load_relaxed(a);
     loop {
+        // Cheap reject: a field without `n` set bits cannot hold an `n`-run.
+        // Keeps full / near-full fields O(1) as the arena fills, instead of
+        // scanning every shift only to fail.
+        if (old as u64).count_ones() < n as u32 {
+            return None;
+        }
         // Find a shift where `n` contiguous bits are set.
         let mut shift = 0usize;
         let mut found = None;
@@ -256,6 +262,18 @@ impl BChunk {
             }
             // A run of n<=64 could still straddle a field boundary; fall through
             // to the general scan to catch that case.
+        }
+        // The spanning scan below is O(CHUNK_BITS); only attempt it when the
+        // chunk holds at least `n` free bits in total (cheap popcount). A
+        // near-full chunk that can never satisfy `n` is rejected here instead of
+        // being bit-walked on every allocation as the arena fills.
+        let free: u32 = self
+            .fields
+            .iter()
+            .map(|a| load_acquire(a).count_ones())
+            .sum();
+        if (free as usize) < n {
+            return None;
         }
         self.find_and_clear_n_spanning(n)
     }
@@ -641,6 +659,44 @@ mod tests {
         let _ = bm.try_find_and_clear_n(FIELD_BITS, 0).unwrap();
         let idx = bm.try_find_and_clear_n(FIELD_BITS, 0).unwrap();
         assert!(bm.is_clear_n(idx, FIELD_BITS));
+    }
+
+    // The popcount fast-rejects (per-field and the spanning guard) must never
+    // hide a genuinely available run: a near-full chunk whose only free space is
+    // a run straddling a field boundary must still be found.
+    #[test]
+    fn near_full_spanning_run_still_found() {
+        let (cm, chunks) = make(1);
+        let bm = Bitmap::from_parts(&cm, &chunks);
+        // SAFETY: single-threaded test; `bm` is exclusively owned here.
+        unsafe { bm.unsafe_set_n(0, CHUNK_BITS) };
+        // Carve everything, then free a 10-bit run straddling the first field
+        // boundary (bits 60..70) — total free (10) == n, so the spanning guard
+        // must not reject it.
+        for _ in 0..CHUNK_BITS {
+            bm.try_find_and_clear(0).unwrap();
+        }
+        bm.set_n(60, 10);
+        assert_eq!(bm.popcount(), 10);
+        let idx = bm
+            .try_find_and_clear_n(10, 0)
+            .expect("spanning run must be found");
+        assert_eq!(idx, 60);
+        assert!(bm.try_find_and_clear_n(10, 0).is_none()); // now truly exhausted
+    }
+
+    // Enough free bits in total, but never `n` contiguous ⇒ correctly None
+    // (the guard only short-circuits the scan; it must not invent a run).
+    #[test]
+    fn scattered_free_bits_no_run() {
+        let (cm, chunks) = make(1);
+        let bm = Bitmap::from_parts(&cm, &chunks);
+        // Set every 4th bit: 128 free bits, but no 2 adjacent.
+        for i in (0..CHUNK_BITS).step_by(4) {
+            bm.set_n(i, 1);
+        }
+        assert_eq!(bm.popcount(), CHUNK_BITS / 4);
+        assert!(bm.try_find_and_clear_n(2, 0).is_none());
     }
 
     #[test]

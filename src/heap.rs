@@ -37,6 +37,13 @@ const BIN_SIZES: [usize; MI_BIN_COUNT] = {
     t
 };
 
+/// Smallest zeroed allocation that consults the serving page's zero state
+/// instead of always memset-ing. Below one OS page a straight memset is cheaper
+/// than the page-map lookup; at or above it, skipping a redundant full-block
+/// zero (when the page is still OS-zero) is the larger win. See
+/// [`Heap::alloc_zeroed`].
+const ZERO_VIA_PAGE_MIN: usize = 4096;
+
 /// Block size for a (non-huge) bin.
 #[inline]
 fn bin_block_size(b: usize) -> usize {
@@ -274,13 +281,13 @@ impl Heap {
         Some(unsafe { NonNull::new_unchecked(p.as_ptr().with_addr(aligned)) })
     }
 
-    /// Allocate `size` zeroed bytes. Large/huge blocks consult the serving
-    /// page's zero state to skip re-zeroing memory the OS already cleared
-    /// (ports the `free_is_zero` fast path of `_mi_page_malloc_zero`); small
-    /// blocks just memset, where that is cheaper than the page-map lookup.
+    /// Allocate `size` zeroed bytes. Blocks past [`ZERO_VIA_PAGE_MIN`] consult
+    /// the serving page's zero state to skip re-zeroing memory the OS already
+    /// cleared (ports the `free_is_zero` fast path of `_mi_page_malloc_zero`);
+    /// smaller blocks just memset, where that beats the page-map lookup.
     pub fn alloc_zeroed(&self, size: usize) -> Option<NonNull<u8>> {
         let p = self.alloc(size)?;
-        if size > MI_MEDIUM_MAX_OBJ_SIZE {
+        if size > ZERO_VIA_PAGE_MIN {
             let page = page_map::lookup(p.addr().get()) as *const Page;
             debug_assert!(!page.is_null(), "just-allocated block must be mapped");
             // SAFETY: a just-allocated block is registered; `p` is its start.
