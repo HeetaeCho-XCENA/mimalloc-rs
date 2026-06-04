@@ -54,8 +54,8 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
-      # Lint the stable-compatible feature surface too (C API, hardening, stats).
-      - run: cargo clippy --all-targets --features capi,secure,debug,stats,track -- -D warnings
+      # Lint the stable-compatible feature surface too (hardening, stats).
+      - run: cargo clippy --all-targets --features secure,debug,stats,track -- -D warnings
 
   # Undefined-behavior / strict-provenance checks on the pure-logic modules
   # (the OS-backed paths use real mmap and can't run under Miri).
@@ -72,16 +72,6 @@ jobs:
       - run: cargo miri test --lib free_list
       - run: cargo miri test --lib layout
       - run: cargo miri test --lib bits
-
-  # Transparent LD_PRELOAD override: build the cdylib and verify an unmodified
-  # C program uses our allocator (mi_is_in_heap_region) and common binaries run.
-  preload:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Run LD_PRELOAD verification
-        run: bash scripts/preload-check.sh
 
   # Concurrency model checking (bitmap CAS + xthread_free MPSC).
   loom:

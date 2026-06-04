@@ -18,10 +18,10 @@
 - [ ] Miri (`cargo +nightly miri test --lib …`) — if pure-logic/provenance touched
 - [ ] differential (`MIMALLOC_C_LIB=<dir> cargo test --features differential --test differential`)
 - [ ] secure+debug abort gate clean
-- [ ] **perf**: no regression on any `bench_suite` phase (pinned machine) — *required for perf-affecting changes*; paste `scripts/perf_compare.sh` output:
+- [ ] **perf**: no regression (pinned machine) — *required for perf-affecting changes*; build `examples/stress` on this branch and `main`, interleave, paste medians:
 
 ```
-<perf_compare.sh output, or "N/A — no perf-affecting change">
+<stress branch-vs-main medians, or "N/A — no perf-affecting change">
 ```
 
 ## Notes / caveats

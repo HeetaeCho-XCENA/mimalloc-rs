@@ -257,9 +257,9 @@ pub use lifecycle::{
     thread_init, DeferredFreeFun,
 };
 
-/// Serializes tests that mutate the process-global deferred-free registry
-/// (here and in `capi`), so concurrent test threads don't overwrite each
-/// other's registration. Test-only; no effect on the shipped allocator.
+/// Serializes tests that mutate the process-global deferred-free registry so
+/// concurrent test threads don't overwrite each other's registration.
+/// Test-only; no effect on the shipped allocator.
 #[cfg(all(test, feature = "std"))]
 pub(crate) static DEFERRED_REG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -272,15 +272,6 @@ pub unsafe fn realloc(
     ptr: core::ptr::NonNull<u8>,
     new_size: usize,
 ) -> Option<core::ptr::NonNull<u8>> {
-    // Foreign pointer (allocated by the system allocator): realloc it with the
-    // real system realloc rather than treating it as one of ours.
-    #[cfg(all(feature = "override", feature = "std"))]
-    if !crate::heap::is_in_heap_region(ptr.as_ptr()) {
-        // SAFETY: not in our heap region ⇒ `ptr` is a live system allocation.
-        let p =
-            unsafe { crate::sysalloc::realloc(ptr.as_ptr() as *mut core::ffi::c_void, new_size) };
-        return core::ptr::NonNull::new(p as *mut u8);
-    }
     // SAFETY: ptr is a live allocation.
     let old = unsafe { crate::heap::usable_size(ptr) };
     if new_size <= old {
@@ -305,17 +296,6 @@ pub unsafe fn realloc_aligned(
     new_size: usize,
     align: usize,
 ) -> Option<core::ptr::NonNull<u8>> {
-    // Foreign pointer under override: realloc of a foreign pointer ignores the
-    // alignment refinement and just system-reallocs (the system allocator's own
-    // alignment guarantees apply); we cannot relocate a block we do not own.
-    #[cfg(all(feature = "override", feature = "std"))]
-    if !crate::heap::is_in_heap_region(ptr.as_ptr()) {
-        let _ = align;
-        // SAFETY: not in our heap region ⇒ `ptr` is a live system allocation.
-        let p =
-            unsafe { crate::sysalloc::realloc(ptr.as_ptr() as *mut core::ffi::c_void, new_size) };
-        return core::ptr::NonNull::new(p as *mut u8);
-    }
     // SAFETY: ptr is a live allocation.
     let old = unsafe { crate::heap::usable_size(ptr) };
     let np = malloc_aligned(new_size, align)?;

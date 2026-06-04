@@ -539,11 +539,9 @@ impl Page {
     /// Allocate one block, or `None` if the page is full.
     ///
     /// Fast path: pop the head of `free`. When `free` is empty the refill
-    /// (collect cross-thread frees, then lazily extend) lives in [`Page::alloc_slow`],
-    /// kept out of line **only in the preload cdylib** (`cfg(override_export)`) so
-    /// this shell inlines across the export boundary — mirroring C's force-inlined
-    /// `mi_page_malloc_zero` over the noinline generic refill. In a static build the
-    /// optimizer folds `alloc_slow` back in (no forced call on the refill path).
+    /// (collect cross-thread frees, then lazily extend) lives in [`Page::alloc_slow`]
+    /// — mirroring C's force-inlined `mi_page_malloc_zero` over the noinline generic
+    /// refill. The optimizer folds `alloc_slow` back in (no forced call on the refill path).
     #[inline]
     pub fn alloc(&self) -> Option<NonNull<u8>> {
         let b = self.free.get();
@@ -556,8 +554,7 @@ impl Page {
 
     /// Cold refill path: `free` was empty, so reclaim local/cross-thread frees
     /// and, if still empty, initialize the next batch of blocks on demand.
-    /// (`#[cold]` only in the preload cdylib; see [`Page::alloc`].)
-    #[cfg_attr(override_export, cold)]
+    /// (See [`Page::alloc`].)
     fn alloc_slow(&self) -> Option<NonNull<u8>> {
         // SAFETY: owner path — reclaim any local/cross-thread frees first.
         unsafe { self.collect() };
