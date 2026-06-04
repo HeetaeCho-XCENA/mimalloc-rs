@@ -27,17 +27,8 @@ debug = []
 stats = []
 # Valgrind/ASan tracking hooks (mirrors track.h); no-op when off.
 track = []
-# Export the C-ABI `mi_*` symbols (#[no_mangle] extern "C"); requires `std`.
-# Off by default to avoid symbol clashes when used as an ordinary Rust crate.
-capi = ["std"]
 # Differential test harness against the C libmimalloc (set MIMALLOC_C_LIB).
 differential = ["std"]
-# Transparent malloc/free override (LD_PRELOAD). Exports the standard libc
-# symbols (plain `malloc`/`free`/… — Phase N) plus the `mi_*` symbols, and routes
-# foreign pointers (not allocated by us) to the real system allocator instead of
-# leaking/aborting. Pulls in `capi` so the shared `mi_*` forwarding logic is
-# always compiled in. Requires std. Off by default.
-override = ["std", "capi"]
 
 [dependencies]
 # Stable `Allocator` trait. On nightly we additionally impl `core::alloc::Allocator`.
@@ -70,9 +61,7 @@ harness = false
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 # `--cfg loom` is set manually when running concurrency models.
-# `--cfg override_export` is set (with --features override) only for the
-# deliberately built LD_PRELOAD cdylib/staticlib; never by cargo test/build.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(have_c_mimalloc)', 'cfg(override_export)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(have_c_mimalloc)'] }
 
 [profile.release]
 lto = true

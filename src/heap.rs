@@ -198,13 +198,10 @@ impl Heap {
     /// (`pages_free_direct`), which usually still has a free block. The cold
     /// queue-scan / reclaim / fresh-page work lives in `alloc_generic`.
     ///
-    /// `alloc_generic` is marked `#[cold]` **only in the preload `cdylib` build**
-    /// (`cfg(override_export)`): there the fast shell must stay small so it inlines
-    /// across the export-symbol boundary into `malloc`/`operator new` (mirroring
-    /// C's force-inlined `mi_page_malloc_zero` over the noinline `_mi_malloc_generic`).
-    /// In a statically-linked `#[global_allocator]` build the caller sees the whole
-    /// chain and inlines holistically, so we leave `alloc_generic` un-hinted and let
-    /// the optimizer fold it back in — forcing it out of line there measurably
+    /// `alloc_generic` is left un-hinted: the statically-linked `#[global_allocator]`
+    /// caller sees the whole chain and inlines holistically (mirroring C's
+    /// force-inlined `mi_page_malloc_zero` over the noinline `_mi_malloc_generic`),
+    /// so we let the optimizer fold it back in — forcing it out of line measurably
     /// regresses the small-alloc hot path (phase 1).
     #[inline]
     fn alloc_impl(&self, size: usize) -> Option<NonNull<u8>> {
@@ -226,8 +223,7 @@ impl Heap {
 
     /// Cold allocation path: no direct page was available — map the size to its
     /// bin and scan the bin queue, reclaim an abandoned page, or carve a fresh
-    /// one. (`#[cold]` only in the preload cdylib; see `alloc_impl`.)
-    #[cfg_attr(override_export, cold)]
+    /// one. (See `alloc_impl`.)
     fn alloc_generic(&self, size: usize, wsize: usize) -> Option<NonNull<u8>> {
         let b = bin(size);
         if b >= MI_BIN_HUGE {
@@ -477,41 +473,19 @@ pub fn is_in_heap_region(ptr: *const u8) -> bool {
     !ptr.is_null() && subproc_main().owns_address(ptr)
 }
 
-/// Cold free path for a pointer with no page-map entry: it is either genuinely
-/// foreign (system malloc, the linker, TLS) or one of *ours* whose page was
-/// retired/unregistered (a double-free, a free racing a concurrent retire, or
-/// freeing an already-reclaimed block). Disambiguate by arena membership —
-/// arenas are never unmapped, so an our-arena address with a cleared page-map
-/// entry is still ours and must NOT go to the system allocator (glibc would
-/// abort with "free(): invalid pointer"). Out of line in the preload cdylib so
-/// the common free path inlines into the exported entry point.
+/// Cold free path for a pointer with no page-map entry. In a rust-native global
+/// allocator such a pointer is always *ours* whose page was retired/unregistered
+/// (a double-free, a free racing a concurrent retire, or freeing an
+/// already-reclaimed block) — never foreign, since every pointer reaching this
+/// allocator's `free` originated from its `alloc`. Arenas are never unmapped, so
+/// the block is still inside one of our arenas.
 ///
 /// # Safety
 /// `ptr` was passed to `free` and has no page-map entry.
-#[cfg_attr(override_export, cold)]
-// The early `return` after handing a foreign pointer to the system free is
-// needed only when `secure`/`debug` is also on (otherwise control would fall
-// through to the abort); in the `override`-only config it is the last statement,
-// which clippy flags — but it is genuinely cfg-conditional, so allow it.
-#[allow(clippy::needless_return)]
 unsafe fn free_foreign_or_invalid(ptr: NonNull<u8>) {
-    // `ptr` is consumed below only in the `override`+`std` configuration; tie it
-    // off up front so every feature combination (e.g. `secure`/`debug` without
-    // `override`, where only the abort path runs) keeps it "used". `NonNull` is
-    // `Copy`, so the later reads are unaffected, and being first this is never
-    // unreachable after the diverging abort.
     let _ = ptr;
-    #[cfg(all(feature = "override", feature = "std"))]
-    if !subproc_main().owns_address(ptr.as_ptr()) {
-        // Genuinely foreign pointer: hand it back to the real system free.
-        // SAFETY: not in any of our arenas ⇒ it is a system allocation safe
-        // to hand to the real libc free.
-        unsafe { crate::sysalloc::free(ptr.as_ptr() as *mut core::ffi::c_void) };
-        return;
-    }
-    // Ours-but-unmapped (or, in non-override builds, any unmapped pointer): an
-    // invalid/double free of one of our blocks. Default builds treat it as a
-    // no-op; hardened builds abort. Never forward it to the system.
+    // Ours-but-unmapped: an invalid/double free of one of our blocks. Default
+    // builds treat it as a no-op; hardened builds abort.
     #[cfg(any(feature = "secure", feature = "debug"))]
     report_corruption_and_abort(
         "mimalloc-rs: invalid free (pointer not owned by this allocator)\n",
@@ -625,11 +599,10 @@ unsafe fn recover_block_start(page_ptr: *mut Page, p: NonNull<u8>, bs: usize) ->
 /// Cold free paths split out of [`free`] so the common local free stays a tight
 /// near-leaf: an **owner** free into a full / interior-flagged page (`xtid` within
 /// the flag mask), or a **cross-thread / abandoned-page** free (`xtid` above the
-/// mask). Ports the non-fast arms of `mi_free_ex` (`free.c:185-205`). Marked
-/// `cold` only in the preload cdylib (`override_export`); a static
-/// `#[global_allocator]` build lets the optimizer fold it back holistically.
+/// mask). Ports the non-fast arms of `mi_free_ex` (`free.c:185-205`). Left
+/// un-hinted; a static `#[global_allocator]` build lets the optimizer fold it
+/// back holistically.
 #[cfg(feature = "std")]
-#[cfg_attr(override_export, cold)]
 unsafe fn free_cold(ptr: NonNull<u8>, page_ptr: *mut Page, xtid: usize) {
     // SAFETY: live header; const field read.
     let bs = unsafe { Page::raw_block_size(page_ptr) };
@@ -935,16 +908,8 @@ impl Drop for Heap {
 pub unsafe fn usable_size(ptr: NonNull<u8>) -> usize {
     let page_ptr = page_map::lookup(ptr.addr().get()) as *mut Page;
     if page_ptr.is_null() {
-        // Null page-map lookup is ambiguous (see `free`): disambiguate by arena
-        // membership. A genuinely foreign pointer reports the system usable
-        // size; an our-arena pointer with a cleared page-map entry is not a
-        // live block, so it has no usable size (0) — never query the system
-        // allocator about a pointer it does not own.
-        #[cfg(all(feature = "override", feature = "std"))]
-        if !subproc_main().owns_address(ptr.as_ptr()) {
-            // SAFETY: not in any of our arenas ⇒ `ptr` is a system allocation.
-            return unsafe { crate::sysalloc::usable_size(ptr.as_ptr() as *mut core::ffi::c_void) };
-        }
+        // A null page-map lookup means `ptr` is not a live block of ours (its
+        // page was retired/unregistered), so it has no usable size.
         return 0;
     }
     // SAFETY: valid page header; const fields read via raw projection.
@@ -1350,72 +1315,4 @@ mod tests {
     }
 
     extern crate alloc;
-}
-
-#[cfg(all(test, feature = "override", feature = "std"))]
-mod override_tests {
-    use super::*;
-
-    #[test]
-    fn foreign_free_is_forwarded_not_aborted() {
-        // A block from the REAL system allocator is foreign to us. Freeing it
-        // through our path must forward to system free (never leak/abort) — the
-        // test simply completing is the proof.
-        // SAFETY: standard libc usage.
-        unsafe {
-            let p = libc::malloc(64) as *mut u8;
-            assert!(!p.is_null());
-            assert!(!is_in_heap_region(p), "system block must be foreign");
-            // touch the block to prove it is real, valid memory
-            core::ptr::write_bytes(p, 0xAB, 64);
-            assert_eq!(*p, 0xAB);
-            // our free forwards foreign pointers to the real system free
-            free(NonNull::new(p).unwrap());
-
-            // One of ours behaves normally.
-            let h = Heap::new(crate::init::process_keys(), crate::init::current_tid());
-            let q = h.alloc(64).unwrap();
-            assert!(is_in_heap_region(q.as_ptr()), "our block must be in-region");
-            free(q);
-        }
-    }
-
-    #[test]
-    fn foreign_realloc_is_forwarded() {
-        // A system block reallocated through our path must go to system realloc:
-        // non-null, contents preserved. The result is a system pointer, so our
-        // free forwards it back to the system allocator.
-        // SAFETY: standard libc usage.
-        unsafe {
-            let p = libc::malloc(32) as *mut u8;
-            assert!(!p.is_null());
-            for i in 0..32usize {
-                *p.add(i) = (i as u8).wrapping_mul(7);
-            }
-            let np = crate::init::realloc(NonNull::new(p).unwrap(), 128)
-                .expect("system realloc must return non-null");
-            let np = np.as_ptr();
-            for i in 0..32usize {
-                assert_eq!(*np.add(i), (i as u8).wrapping_mul(7), "pattern preserved");
-            }
-            assert!(
-                !is_in_heap_region(np),
-                "reallocated block is still a system pointer"
-            );
-            // free the (system) result via our forwarding path
-            free(NonNull::new(np).unwrap());
-        }
-    }
-
-    #[test]
-    fn foreign_usable_size_is_forwarded() {
-        // SAFETY: standard libc usage.
-        unsafe {
-            let p = libc::malloc(48) as *mut u8;
-            assert!(!p.is_null());
-            let sz = usable_size(NonNull::new(p).unwrap());
-            assert!(sz >= 48, "system usable_size must cover the request: {sz}");
-            free(NonNull::new(p).unwrap());
-        }
-    }
 }

@@ -9,10 +9,9 @@
 //! ```
 //! These measure the allocator's own alloc/free cost across size classes and a
 //! few realistic patterns, with mean/median/CI/outlier stats — good for *local*
-//! micro-regression tracking on one machine. For end-to-end comparison against
-//! the C reference / system allocator, use `examples/bench_suite.rs` +
-//! `scripts/perf_compare.sh` (pinned-machine, authoritative) and
-//! `scripts/mimalloc-bench.sh` (the standard cross-allocator suite).
+//! micro-regression tracking on one machine. For the official `test-stress`
+//! workload at peak (rs as a static `#[global_allocator]`), see
+//! `examples/stress.rs`.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use mimalloc_rs::{free, malloc};
