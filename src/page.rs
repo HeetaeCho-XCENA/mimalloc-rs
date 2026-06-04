@@ -144,6 +144,75 @@ impl Page {
         }
     }
 
+    /// Initialize a **huge** page whose header lives *off* the data slice (in
+    /// metadata memory at `hdr`), with the whole slice region as the single
+    /// block (`block_start = 0`). Because the allocator never writes into the
+    /// region, allocating a huge block cannot fault it — and so cannot make THP
+    /// zero multi-MiB the OS already handed us (ports the
+    /// `MI_PAGE_META_IS_SEPARATED` path, arena.c:855-876).
+    ///
+    /// # Safety
+    /// `hdr` points at a zeroed `size_of::<Page>()` metadata block; `slice_base`
+    /// points at `slice_count` committed slices not otherwise in use;
+    /// `block_size >= MI_INTPTR_SIZE`.
+    pub unsafe fn init_huge(
+        hdr: NonNull<u8>,
+        slice_base: NonNull<u8>,
+        slice_index: usize,
+        slice_count: usize,
+        block_size: usize,
+        keys: [usize; 2],
+        is_zero: bool,
+    ) -> NonNull<Page> {
+        debug_assert!(block_size >= MI_INTPTR_SIZE);
+        let hdr = hdr.as_ptr() as *mut Page;
+        // SAFETY: writing a freshly-typed header into zeroed metadata memory.
+        unsafe {
+            hdr.write(Page {
+                xthread_id: AtomicUsize::new(0),
+                free: Cell::new(core::ptr::null_mut()),
+                local_free: Cell::new(core::ptr::null_mut()),
+                xthread_free: AtomicPtr::new(core::ptr::without_provenance_mut(TF_OWNED)),
+                used: Cell::new(0),
+                // One block, served directly — never threaded onto a free list.
+                capacity: Cell::new(1),
+                reserved: 1,
+                block_size,
+                page_start: slice_base.as_ptr(),
+                keys,
+                next: Cell::new(core::ptr::null_mut()),
+                prev: Cell::new(core::ptr::null_mut()),
+                slice_index,
+                slice_count,
+                heap: Cell::new(core::ptr::null_mut()),
+                arena: Cell::new(core::ptr::null_mut()),
+                bin: Cell::new(0),
+                free_is_zero: Cell::new(is_zero),
+            });
+            NonNull::new_unchecked(hdr)
+        }
+    }
+
+    /// Serve the single block of a freshly-initialized huge page directly,
+    /// without threading it onto a free list — so the data slice stays
+    /// untouched. Returns the block start.
+    ///
+    /// # Safety
+    /// Owner-only; `self` is a fresh huge page from [`Page::init_huge`]
+    /// (`used == 0`).
+    #[inline]
+    pub unsafe fn serve_huge(&self) -> NonNull<u8> {
+        self.used.set(1);
+        // SAFETY: `page_start` is the start of the single committed block.
+        unsafe { NonNull::new_unchecked(self.page_start) }
+    }
+
+    /// Is this a huge page (its header is off-slice; see [`Page::init_huge`])?
+    #[inline]
+    pub fn is_huge(&self) -> bool {
+        self.bin.get() as usize == crate::bits::MI_BIN_HUGE
+    }
+
     /// Extend the free list from uninitialized capacity, in a bounded batch
     /// (ports `mi_page_extend_free`).
     ///
@@ -527,14 +596,20 @@ impl Page {
     /// `p` must be a block just returned by `self.alloc()` (block start).
     #[inline]
     pub unsafe fn zero_block(&self, p: NonNull<u8>) {
-        let n = if self.free_is_zero.get() {
-            core::mem::size_of::<Block>()
+        if self.free_is_zero.get() {
+            // A huge block is served directly (never threaded), so even its
+            // first word is untouched OS-zero — writing anything would fault
+            // (and THP-zero) the slice, so leave it entirely. Other pages only
+            // dirtied the free-list link word.
+            if self.is_huge() {
+                return;
+            }
+            // SAFETY: a freshly popped block is ≥ `size_of::<Block>()` bytes.
+            unsafe { core::ptr::write_bytes(p.as_ptr(), 0, core::mem::size_of::<Block>()) };
         } else {
-            self.block_size
-        };
-        // SAFETY: `p` is a live block spanning at least `block_size` bytes, and
-        // `n <= block_size`.
-        unsafe { core::ptr::write_bytes(p.as_ptr(), 0, n) };
+            // SAFETY: `p` spans the full block.
+            unsafe { core::ptr::write_bytes(p.as_ptr(), 0, self.block_size) };
+        }
     }
 
     /// Mark this page's free blocks as no longer guaranteed-zero (e.g. after a
