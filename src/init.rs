@@ -217,6 +217,98 @@ pub use lifecycle::{
     thread_init, DeferredFreeFun,
 };
 
+// Per-thread registry of on-demand theaps for first-class shared heaps (ports
+// v3's dynamic per-heap thread-local theaps, `mi_heap_get_theap`/`theap.c`). One
+// `ThreadHeap` per (thread, first-class heap), created on first use and torn down
+// at thread exit. The process default heap is reached through `DEFAULT_THEAP` and
+// is NOT in this registry.
+#[cfg(feature = "std")]
+mod theaps {
+    use super::current_tid;
+    use crate::heap::{teardown_theap, Heap, ThreadHeap};
+    use core::cell::Cell;
+
+    /// Head of this thread's on-demand theaps, linked by `ThreadHeap::tnext`.
+    struct Registry(Cell<*mut ThreadHeap>);
+
+    impl Drop for Registry {
+        fn drop(&mut self) {
+            let mut cur = self.0.get();
+            self.0.set(core::ptr::null_mut());
+            while !cur.is_null() {
+                // SAFETY: the registry holds live on-demand theaps owned by this
+                // thread; read `tnext` before tearing the theap down.
+                let next = unsafe { (*cur).tnext() };
+                unsafe { teardown_theap(cur) };
+                cur = next;
+            }
+        }
+    }
+
+    std::thread_local! {
+        static THEAPS: Registry = const { Registry(Cell::new(core::ptr::null_mut())) };
+    }
+
+    /// This thread's theap for `heap`, created + registered on first use. Null on
+    /// metadata OOM or if called during this thread's TLS teardown.
+    pub fn theap_for(heap: &Heap) -> *mut ThreadHeap {
+        let hp = heap as *const Heap as *mut Heap;
+        THEAPS
+            .try_with(|r| {
+                let mut cur = r.0.get();
+                while !cur.is_null() {
+                    // SAFETY: live theap owned by this thread.
+                    if unsafe { (*cur).owning_heap_ptr() } == hp {
+                        return cur;
+                    }
+                    cur = unsafe { (*cur).tnext() };
+                }
+                match heap.new_theap_for(current_tid()) {
+                    Some(tp) => {
+                        // SAFETY: fresh theap; push onto this thread's registry.
+                        unsafe { (*tp).set_tnext(r.0.get()) };
+                        r.0.set(tp);
+                        tp
+                    }
+                    None => core::ptr::null_mut(),
+                }
+            })
+            .unwrap_or(core::ptr::null_mut())
+    }
+
+    /// Remove + return this thread's theap for `heap` (null if none).
+    pub fn take_theap_for(heap: &Heap) -> *mut ThreadHeap {
+        let hp = heap as *const Heap as *mut Heap;
+        THEAPS
+            .try_with(|r| {
+                let mut prev: *mut ThreadHeap = core::ptr::null_mut();
+                let mut cur = r.0.get();
+                while !cur.is_null() {
+                    // SAFETY: live theap owned by this thread.
+                    let next = unsafe { (*cur).tnext() };
+                    if unsafe { (*cur).owning_heap_ptr() } == hp {
+                        if prev.is_null() {
+                            r.0.set(next);
+                        } else {
+                            // SAFETY: `prev` is the predecessor in this thread's list.
+                            unsafe { (*prev).set_tnext(next) };
+                        }
+                        // SAFETY: detach the removed node.
+                        unsafe { (*cur).set_tnext(core::ptr::null_mut()) };
+                        return cur;
+                    }
+                    prev = cur;
+                    cur = next;
+                }
+                core::ptr::null_mut()
+            })
+            .unwrap_or(core::ptr::null_mut())
+    }
+}
+
+#[cfg(feature = "std")]
+pub use theaps::{take_theap_for, theap_for};
+
 /// Serializes tests that mutate the process-global deferred-free registry so
 /// concurrent test threads don't overwrite each other's registration.
 /// Test-only; no effect on the shipped allocator.

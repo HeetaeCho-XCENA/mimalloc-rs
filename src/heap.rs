@@ -116,6 +116,12 @@ pub struct ThreadHeap {
     /// `true` once this theap is in its heap's `theaps` list (first-class theaps;
     /// the per-thread default theap is reached via TLS and is not listed).
     linked: Cell<bool>,
+    /// Links in the *current thread's* registry of on-demand theaps
+    /// (`mi_theap_t.tnext`), so thread exit can tear down every first-class theap
+    /// this thread lazily created for a shared heap. Owner-thread only. Used only
+    /// by the std per-thread registry (`no_std` first-class heaps are single-thread).
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    tnext: Cell<*mut ThreadHeap>,
 }
 
 impl ThreadHeap {
@@ -138,6 +144,7 @@ impl ThreadHeap {
             hnext: Cell::new(core::ptr::null_mut()),
             hprev: Cell::new(core::ptr::null_mut()),
             linked: Cell::new(false),
+            tnext: Cell::new(core::ptr::null_mut()),
         }
     }
 
@@ -146,6 +153,27 @@ impl ThreadHeap {
         let t = self.tseq.get();
         self.tseq.set(t.wrapping_add(1));
         t
+    }
+
+    /// The logical heap this theap belongs to (raw; for the per-thread registry).
+    #[inline]
+    pub(crate) fn owning_heap_ptr(&self) -> *mut Heap {
+        self.heap
+    }
+
+    /// Next theap in the current thread's on-demand registry (`tnext`). std-only
+    /// (the per-thread registry); `no_std` first-class heaps are single-thread.
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn tnext(&self) -> *mut ThreadHeap {
+        self.tnext.get()
+    }
+
+    /// Set the current thread's registry link (`tnext`). Owner-thread only.
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn set_tnext(&self, next: *mut ThreadHeap) {
+        self.tnext.set(next);
     }
 
     /// Allocate `size` bytes (≥ `MI_INTPTR_SIZE`, naturally aligned to
@@ -548,6 +576,13 @@ pub struct Heap {
     theaps: Cell<*mut ThreadHeap>,
     /// Guards `theaps` list operations (`mi_heap_t.theaps_lock`).
     theaps_lock: SpinLock,
+    /// Reference count (`mi_heap_t.refcount`): one "alive" ref held from
+    /// `new_boxed` until `delete`/`destroy`, plus one per live on-demand theap.
+    /// The heap frees itself when the count reaches 0 — so a heap shared across
+    /// threads outlives each thread's use and is reclaimed by whichever release
+    /// (the last theap teardown, or `delete`) happens last. The `'static` default
+    /// heap is never counted/freed.
+    refcount: AtomicUsize,
 }
 
 // SAFETY: `subproc`/`keys`/`heap_seq` are immutable after construction; `theaps`
@@ -573,6 +608,8 @@ pub fn default_heap() -> &'static Heap {
         heap_seq: 0,
         theaps: Cell::new(core::ptr::null_mut()),
         theaps_lock: SpinLock::new(),
+        // Never freed; the default theaps are not counted (reached via TLS).
+        refcount: AtomicUsize::new(0),
     })
 }
 
@@ -623,24 +660,16 @@ impl Heap {
         }
     }
 
-    /// Allocate a first-class heap from metadata memory (`mi_heap_new`): a logical
-    /// `Heap` plus the single-thread `ThreadHeap` that backs it. Release with
-    /// [`Heap::delete`] or [`Heap::destroy`]. Returns `None` on metadata OOM.
+    /// Allocate a first-class logical heap from metadata memory (`mi_heap_new`).
+    /// Its per-thread `ThreadHeap`s are created lazily on first use by each
+    /// thread (see [`Heap::theap_for`]), so one heap can be shared across threads.
+    /// Release with [`Heap::delete`] or [`Heap::destroy`]. `tid` is unused now
+    /// (theaps bind to the calling thread); kept for API stability.
     pub fn new_boxed(keys: [usize; 2], tid: usize) -> Option<NonNull<Heap>> {
+        let _ = tid;
         let hmem = meta_zalloc(core::mem::size_of::<Heap>())?;
-        let tmem = match meta_zalloc(core::mem::size_of::<ThreadHeap>()) {
-            Some(m) => m,
-            None => {
-                // SAFETY: just allocated above, unreferenced.
-                unsafe { meta_free(hmem, core::mem::size_of::<Heap>()) };
-                return None;
-            }
-        };
         let hp = hmem.as_ptr() as *mut Heap;
-        let tp = tmem.as_ptr() as *mut ThreadHeap;
-        // SAFETY: both are zeroed, suitably sized/aligned metadata blocks. Write
-        // the logical heap first so the theap can cache its `subproc`/`keys`, then
-        // register the theap in the heap's list.
+        // SAFETY: `hmem` is a zeroed, suitably sized/aligned metadata block.
         unsafe {
             hp.write(Heap {
                 subproc: subproc_main(),
@@ -648,19 +677,68 @@ impl Heap {
                 heap_seq: next_heap_seq(),
                 theaps: Cell::new(core::ptr::null_mut()),
                 theaps_lock: SpinLock::new(),
+                // One "alive" ref, released by `delete`/`destroy`.
+                refcount: AtomicUsize::new(1),
             });
-            tp.write(ThreadHeap::new(&*hp, tid));
-            (*hp).register_theap(tp);
         }
         NonNull::new(hp)
     }
 
-    /// The theap backing this first-class heap on the current thread. (HT2: a
-    /// first-class heap is single-thread, so this is the sole listed theap.)
+    /// Create + register a fresh theap of this heap for thread `tid` (metadata
+    /// allocated), bumping `refcount`. Returns `None` on metadata OOM.
+    pub(crate) fn new_theap_for(&self, tid: usize) -> Option<*mut ThreadHeap> {
+        let tmem = meta_zalloc(core::mem::size_of::<ThreadHeap>())?;
+        let tp = tmem.as_ptr() as *mut ThreadHeap;
+        // SAFETY: `tmem` is a zeroed, suitably sized/aligned metadata block.
+        unsafe {
+            tp.write(ThreadHeap::new(self, tid));
+            self.refcount.fetch_add(1, Ordering::AcqRel);
+            self.register_theap(tp);
+        }
+        Some(tp)
+    }
+
+    /// Release one reference (a torn-down theap, or the alive ref from `delete`/
+    /// `destroy`). Frees the heap's metadata when the last reference goes.
+    ///
+    /// # Safety
+    /// Each ref (the alive ref + one per [`Heap::new_theap_for`]) is released
+    /// exactly once; after this returns the heap may be freed and must not be used.
+    unsafe fn release_ref(&self) {
+        if self.refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Last reference: no theap and no handle remain.
+            // SAFETY: refcount reached 0, so nothing references this heap; the
+            // first-class lifecycle contract guarantees no concurrent use.
+            unsafe {
+                meta_free(
+                    NonNull::new_unchecked(self as *const Heap as *mut u8),
+                    core::mem::size_of::<Heap>(),
+                )
+            };
+        }
+    }
+
+    /// This thread's theap for this heap, created on first use (`mi_heap_get_theap`).
+    /// Returns `None` only on metadata OOM. The default heap never calls this
+    /// (its theaps live in TLS); a first-class heap gets one theap per thread.
     #[inline]
-    fn theap(&self) -> &ThreadHeap {
-        // SAFETY: registered at `new_boxed`, live until `delete`/`destroy`.
-        unsafe { &*self.theaps.get() }
+    fn current_theap(&self) -> Option<&ThreadHeap> {
+        #[cfg(feature = "std")]
+        {
+            let tp = crate::init::theap_for(self);
+            // SAFETY: `theap_for` returns a live theap of this heap (or null on OOM).
+            (!tp.is_null()).then(|| unsafe { &*tp })
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            // No TLS: a no_std first-class heap is single-thread — one lazy theap.
+            let mut tp = self.theaps.get();
+            if tp.is_null() {
+                tp = self.new_theap_for(MI_THREADID_ABANDONED_MAPPED + 4)?;
+            }
+            // SAFETY: just created or previously created; live until delete/destroy.
+            Some(unsafe { &*tp })
+        }
     }
 
     /// Encoding keys (diagnostics/tests).
@@ -678,88 +756,137 @@ impl Heap {
     /// Allocate `size` bytes from this heap (`mi_heap_malloc`).
     #[inline]
     pub fn alloc(&self, size: usize) -> Option<NonNull<u8>> {
-        self.theap().alloc(size)
+        self.current_theap()?.alloc(size)
     }
 
     /// Allocate `size` bytes aligned to `align` (`mi_heap_malloc_aligned`).
     #[inline]
     pub fn alloc_aligned(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
-        self.theap().alloc_aligned(size, align)
+        self.current_theap()?.alloc_aligned(size, align)
     }
 
     /// Allocate `size` zeroed bytes (`mi_heap_zalloc`).
     #[inline]
     pub fn alloc_zeroed(&self, size: usize) -> Option<NonNull<u8>> {
-        self.theap().alloc_zeroed(size)
+        self.current_theap()?.alloc_zeroed(size)
     }
 
     /// Allocate `size` zeroed bytes aligned to `align`.
     #[inline]
     pub fn alloc_zeroed_aligned(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
-        self.theap().alloc_zeroed_aligned(size, align)
+        self.current_theap()?.alloc_zeroed_aligned(size, align)
     }
 
-    /// Reclaim memory held by this heap (`mi_heap_collect`).
+    /// Reclaim memory held by this heap on the current thread (`mi_heap_collect`).
     pub fn collect(&self, force: bool) {
-        self.theap().collect(force);
+        if let Some(th) = self.current_theap() {
+            th.collect(force);
+        }
     }
 
-    /// Delete a first-class heap (`mi_heap_delete`): hand off its pages via the
-    /// theap drop path (live blocks stay valid), then free the theap and the heap.
+    /// Delete a first-class heap (`mi_heap_delete`): hand off the calling thread's
+    /// theap pages (live blocks stay valid) and release the heap handle. Theaps on
+    /// other threads are handed off when those threads exit; the heap's metadata is
+    /// freed once the last theap and the handle are gone.
     ///
     /// # Safety
-    /// `heap` must come from [`Heap::new_boxed`] and not be used afterwards.
+    /// `heap` must come from [`Heap::new_boxed`] and the handle not be used after.
     pub unsafe fn delete(heap: NonNull<Heap>) {
-        // SAFETY: caller guarantees exclusive, final access.
+        // SAFETY: forwarded; `take_current_theap` removes + returns this thread's
+        // theap (or null), which `teardown_theap` hands off and frees.
         unsafe {
-            let tp = heap.as_ref().theaps.get();
+            let h = heap.as_ref();
+            let tp = h.take_current_theap();
             if !tp.is_null() {
-                // `ThreadHeap::drop` unregisters from the theaps list, then
-                // abandons/releases the pages.
-                core::ptr::drop_in_place(tp);
-                meta_free(
-                    NonNull::new_unchecked(tp as *mut u8),
-                    core::mem::size_of::<ThreadHeap>(),
-                );
+                teardown_theap(tp);
             }
-            meta_free(heap.cast::<u8>(), core::mem::size_of::<Heap>());
+            h.release_ref(); // release the alive ref (may free the heap)
         }
     }
 
-    /// Destroy a first-class heap (`mi_heap_destroy`): free **all** of its pages
-    /// and blocks in bulk, then free the theap and heap. All its pointers become
-    /// invalid.
+    /// Destroy a first-class heap (`mi_heap_destroy`): bulk-free the calling
+    /// thread's theap pages (its blocks become invalid) and release the handle.
+    /// Per the v3 contract no other thread may touch the heap; any theaps left on
+    /// other (now-quiescent) threads release their pages when those threads exit.
     ///
     /// # Safety
-    /// `heap` must come from [`Heap::new_boxed`], no block of it may be used
-    /// afterwards, and no other thread may touch it.
+    /// `heap` from [`Heap::new_boxed`], no block used afterwards, no other thread
+    /// touches it.
     pub unsafe fn destroy(heap: NonNull<Heap>) {
-        // SAFETY: caller guarantees exclusive, final access.
+        // SAFETY: forwarded; exclusive final access per the contract.
         unsafe {
-            let tp = heap.as_ref().theaps.get();
+            let h = heap.as_ref();
+            let tp = h.take_current_theap();
             if !tp.is_null() {
-                let th = &*tp;
-                for b in 0..MI_BIN_COUNT {
-                    let mut cur = th.pages[b].first();
-                    while !cur.is_null() {
-                        let next = (*cur).next.get();
-                        // SAFETY: bulk free — return the slices regardless of `used`.
-                        th.pages[b].remove(cur);
-                        release_page_slices(cur);
-                        cur = next;
-                    }
-                }
-                // Unlink from the theaps list, then free the theap's raw metadata
-                // without running its `Drop` (the pages are already released; we
-                // must not abandon them).
-                heap.as_ref().unregister_theap(tp);
-                meta_free(
-                    NonNull::new_unchecked(tp as *mut u8),
-                    core::mem::size_of::<ThreadHeap>(),
-                );
+                teardown_theap_bulk(tp);
             }
-            meta_free(heap.cast::<u8>(), core::mem::size_of::<Heap>());
+            h.release_ref();
         }
+    }
+
+    /// Remove + return the calling thread's theap for this heap (null if none),
+    /// so the caller can tear it down. std: from the per-thread registry; no_std:
+    /// the single theap at the list head.
+    ///
+    /// # Safety
+    /// Caller tears down the returned theap exactly once.
+    unsafe fn take_current_theap(&self) -> *mut ThreadHeap {
+        #[cfg(feature = "std")]
+        {
+            crate::init::take_theap_for(self)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            self.theaps.get()
+        }
+    }
+}
+
+/// Tear down a metadata-allocated theap (thread exit or `Heap::delete`): runs its
+/// `Drop` (unregister from the heap's theaps list + hand off / abandon pages),
+/// frees the metadata, then releases the heap reference it held.
+///
+/// # Safety
+/// `tp` is a live theap from [`Heap::new_theap_for`], already removed from any
+/// per-thread registry, torn down exactly once.
+pub(crate) unsafe fn teardown_theap(tp: *mut ThreadHeap) {
+    // SAFETY: `tp` is live; read its heap before dropping it.
+    unsafe {
+        let hp = (*tp).owning_heap_ptr();
+        core::ptr::drop_in_place(tp); // unregister + abandon pages
+        meta_free(
+            NonNull::new_unchecked(tp as *mut u8),
+            core::mem::size_of::<ThreadHeap>(),
+        );
+        (*hp).release_ref();
+    }
+}
+
+/// Like [`teardown_theap`] but **bulk-frees** the theap's pages (for
+/// `Heap::destroy`) instead of handing them off — every block becomes invalid.
+///
+/// # Safety
+/// As [`teardown_theap`], and no block of the theap may be used afterwards.
+unsafe fn teardown_theap_bulk(tp: *mut ThreadHeap) {
+    // SAFETY: `tp` is live and exclusively held.
+    unsafe {
+        let hp = (*tp).owning_heap_ptr();
+        let th = &*tp;
+        (*hp).unregister_theap(tp); // remove from theaps list (skip Drop's abandon)
+        for b in 0..MI_BIN_COUNT {
+            let mut cur = th.pages[b].first();
+            while !cur.is_null() {
+                let next = (*cur).next.get();
+                th.pages[b].remove(cur);
+                release_page_slices(cur);
+                cur = next;
+            }
+        }
+        meta_free(
+            NonNull::new_unchecked(tp as *mut u8),
+            core::mem::size_of::<ThreadHeap>(),
+        );
+        (*hp).release_ref();
     }
 }
 
@@ -1247,6 +1374,53 @@ mod tests {
             let _live = h2.as_ref().alloc(64).unwrap();
             Heap::delete(h1);
             Heap::destroy(h2); // `_live` is now invalid — never touched again
+        }
+    }
+
+    #[test]
+    fn shared_first_class_heap_across_threads() {
+        // The C3 capability: ONE first-class heap, shared by several threads, each
+        // allocating/freeing through its own lazily-created theap. Exercises
+        // cross-thread `register_theap` (concurrent), per-thread theap creation,
+        // thread-exit teardown + refcount, and a final `delete` that frees the
+        // heap only once the last theap is gone. TSan/loom/Miri in CI validate it.
+        #[derive(Clone, Copy)]
+        struct SharedHeap(*const Heap);
+        // SAFETY: `Heap` is `Send + Sync`; the pointer outlives every thread (it is
+        // only deleted after all join). The wrapper preserves provenance (vs an
+        // int round-trip) for strict-provenance Miri.
+        unsafe impl Send for SharedHeap {}
+
+        // SAFETY: the heap outlives all worker threads; each frees only its own ptrs.
+        unsafe {
+            let keys = crate::init::process_keys();
+            let h = Heap::new_boxed(keys, crate::init::current_tid()).unwrap();
+            let shared = SharedHeap(h.as_ptr());
+            let handles: alloc::vec::Vec<_> = (0..6)
+                .map(|t| {
+                    std::thread::spawn(move || {
+                        // Capture the whole Send wrapper (not its raw field, which
+                        // edition-2021 disjoint capture would otherwise grab).
+                        let shared = shared;
+                        let heap = &*shared.0;
+                        let mut v = alloc::vec::Vec::new();
+                        for i in 0..500usize {
+                            let p = heap.alloc(16 + (i % 128)).unwrap();
+                            core::ptr::write_bytes(p.as_ptr(), t as u8, 8);
+                            v.push(p);
+                        }
+                        for p in v {
+                            free(p);
+                        }
+                    })
+                })
+                .collect();
+            for hh in handles {
+                hh.join().unwrap();
+            }
+            // All workers have exited, so their theaps are torn down (each released
+            // its heap ref). `delete` releases the alive ref and frees the heap.
+            Heap::delete(h);
         }
     }
 
