@@ -3,7 +3,7 @@
 
 use core::cell::Cell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arena_meta::{meta_free, meta_zalloc};
 use crate::bits::{
@@ -21,6 +21,7 @@ use crate::page::Page;
 use crate::page_map;
 use crate::page_queue::PageQueue;
 use crate::subproc::{subproc_main, Subproc};
+use crate::sync::{OnceBox, SpinLock};
 
 /// Largest request each bin serves. Rust: a `const` table (vs C's runtime
 /// `pages[bin].block_size` field), so `bin_block_size` is a bare array index.
@@ -103,16 +104,29 @@ pub struct ThreadHeap {
     /// `page_retired_min/max`, types.h:512-513). Empty when `min > max`.
     page_retired_min: Cell<usize>,
     page_retired_max: Cell<usize>,
+    // --- Cold fields (appended so the hot fields above keep the pre-split
+    // offsets). Logical-heap membership; never touched on the alloc/free hot
+    // path. ---
+    /// Owning logical heap (`mi_theap_t.heap`, types.h:506).
+    heap: *mut Heap,
+    /// Links in the owning heap's `theaps` list (`mi_theap_t.hnext/hprev`),
+    /// guarded by [`Heap::theaps_lock`]. Null unless `linked`.
+    hnext: Cell<*mut ThreadHeap>,
+    hprev: Cell<*mut ThreadHeap>,
+    /// `true` once this theap is in its heap's `theaps` list (first-class theaps;
+    /// the per-thread default theap is reached via TLS and is not listed).
+    linked: Cell<bool>,
 }
 
 impl ThreadHeap {
-    /// Create a theap with the given encoding keys, owned by thread `tid` (low 2
-    /// bits clear, non-zero), bound to the main subprocess. (HT2 will link each
-    /// theap to its logical [`Heap`] and shared theaps list.)
-    pub fn new(keys: [usize; 2], tid: usize) -> Self {
+    /// Create a theap belonging to logical `heap`, owned by thread `tid` (low 2
+    /// bits clear, non-zero). Caches `subproc`/`keys` from the heap (the tld
+    /// pattern). `heap` must outlive the theap (the `'static` default heap, or a
+    /// first-class heap that owns the theap).
+    pub fn new(heap: &Heap, tid: usize) -> Self {
         ThreadHeap {
-            subproc: subproc_main(),
-            keys,
+            subproc: heap.subproc,
+            keys: heap.keys,
             tid,
             tseq: Cell::new(0),
             pages: [const { PageQueue::new() }; MI_BIN_COUNT],
@@ -120,6 +134,10 @@ impl ThreadHeap {
             // Empty retired range: min > max.
             page_retired_min: Cell::new(MI_BIN_FULL),
             page_retired_max: Cell::new(0),
+            heap: heap as *const Heap as *mut Heap,
+            hnext: Cell::new(core::ptr::null_mut()),
+            hprev: Cell::new(core::ptr::null_mut()),
+            linked: Cell::new(false),
         }
     }
 
@@ -512,19 +530,32 @@ impl ThreadHeap {
 }
 
 /// A logical heap (`mi_heap_t`, types.h:556): the shareable identity that owns a
-/// set of thread-local [`ThreadHeap`]s. A first-class heap (`mi_heap_new`) owns
-/// one single-thread `ThreadHeap`; the process default heap is driven directly
-/// through the per-thread `ThreadHeap` in TLS. (The shared default-heap object,
-/// the theaps list, and per-heap cross-thread theaps are layered on next.)
+/// set of thread-local [`ThreadHeap`]s — one per thread that allocates from it.
+/// The process default heap is reached through the per-thread `ThreadHeap` in TLS
+/// (it is not listed); a first-class heap (`mi_heap_new`) registers its theap(s)
+/// in `theaps`. (HT3 makes one first-class heap usable from several threads, each
+/// via its own listed theap.)
 pub struct Heap {
+    /// Subprocess this heap allocates from (`mi_heap_t.subproc`).
+    subproc: &'static Subproc,
     /// Free-list encoding keys for this heap's pages.
     keys: [usize; 2],
     /// Unique id among heaps of this subprocess (`mi_heap_t.heap_seq`).
     heap_seq: usize,
-    /// The single-thread theap backing this first-class heap (metadata-allocated).
-    /// (HT2 generalizes this to the per-heap theaps list for cross-thread sharing.)
-    theap: AtomicPtr<ThreadHeap>,
+    /// Head of the intrusive list of theaps belonging to this heap
+    /// (`mi_heap_t.theaps`), linked through `ThreadHeap::hnext/hprev`. Touched
+    /// only under `theaps_lock`. Empty (null) for the default heap.
+    theaps: Cell<*mut ThreadHeap>,
+    /// Guards `theaps` list operations (`mi_heap_t.theaps_lock`).
+    theaps_lock: SpinLock,
 }
+
+// SAFETY: `subproc`/`keys`/`heap_seq` are immutable after construction; `theaps`
+// is only read/written while holding `theaps_lock`, whose Acquire/Release
+// ordering publishes the linked theaps across threads. The raw `theaps` pointer
+// is never used to move a `ThreadHeap` across threads — only to link/unlink it.
+unsafe impl Sync for Heap {}
+unsafe impl Send for Heap {}
 
 /// Monotonic source for [`Heap::heap_seq`].
 fn next_heap_seq() -> usize {
@@ -532,7 +563,66 @@ fn next_heap_seq() -> usize {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The process-wide default logical heap (`mi_heap_main`): the shared identity
+/// behind every thread's default [`ThreadHeap`]. Created once.
+pub fn default_heap() -> &'static Heap {
+    static DEFAULT: OnceBox<Heap> = OnceBox::new();
+    DEFAULT.get_or_init(|| Heap {
+        subproc: subproc_main(),
+        keys: crate::init::process_keys(),
+        heap_seq: 0,
+        theaps: Cell::new(core::ptr::null_mut()),
+        theaps_lock: SpinLock::new(),
+    })
+}
+
 impl Heap {
+    /// Link `th` into this heap's `theaps` list (head insert) and mark it linked.
+    ///
+    /// # Safety
+    /// `th` is a live theap owned by the caller, not currently in any list.
+    unsafe fn register_theap(&self, th: *mut ThreadHeap) {
+        let _g = self.theaps_lock.lock();
+        let head = self.theaps.get();
+        // SAFETY: `th` is live; `head` (if any) is a live listed theap.
+        unsafe {
+            (*th).hnext.set(head);
+            (*th).hprev.set(core::ptr::null_mut());
+            if !head.is_null() {
+                (*head).hprev.set(th);
+            }
+            (*th).linked.set(true);
+        }
+        self.theaps.set(th);
+    }
+
+    /// Unlink `th` from this heap's `theaps` list. No-op if `th` is not linked.
+    ///
+    /// # Safety
+    /// `th` is a live theap; if linked, it belongs to *this* heap's list.
+    unsafe fn unregister_theap(&self, th: *mut ThreadHeap) {
+        let _g = self.theaps_lock.lock();
+        // SAFETY: `th` is live; list links are valid under the lock.
+        unsafe {
+            if !(*th).linked.get() {
+                return;
+            }
+            let prev = (*th).hprev.get();
+            let next = (*th).hnext.get();
+            if prev.is_null() {
+                self.theaps.set(next);
+            } else {
+                (*prev).hnext.set(next);
+            }
+            if !next.is_null() {
+                (*next).hprev.set(prev);
+            }
+            (*th).hnext.set(core::ptr::null_mut());
+            (*th).hprev.set(core::ptr::null_mut());
+            (*th).linked.set(false);
+        }
+    }
+
     /// Allocate a first-class heap from metadata memory (`mi_heap_new`): a logical
     /// `Heap` plus the single-thread `ThreadHeap` that backs it. Release with
     /// [`Heap::delete`] or [`Heap::destroy`]. Returns `None` on metadata OOM.
@@ -548,23 +638,29 @@ impl Heap {
         };
         let hp = hmem.as_ptr() as *mut Heap;
         let tp = tmem.as_ptr() as *mut ThreadHeap;
-        // SAFETY: both are zeroed, suitably sized/aligned metadata blocks.
+        // SAFETY: both are zeroed, suitably sized/aligned metadata blocks. Write
+        // the logical heap first so the theap can cache its `subproc`/`keys`, then
+        // register the theap in the heap's list.
         unsafe {
-            tp.write(ThreadHeap::new(keys, tid));
             hp.write(Heap {
+                subproc: subproc_main(),
                 keys,
                 heap_seq: next_heap_seq(),
-                theap: AtomicPtr::new(tp),
+                theaps: Cell::new(core::ptr::null_mut()),
+                theaps_lock: SpinLock::new(),
             });
+            tp.write(ThreadHeap::new(&*hp, tid));
+            (*hp).register_theap(tp);
         }
         NonNull::new(hp)
     }
 
-    /// The thread-local heap backing this first-class heap.
+    /// The theap backing this first-class heap on the current thread. (HT2: a
+    /// first-class heap is single-thread, so this is the sole listed theap.)
     #[inline]
     fn theap(&self) -> &ThreadHeap {
-        // SAFETY: set at `new_boxed` and live until `delete`/`destroy`.
-        unsafe { &*self.theap.load(Ordering::Acquire) }
+        // SAFETY: registered at `new_boxed`, live until `delete`/`destroy`.
+        unsafe { &*self.theaps.get() }
     }
 
     /// Encoding keys (diagnostics/tests).
@@ -616,9 +712,10 @@ impl Heap {
     pub unsafe fn delete(heap: NonNull<Heap>) {
         // SAFETY: caller guarantees exclusive, final access.
         unsafe {
-            let tp = heap.as_ref().theap.load(Ordering::Acquire);
+            let tp = heap.as_ref().theaps.get();
             if !tp.is_null() {
-                // `ThreadHeap::drop` abandons/releases the pages.
+                // `ThreadHeap::drop` unregisters from the theaps list, then
+                // abandons/releases the pages.
                 core::ptr::drop_in_place(tp);
                 meta_free(
                     NonNull::new_unchecked(tp as *mut u8),
@@ -639,7 +736,7 @@ impl Heap {
     pub unsafe fn destroy(heap: NonNull<Heap>) {
         // SAFETY: caller guarantees exclusive, final access.
         unsafe {
-            let tp = heap.as_ref().theap.load(Ordering::Acquire);
+            let tp = heap.as_ref().theaps.get();
             if !tp.is_null() {
                 let th = &*tp;
                 for b in 0..MI_BIN_COUNT {
@@ -652,8 +749,10 @@ impl Heap {
                         cur = next;
                     }
                 }
-                // Free the theap's raw metadata without running its `Drop` (the
-                // pages are already released; we must not abandon them).
+                // Unlink from the theaps list, then free the theap's raw metadata
+                // without running its `Drop` (the pages are already released; we
+                // must not abandon them).
+                heap.as_ref().unregister_theap(tp);
                 meta_free(
                     NonNull::new_unchecked(tp as *mut u8),
                     core::mem::size_of::<ThreadHeap>(),
@@ -1057,9 +1156,16 @@ unsafe fn abandon_owned_page(subproc: &Subproc, page_ptr: *mut Page, bin: usize)
 }
 
 impl Drop for ThreadHeap {
-    /// On thread exit, hand off this theap's pages: empty pages are released to
+    /// On theap teardown (thread exit or `Heap::delete`): unlink from the owning
+    /// heap's theaps list, then hand off the pages — empty pages are released to
     /// the arena, pages with live blocks are abandoned for another thread.
     fn drop(&mut self) {
+        // Unregister first so no other thread can find this theap mid-teardown.
+        // No-op for the (unlisted) default theap. SAFETY: `heap` is live; `self`
+        // is this theap.
+        if self.linked.get() {
+            unsafe { (*self.heap).unregister_theap(self as *mut ThreadHeap) };
+        }
         for b in 0..MI_BIN_COUNT {
             let mut cur = self.pages[b].first();
             while !cur.is_null() {
@@ -1104,11 +1210,9 @@ mod tests {
     use super::*;
 
     fn test_heap() -> ThreadHeap {
-        // Use the real thread id so owner-vs-cross-thread free routing is correct.
-        ThreadHeap::new(
-            [0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321],
-            crate::init::current_tid(),
-        )
+        // Belongs to the shared default heap; real thread id so owner-vs-cross-
+        // thread free routing is correct.
+        ThreadHeap::new(default_heap(), crate::init::current_tid())
     }
 
     #[test]
@@ -1143,6 +1247,45 @@ mod tests {
             let _live = h2.as_ref().alloc(64).unwrap();
             Heap::delete(h1);
             Heap::destroy(h2); // `_live` is now invalid — never touched again
+        }
+    }
+
+    #[test]
+    fn first_class_heaps_across_threads() {
+        // Many threads each create, use, and tear down their own first-class heap
+        // concurrently — exercising theaps register/unregister and both teardown
+        // paths (delete = hand off, destroy = bulk free) under thread churn. The
+        // shared default heap's lock is touched by every theap drop. TSan/Miri in
+        // CI validate the list/lock discipline.
+        let handles: alloc::vec::Vec<_> = (0..8)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    // SAFETY: each thread owns the heaps it creates and frees.
+                    unsafe {
+                        let keys = crate::init::process_keys();
+                        let tid = crate::init::current_tid();
+                        for i in 0..50 {
+                            let h = Heap::new_boxed(keys, tid).unwrap();
+                            let mut ptrs = alloc::vec::Vec::new();
+                            for _ in 0..64 {
+                                ptrs.push(h.as_ref().alloc(32 + t * 8).unwrap());
+                            }
+                            for p in ptrs.drain(..) {
+                                free(p);
+                            }
+                            if i % 2 == 0 {
+                                Heap::delete(h);
+                            } else {
+                                let _live = h.as_ref().alloc(48).unwrap();
+                                Heap::destroy(h); // `_live` invalid afterwards
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
         }
     }
 

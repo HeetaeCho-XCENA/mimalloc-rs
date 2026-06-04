@@ -55,15 +55,17 @@ pub fn current_tid() -> usize {
 
 #[cfg(feature = "std")]
 mod tls {
-    use super::{current_tid, process_keys};
-    use crate::heap::ThreadHeap;
+    use super::current_tid;
+    use crate::heap::{default_heap, ThreadHeap};
     use core::ptr::NonNull;
 
     // Rust: the whole `ThreadHeap` (mi_theap_t) lives inline in a `thread_local!`
     // (vs C's `__thread mi_theap_t*`); an out-of-line pointer cache showed no win.
+    // Every thread's default theap belongs to the one shared `default_heap()`
+    // (and is reached via TLS, so it is not added to that heap's theaps list).
     std::thread_local! {
         /// The calling thread's default thread-local heap.
-        static DEFAULT_THEAP: ThreadHeap = ThreadHeap::new(process_keys(), current_tid());
+        static DEFAULT_THEAP: ThreadHeap = ThreadHeap::new(default_heap(), current_tid());
     }
 
     /// Allocate `size` bytes from the calling thread's default theap.
