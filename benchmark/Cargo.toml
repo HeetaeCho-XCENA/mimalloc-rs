@@ -1,0 +1,24 @@
+# Benchmark workspace — faithful Rust ports of mimalloc-bench microbenchmarks,
+# run with mimalloc-rs as the static #[global_allocator] (its peak). Isolated
+# from the parent crate via its own [workspace] table so it never affects the
+# library build/CI. Not published.
+[package]
+name = "mimalloc-rs-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+mimalloc-rs = { path = ".." }
+
+[features]
+# Swap the global allocator to Rust's System (glibc) for a same-binary
+# rs-vs-system comparison (the workloads are unchanged).
+bench-system = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
