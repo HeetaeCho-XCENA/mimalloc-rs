@@ -36,13 +36,8 @@ mod imp {
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            // SAFETY: forwarding to `alloc`.
-            let p = unsafe { self.alloc(layout) };
-            if !p.is_null() {
-                // SAFETY: `p` is valid for `layout.size()` bytes.
-                unsafe { core::ptr::write_bytes(p, 0, layout.size()) }
-            }
-            p
+            init::zalloc_aligned(layout.size().max(1), layout.align())
+                .map_or(core::ptr::null_mut(), |p| p.as_ptr())
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {

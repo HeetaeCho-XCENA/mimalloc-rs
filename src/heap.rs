@@ -238,6 +238,8 @@ impl Heap {
         let page = unsafe { &*page_ptr };
         let arena = page.owning_arena();
         page.set_owner(self.tid);
+        // A reclaimed page has been used; its free blocks are no longer zero.
+        page.mark_reused();
         page.set_provenance(self as *const Heap as *mut Heap, arena, bin as u32);
         // SAFETY: owner now; drain cross-thread frees, then link into our queue.
         unsafe {
@@ -272,6 +274,37 @@ impl Heap {
         Some(unsafe { NonNull::new_unchecked(p.as_ptr().with_addr(aligned)) })
     }
 
+    /// Allocate `size` zeroed bytes. Large/huge blocks consult the serving
+    /// page's zero state to skip re-zeroing memory the OS already cleared
+    /// (ports the `free_is_zero` fast path of `_mi_page_malloc_zero`); small
+    /// blocks just memset, where that is cheaper than the page-map lookup.
+    pub fn alloc_zeroed(&self, size: usize) -> Option<NonNull<u8>> {
+        let p = self.alloc(size)?;
+        if size > MI_MEDIUM_MAX_OBJ_SIZE {
+            let page = page_map::lookup(p.addr().get()) as *const Page;
+            debug_assert!(!page.is_null(), "just-allocated block must be mapped");
+            // SAFETY: a just-allocated block is registered; `p` is its start.
+            unsafe { (*page).zero_block(p) };
+        } else {
+            // SAFETY: `p` is a fresh block valid for at least `size` bytes.
+            unsafe { core::ptr::write_bytes(p.as_ptr(), 0, size) };
+        }
+        Some(p)
+    }
+
+    /// Allocate `size` zeroed bytes aligned to `align`. For over-alignment the
+    /// block start differs from the returned pointer, so the page fast path does
+    /// not apply — the user region is zeroed directly.
+    pub fn alloc_zeroed_aligned(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+        if align <= MI_INTPTR_SIZE {
+            return self.alloc_zeroed(size);
+        }
+        let p = self.alloc_aligned(size, align)?;
+        // SAFETY: `p` is valid for at least `size` bytes.
+        unsafe { core::ptr::write_bytes(p.as_ptr(), 0, size) };
+        Some(p)
+    }
+
     /// Allocate an object too large for any size class as its own page.
     fn alloc_huge(&self, size: usize) -> Option<NonNull<u8>> {
         let header = align_up(core::mem::size_of::<Page>(), MI_MAX_ALIGN_SIZE);
@@ -288,9 +321,9 @@ impl Heap {
     fn new_page(&self, bin: usize, bs: usize, slices: usize) -> Option<*mut Page> {
         let tseq = self.next_tseq();
         let eager = crate::options::eager_commit();
-        let (arena, idx, p) = self.subproc.alloc_slices(slices, eager, tseq)?;
+        let (arena, idx, p, is_zero) = self.subproc.alloc_slices(slices, eager, tseq)?;
         // SAFETY: `p` is `slices` committed, slice-aligned slices owned by us.
-        let page = unsafe { Page::init(p, idx, slices, bs, self.keys) };
+        let page = unsafe { Page::init(p, idx, slices, bs, self.keys, is_zero) };
         let page_ptr = page.as_ptr();
         // SAFETY: page just created and owned by this thread.
         unsafe {
