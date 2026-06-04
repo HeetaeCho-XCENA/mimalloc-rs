@@ -17,7 +17,7 @@ compares, on the same workload pattern:
 Isolated from the parent crate (its own `[workspace]`), so it never affects the
 library build/CI. Not published.
 
-## Benchmarks (the 5 distinct allocator patterns)
+## Benchmarks (the allocator patterns)
 
 | bin | mimalloc-bench source | exercises |
 |---|---|---|
@@ -26,6 +26,29 @@ library build/CI. Not published.
 | `alloc_test` | `allocator_tester.{h,cpp}` (rpmalloc) | single-thread-ish fast-path throughput, Pareto sizes |
 | `xmalloc_test` | `xmalloc-test.c` | producer/consumer **cross-thread free** |
 | `larson` | `larson.cpp` | server-style MT alloc/free with slot churn |
+| `calloc_test` | — (ours) | `calloc`/zeroed alloc + realistic first-touch |
+| `realloc_test` | — (ours) | `realloc` grow churn across size classes |
+
+### Coverage matrix
+
+What the suite spans, so additions stay principled rather than ad-hoc. Rows are
+allocator behaviours; a cell names the workload(s) that exercise it.
+
+| behaviour \ size | tiny ≤16 B | small ≤1 KiB | medium ≤84 KiB | large ≤512 KiB | huge >512 KiB |
+|---|---|---|---|---|---|
+| single-thread malloc/free churn | `alloc_test`(1T) | `alloc_test` | `alloc_test` | — | — |
+| multi-thread random churn | `cache_thrash` | `larson` | `larson` | — | `malloc_large`* |
+| **cross-thread free** (producer/consumer) | `xmalloc_test` | `xmalloc_test` | — | — | — |
+| alloc + replace (long-lived set) | — | — | — | `malloc_large` | `malloc_large` |
+| **calloc / zeroed** (+ first-touch) | `calloc_test` | `calloc_test` | `calloc_test` | `calloc_test` | `calloc_test` |
+| **realloc** grow/shrink | `realloc_test` | `realloc_test` | `realloc_test` | `realloc_test` | — |
+| per-thread cache locality | `cache_thrash` | — | — | — | — |
+
+`*` `malloc_large` is single-thread. Axes intentionally **not** benched (covered
+by correctness tests, not perf-critical): `aligned_alloc` placement, huge
+cross-thread free, `no_std` `Heap` API. Every memory-touching workload reads/writes
+its blocks so first-touch faults — the real cost — are counted, not hidden behind
+never-used allocations.
 
 Each port cites its C source, reproduces the size distribution / threading /
 alloc-free-transfer pattern, and substitutes the C PRNG with splitmix64 over the
@@ -51,22 +74,28 @@ the absolute rs-vs-mimalloc-c numbers are not directly comparable.
 
 | pattern | mimalloc-rs / glibc | mimalloc-c / glibc |
 |---|---|---|
-| xmalloc-test (producer/consumer cross-thread free) | **3.9×** | **4.8×** |
-| alloc-test (fast path) | **1.27×** | **1.27×** |
-| larson (server MT) | **1.19×** | 1.04× |
-| malloc-large (5–25 MiB) | **0.95×** | 1.11× |
-| cache-thrash (false-share, 1 B) | **0.82×** | 1.00× |
+| xmalloc-test (producer/consumer cross-thread free) | **3.8×** | **4.9×** |
+| alloc-test (fast path) | **1.17×** | **1.28×** |
+| larson (server MT) | **1.20×** | 1.08× |
+| malloc-large (5–25 MiB) | **0.97×** | 1.11× |
+| cache-thrash (false-share, 1 B) | **0.91×** | 1.00× |
+| calloc-test (zeroed + touch, 64 KiB) | **0.88×** | 1.00× |
+| realloc-test (grow churn) | **0.86×** | 0.86× |
 
 **Reading it:**
-- The big win for *both* allocators over glibc is **xmalloc-test** (pure
-  cross-thread free, glibc's weak spot): rs ~3.9×, mimalloc-c ~4.8×.
-- mimalloc-rs and mimalloc-c are otherwise **in the same league** vs glibc:
-  alloc-test tie (1.27×), larson rs slightly ahead.
-- **mimalloc-rs is slower than glibc** on **malloc-large** (0.95×) and
-  **cache-thrash** (0.82×) — both cases where mimalloc-c stays ≥ glibc, so they
-  are genuine rs weak spots (large-block/purge handling; tiny-object placement).
-  cache-thrash at 1-byte objects is largely write-loop-bound, so its number mixes
-  placement with noise.
+- The big shared win over glibc is **xmalloc-test** (pure cross-thread free,
+  glibc's weak spot): rs ~3.8×, mimalloc-c ~4.9×.
+- mimalloc-rs and mimalloc-c are **in the same league** vs glibc; rs leads on
+  larson, ties on the rest.
+- **calloc-test** is near parity once the memory is *touched* (the realistic
+  case): the kernel's first-touch faulting dominates and is allocator-independent.
+  Measuring zeroed allocations that are never used would make rs look
+  artificially fast (it skips the memset and never faults the pages) — this
+  workload deliberately touches every page.
+- **realloc-test** and **malloc-large**/**cache-thrash** are the spots where rs
+  sits at or just under glibc; rs tracks mimalloc-c there (realloc 0.86× = mi-c),
+  so it is not a Rust-specific cost. cache-thrash at 1 B is largely write-loop
+  noise (parity at ≥16 B).
 
 > **Methodology note (important).** The `mimalloc-c` column is measured by
 > `LD_PRELOAD`-ing a real mimalloc `.so` (CMake Release) over the **original**
