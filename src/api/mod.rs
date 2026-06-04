@@ -142,6 +142,45 @@ mod tests {
         }
     }
 
+    // The arena allocation cursor starts the slice search at the last-used
+    // (frontier) arena and wraps. Allocate enough huge blocks to span several
+    // arenas, free a scattered subset, then re-allocate the same count: the wrap
+    // must still reclaim the freed slots (no leak, no overlap with live blocks).
+    #[test]
+    fn arena_cursor_reclaims_freed_across_arenas() {
+        let mm = MiMalloc;
+        let size = 2 * 1024 * 1024; // huge; ~130 of these exceed one 256 MiB arena
+        let l = Layout::from_size_align(size, 16).unwrap();
+        // SAFETY: matched alloc/dealloc with one layout throughout.
+        unsafe {
+            let mut live: Vec<*mut u8> = (0..200).map(|_| mm.alloc(l)).collect();
+            assert!(live.iter().all(|p| !p.is_null()));
+            // Free every third block (holes scattered below the frontier).
+            for i in (0..live.len()).step_by(3) {
+                mm.dealloc(live[i], l);
+                live[i] = core::ptr::null_mut();
+            }
+            // Re-allocate as many; these must reuse the freed slots.
+            for slot in live.iter_mut().filter(|p| p.is_null()) {
+                *slot = mm.alloc(l);
+                assert!(!slot.is_null());
+            }
+            // All live pointers distinct (no double-hand-out).
+            let mut addrs: Vec<usize> = live.iter().map(|p| *p as usize).collect();
+            addrs.sort_unstable();
+            let n = addrs.len();
+            addrs.dedup();
+            assert_eq!(
+                addrs.len(),
+                n,
+                "arena cursor handed out an overlapping block"
+            );
+            for p in live {
+                mm.dealloc(p, l);
+            }
+        }
+    }
+
     // The large/huge `alloc_zeroed` fast path skips the body memset when the
     // serving slices are OS-zero (clearing only the free-list link word). Churn
     // a large block through dirty→free→purge→reuse and require every byte zero

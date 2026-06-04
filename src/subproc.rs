@@ -21,12 +21,18 @@ pub struct Subproc {
     lock: SpinLock,
     arenas: [AtomicPtr<Arena>; MAX_ARENAS],
     arena_count: AtomicUsize,
+    /// Hint: the arena that last satisfied an allocation. The slice search starts
+    /// here and wraps, so a run of allocations stays on the filling frontier
+    /// instead of re-scanning the full arenas from index 0 each time (a hint
+    /// only — the search still wraps over every arena, so it is race-tolerant).
+    alloc_cursor: AtomicUsize,
 }
 
 static MAIN: Subproc = Subproc {
     lock: SpinLock::new(),
     arenas: [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_ARENAS],
     arena_count: AtomicUsize::new(0),
+    alloc_cursor: AtomicUsize::new(0),
 };
 
 /// The process-global main sub-process.
@@ -112,14 +118,21 @@ impl Subproc {
         commit: bool,
         tseq: usize,
     ) -> Option<(NonNull<Arena>, usize, NonNull<u8>, bool)> {
-        // Try existing arenas.
+        // Try existing arenas, starting at the frontier hint and wrapping.
         let count = self.arena_count();
-        for i in 0..count {
-            if let Some(arena) = self.arena_at(i) {
-                // SAFETY: registered arenas stay live for the process.
-                let a = unsafe { arena.as_ref() };
-                if let Some((idx, p, is_zero)) = a.alloc_slices(n, tseq) {
-                    return Some((arena, idx, p, is_zero));
+        if count > 0 {
+            let start = self.alloc_cursor.load(Ordering::Relaxed) % count;
+            for k in 0..count {
+                let i = (start + k) % count;
+                if let Some(arena) = self.arena_at(i) {
+                    // SAFETY: registered arenas stay live for the process.
+                    let a = unsafe { arena.as_ref() };
+                    if let Some((idx, p, is_zero)) = a.alloc_slices(n, tseq) {
+                        if k != 0 {
+                            self.alloc_cursor.store(i, Ordering::Relaxed);
+                        }
+                        return Some((arena, idx, p, is_zero));
+                    }
                 }
             }
         }
@@ -128,6 +141,9 @@ impl Subproc {
         // SAFETY: freshly registered arena.
         let a = unsafe { arena.as_ref() };
         let (idx, p, is_zero) = a.alloc_slices(n, tseq)?;
+        // The new arena is the frontier; allocations resume there next time.
+        self.alloc_cursor
+            .store(self.arena_count().saturating_sub(1), Ordering::Relaxed);
         Some((arena, idx, p, is_zero))
     }
 
