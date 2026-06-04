@@ -89,6 +89,11 @@ pub struct Page {
     /// carve, cleared once any recycled block is collected back into `free`
     /// (ports `mi_page_t.free_is_zero`, types.h:390).
     free_is_zero: Cell<bool>,
+    /// Retire countdown (`mi_page_t.retire_expire`, types.h:389). Non-zero only
+    /// while this is the emptied *sole* page of its bin, kept for reuse;
+    /// `collect_retired` decrements it each cadence and releases the page at 0.
+    /// Owner-thread only.
+    retire_expire: Cell<u8>,
 }
 
 impl Page {
@@ -139,6 +144,7 @@ impl Page {
                 arena: Cell::new(core::ptr::null_mut()),
                 bin: Cell::new(0),
                 free_is_zero: Cell::new(is_zero),
+                retire_expire: Cell::new(0),
             });
             NonNull::new_unchecked(hdr)
         }
@@ -188,6 +194,7 @@ impl Page {
                 arena: Cell::new(core::ptr::null_mut()),
                 bin: Cell::new(0),
                 free_is_zero: Cell::new(is_zero),
+                retire_expire: Cell::new(0),
             });
             NonNull::new_unchecked(hdr)
         }
@@ -648,6 +655,18 @@ impl Page {
     #[inline]
     pub fn bin(&self) -> u32 {
         self.bin.get()
+    }
+
+    /// Retire countdown (`mi_page_t.retire_expire`). Owner-thread only.
+    #[inline]
+    pub fn retire_expire(&self) -> u8 {
+        self.retire_expire.get()
+    }
+
+    /// Set the retire countdown. Owner-thread only.
+    #[inline]
+    pub fn set_retire_expire(&self, cycles: u8) {
+        self.retire_expire.set(cycles);
     }
 
     /// Migrate cross-thread + local frees into `free` (owner path).
