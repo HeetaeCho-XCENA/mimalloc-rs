@@ -22,8 +22,6 @@ pub struct PageQueue {
 
 impl Default for PageQueue {
     fn default() -> Self {
-        // Manual impl (not derived): a derive would require `*mut Page: Default`,
-        // which is newer than our MSRV. Delegating to `new()` avoids that.
         Self::new()
     }
 }

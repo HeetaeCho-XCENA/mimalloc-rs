@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Pages (ports the `mi_page_t` core of `page.c` / `alloc.c` / `free.c`).
 //!
-//! A page owns a run of arena slices and serves fixed-size blocks from a sharded
-//! free list. Its header lives inline at the start of its first slice; the
-//! blocks follow at `page_start`.
-//!
-//! Three free lists (mimalloc's design):
-//! * `free` — blocks `malloc` hands out (owner-only),
-//! * `local_free` — blocks the owner freed, migrated to `free` on demand (keeps
-//!   a monotonic heartbeat),
-//! * `xthread_free` — blocks freed by *other* threads (atomic Treiber stack).
-//!
-//! The owner pops from `free`; other threads push to `xthread_free`; the owner
-//! collects both `local_free` and `xthread_free` on demand. Pages carry their
-//! owning heap/arena/bin so they can be retired or abandoned (thread exit).
+//! The header lives inline at the start of the page's first slice; blocks follow
+//! at `page_start`. Three free lists: `free` (owner pops), `local_free` (owner's
+//! deferred frees), `xthread_free` (atomic Treiber stack of cross-thread frees).
 
 use core::cell::Cell;
 use core::ptr::NonNull;
@@ -26,16 +16,10 @@ use crate::bits::{
 use crate::free_list::Block;
 use crate::layout::align_up;
 
-// ---------------------------------------------------------------------------
-// `xthread_free` ownership tag (ports v3's `mi_tf_*`, internal.h:919-950)
-// ---------------------------------------------------------------------------
-//
-// The `xthread_free` head word is a `*mut Block` whose **low bit** is the page's
-// ownership token: a page managed by a live theap (or temporarily claimed by a
-// freeing thread) is *owned* (1); an abandoned page is *unowned* (0) until a
-// free claims it. Blocks are at least pointer-aligned, so the low bit is always
-// free. We tag through `map_addr`, which **preserves provenance**, so the head
-// stays a real (deref-able) pointer with no `expose`/`with_exposed` round-trip.
+// `xthread_free` ownership tag (ports v3's `mi_tf_*`, internal.h:919-950).
+// The head word's low bit is the page's ownership token (owned=1, unowned=0);
+// blocks are pointer-aligned so the bit is always free. Rust: tagged through
+// `map_addr` (strict-provenance), so the head stays a deref-able pointer.
 
 /// Ownership bit of an `xthread_free` head word.
 const TF_OWNED: usize = 1;
@@ -59,12 +43,9 @@ fn tf_create(block: *mut Block, owned: bool) -> *mut Block {
 /// Extend the free list by at most this many bytes' worth of blocks at a time
 /// (ports `MI_MAX_EXTEND_SIZE`); bounds the upfront init cost per batch.
 const MI_MAX_EXTEND_SIZE: usize = 4096;
-/// Always extend by at least this many blocks (ports `MI_MIN_EXTEND`).
-///
-/// Upstream uses `8*MI_SECURE` under `secure` to enlarge batches for the
-/// randomized free-list-shuffle hardening; that shuffle path is not yet ported
-/// (see the `secure` free-list work), so we keep `1` for all builds. This only
-/// affects batch size, not correctness.
+/// Always extend by at least this many blocks (ports `MI_MIN_EXTEND`). Upstream
+/// uses `8*MI_SECURE` for the randomized free-list shuffle, not yet ported;
+/// affects batch size only, not correctness.
 const MI_MIN_EXTEND: usize = 1;
 
 /// A mimalloc page: header for a run of slices serving fixed-size blocks.
@@ -76,9 +57,8 @@ pub struct Page {
     free: Cell<*mut Block>,
     /// Owner-deferred frees, migrated into `free` on demand.
     local_free: Cell<*mut Block>,
-    /// Cross-thread free list: an atomic Treiber stack of blocks freed by other
-    /// threads. Stored as `AtomicPtr` so pointer provenance is preserved. The
-    /// ownership-bit tagging used for *abandoned* page reclaim is follow-up work.
+    /// Cross-thread free list (atomic Treiber stack). Rust: `AtomicPtr` to
+    /// preserve provenance.
     pub xthread_free: AtomicPtr<Block>,
     /// Blocks currently handed out (alive + in thread_free).
     used: Cell<u32>,
@@ -98,8 +78,7 @@ pub struct Page {
     /// Provenance of the page within its arena.
     pub slice_index: usize,
     pub slice_count: usize,
-    /// Owning heap (set after init; owner-only access). Used to retire the page
-    /// to its bin queue when it empties.
+    /// Owning heap (set after init; owner-only access).
     heap: Cell<*mut crate::heap::Heap>,
     /// Owning arena (set after init). Slices return here on retire.
     arena: Cell<*mut crate::arena::Arena>,
@@ -108,10 +87,8 @@ pub struct Page {
 }
 
 impl Page {
-    /// Initialize a page in place at the start of its slice run.
-    ///
-    /// Lays the header at `slice_ptr`, places blocks after it, and threads the
-    /// whole free list. Returns a pointer to the in-place header.
+    /// Initialize a page in place at the start of its slice run. Returns a
+    /// pointer to the in-place header.
     ///
     /// # Safety
     /// `slice_ptr` must point at `slice_count` committed, slice-aligned slices
@@ -126,7 +103,6 @@ impl Page {
         debug_assert!(block_size >= MI_INTPTR_SIZE);
         let region = slice_count * MI_ARENA_SLICE_SIZE;
         let header = align_up(core::mem::size_of::<Page>(), MI_MAX_ALIGN_SIZE);
-        // Align the block area so blocks get natural alignment up to max-align.
         let start_off = align_up(header, MI_MAX_ALIGN_SIZE);
         let area = region - start_off;
         let reserved = (area / block_size) as u32;
@@ -140,14 +116,10 @@ impl Page {
                 xthread_id: AtomicUsize::new(0),
                 free: Cell::new(core::ptr::null_mut()),
                 local_free: Cell::new(core::ptr::null_mut()),
-                // Owned + empty (ports `page->xthread_free == 1` at init): a fresh
-                // page is owned by the heap that created it. `without_provenance`
-                // is correct here — the word carries no block pointer yet.
+                // Owned + empty (ports `page->xthread_free == 1` at init).
                 xthread_free: AtomicPtr::new(core::ptr::without_provenance_mut(TF_OWNED)),
                 used: Cell::new(0),
-                // Lazily built: the free list starts empty and is extended in
-                // batches on demand (see `extend_free`), so page creation does
-                // not touch every block's memory upfront (better cache locality).
+                // Lazily built: free list extended in batches (see `extend_free`).
                 capacity: Cell::new(0),
                 reserved,
                 block_size,
@@ -161,17 +133,12 @@ impl Page {
                 arena: Cell::new(core::ptr::null_mut()),
                 bin: Cell::new(0),
             });
-            // No upfront free-list build: the first `alloc` extends it.
             NonNull::new_unchecked(hdr)
         }
     }
 
     /// Extend the free list from uninitialized capacity, in a bounded batch
-    /// (ports `mi_page_extend_free`). Threads blocks `[capacity, capacity+n)`
-    /// onto `free` in ascending address order and advances `capacity`. Does
-    /// nothing once `capacity == reserved`. This keeps page creation from
-    /// touching every block upfront and keeps freshly-initialized blocks hot in
-    /// cache near their first use.
+    /// (ports `mi_page_extend_free`).
     ///
     /// # Safety
     /// Owner-only; called when `free` is empty. `self`'s `Cell` fields are not
@@ -182,16 +149,9 @@ impl Page {
         if cap >= reserved {
             return;
         }
-        // Batch ~MI_MAX_EXTEND_SIZE bytes of blocks at a time (at least
-        // MI_MIN_EXTEND), capped by the remaining capacity. Simplified-equivalent
-        // of upstream's `bsize >= MI_MAX_EXTEND_SIZE ? MI_MIN_EXTEND : .../bsize`
-        // branch for `MI_MIN_EXTEND == 1` (block_size >= MI_INTPTR_SIZE, so no
-        // divide-by-zero).
         let max_extend = (MI_MAX_EXTEND_SIZE / self.block_size).max(MI_MIN_EXTEND);
         let extend = (reserved - cap).min(max_extend);
-        // Thread `[cap, cap+extend)` with the lowest index at the head, prepended
-        // to the current free list (empty in practice on the owner path) —
-        // sequential addresses for locality.
+        // Thread `[cap, cap+extend)` lowest-index-first for sequential locality.
         let mut head = self.free.get();
         let mut i = cap + extend;
         while i > cap {
@@ -208,23 +168,20 @@ impl Page {
         self.capacity.set((cap + extend) as u32);
     }
 
-    /// Migrate `local_free` and the cross-thread `xthread_free` list into `free`.
-    ///
-    /// Cross-thread freed blocks were not counted against `used` by the freeing
-    /// thread (only the owner mutates `used`), so we decrement `used` here.
+    /// Migrate `local_free` and `xthread_free` into `free` (ports
+    /// `_mi_page_free_collect`). Cross-thread frees do not touch `used` (only the
+    /// owner does), so `used` is decremented here.
     ///
     /// # Safety
     /// Owner-only; `self`'s `Cell` fields are not touched by other threads.
     unsafe fn collect(&self) {
-        // 1. Drain the cross-thread free stack. Capture the list with a CAS that
-        // resets the head to (NULL, owned) — **preserving the ownership bit** so a
-        // concurrent freer keeps seeing the page as owned (ports
-        // `mi_page_thread_free_collect`). Retry if a freer pushed meanwhile.
+        // 1. Capture the cross-thread stack with a CAS to (NULL, owned) —
+        // preserving the ownership bit. Retry if a freer pushed meanwhile.
         loop {
             let tfree = self.xthread_free.load(Ordering::Acquire);
             let mut tf = tf_block(tfree);
             if tf.is_null() {
-                break; // nothing queued; leave the ownership bit untouched
+                break; // nothing queued
             }
             let empty = tf_create(core::ptr::null_mut(), tf_is_owned(tfree));
             if self
@@ -236,9 +193,7 @@ impl Page {
             }
             // We now exclusively own the captured `tf` list; splice it into `free`.
             while !tf.is_null() {
-                // SAFETY: `tf` blocks were published by freeing threads via
-                // `set_next`, so the link is decoded the same way (encoded under
-                // `secure`/`debug`).
+                // SAFETY: `tf` blocks were published via `set_next` (same encoding).
                 let next = unsafe { (*tf).next(self.keys) };
                 // SAFETY: `tf` is a valid block slot owned by this page.
                 unsafe {
@@ -250,23 +205,14 @@ impl Page {
             }
             break;
         }
-        // 2. Splice the owner-local deferred frees into `free`. Ports
-        // `_mi_page_free_collect`'s key optimization: in the common case `free`
-        // is empty, so move the whole `local_free` list over with a single
-        // **O(1)** head assignment — *no traversal*. (The previous code walked and
-        // re-linked every block, which made `Page::alloc` ~60% pointer-chasing the
-        // `local_free` list on the single-thread fast path.) Only when `free`
-        // already holds blocks (the cross-thread drain above prepended some) do we
-        // walk `local_free` to its tail and append — the rare path.
+        // 2. Splice `local_free` into `free`. Common case: `free` is empty, so
+        // adopt the whole list head in O(1) with no traversal.
         let lf = self.local_free.get();
         if !lf.is_null() {
             if self.free.get().is_null() {
-                // Common: just adopt the list head (order preserved; links — encoded
-                // under secure/debug — are already correct and untouched).
                 self.free.set(lf);
             } else {
-                // Rare: `free` is non-empty (xthread blocks drained in). Walk to
-                // `local_free`'s tail and link it ahead of the current `free`.
+                // Rare: `free` non-empty (xthread drained in). Append at the tail.
                 let mut tail = lf;
                 loop {
                     // SAFETY: `tail` is a valid free block on our local list.
@@ -286,38 +232,26 @@ impl Page {
         }
     }
 
-    /// Collect the cross-thread free list **without the atomic swap**, given the
-    /// block `head` we just pushed onto `xthread_free` (now its head) when a free
-    /// claimed an abandoned page. Ports `_mi_page_free_collect_partly`
-    /// (`page.c:243`) — the no-atomic collect that keeps the cross-thread claim
-    /// path cheap.
-    ///
-    /// We must not collect `head` itself: `xthread_free` still points at it and a
-    /// concurrent freer may prepend a new block (writing *that* block's `next`,
-    /// never `head`'s), so `head`'s own `next` is touched only by us. We sever
-    /// `head` from the rest and migrate the rest (`head->next` onward) into the
-    /// local lists with no atomic op; `head` stays queued and is picked up by a
-    /// later full [`Page::collect`]. If only `head` remains live afterwards
-    /// (`used == 1`), we full-collect to finish (the page is then empty).
+    /// Collect `xthread_free` **without the atomic swap**, given the `head` block
+    /// we just pushed (ports `_mi_page_free_collect_partly`, page.c:243). `head`
+    /// itself stays queued (a concurrent freer may prepend ahead of it) and is
+    /// picked up by a later full [`Page::collect`]; we migrate `head->next`
+    /// onward into the local lists.
     ///
     /// # Safety
     /// Owner (claim) path: the caller exclusively owns the page and `head` is the
     /// block it just pushed onto `xthread_free`.
-    // Only reached from the std cross-thread claim path (`free_try_collect_mt`);
-    // the no_std build is single-owner and never claims an abandoned page.
+    // std-only: the no_std build is single-owner and never claims a page.
     #[cfg(feature = "std")]
     pub(crate) unsafe fn collect_partly(&self, head: *mut Block) {
         if head.is_null() {
             return;
         }
-        // SAFETY: only the owner touches `head`'s `next`; concurrent pushers
-        // prepend new blocks ahead of `head` and never touch `head`'s `next`.
+        // SAFETY: only the owner touches `head`'s `next`; pushers prepend ahead.
         let next = unsafe { (*head).next(self.keys) };
         if !next.is_null() {
-            // Sever `head` from the rest, then append the current `local_free`
-            // after the captured list's tail and adopt the captured list as the
-            // new `local_free` (ports `mi_page_thread_collect_to_local`), counting
-            // blocks to correct `used` (the cross-thread freer never decremented).
+            // Migrate `head->next` onward into `local_free` (ports
+            // `mi_page_thread_collect_to_local`), counting blocks to fix `used`.
             // SAFETY: `head` is ours; the `next` chain is now exclusively ours.
             unsafe { (*head).set_next(core::ptr::null_mut(), self.keys) };
             let mut count: u32 = 1;
@@ -335,39 +269,30 @@ impl Page {
             unsafe { (*last).set_next(self.local_free.get(), self.keys) };
             self.local_free.set(next);
             self.used.set(self.used.get() - count);
-            // Common case: `free` empty ⇒ adopt `local_free` wholesale (O(1)).
             if self.free.get().is_null() {
                 self.free.set(self.local_free.get());
                 self.local_free.set(core::ptr::null_mut());
             }
         }
         if self.used.get() == 1 {
-            // Only `head` remains live ⇒ everything else was freed; full-collect
-            // to grab `head` too (the page is then empty).
+            // Only `head` remains live: full-collect to grab it (page then empty).
             // SAFETY: owner path.
             unsafe { self.collect() };
         }
     }
 
-    /// Stamp the owning thread id on a **freshly initialized** page (flags are 0
-    /// and the page is not yet published in the page-map, so no other thread can
-    /// observe or mutate it) with a single plain store. This is the per-page
-    /// creation path; on the huge-alloc workload (one page per allocation) the
-    /// flag-preserving CAS below is a measurable per-op cost (a locked
-    /// read-modify-write), so the fresh path must stay a plain store.
+    /// Stamp the owning thread id on a **freshly initialized**, unpublished page
+    /// with a plain store (no other thread can observe it yet), avoiding the
+    /// flag-preserving CAS of [`Page::set_owner`].
     #[inline]
     pub fn set_owner_fresh(&self, tid: usize) {
         debug_assert_eq!(tid & MI_PAGE_FLAG_MASK, 0, "tid must have clear flag bits");
         self.xthread_id.store(tid, Ordering::Release);
     }
 
-    /// Restamp the owning thread id on an **already-live** page, **preserving the
-    /// page flag bits** in the low `MI_PAGE_FLAG_MASK` bits (ports
-    /// `mi_page_set_theap`'s flag-preserving CAS, `internal.h:867-871`). Used when
-    /// reclaiming an abandoned page, which may carry `has_interior` from a prior
-    /// life (and a concurrent thread may set it), so we must not clobber the flags.
-    /// `tid` must have its low 2 bits clear (`current_tid` / `MI_THREADID_ABANDONED`
-    /// both do).
+    /// Restamp the owning thread id on an **already-live** page, preserving the
+    /// low flag bits (ports `mi_page_set_theap`'s flag-preserving CAS,
+    /// internal.h:867-871). `tid` must have its low 2 bits clear.
     #[inline]
     pub fn set_owner(&self, tid: usize) {
         debug_assert_eq!(tid & MI_PAGE_FLAG_MASK, 0, "tid must have clear flag bits");
@@ -398,11 +323,9 @@ impl Page {
         xid.load(Ordering::Acquire) & !MI_PAGE_FLAG_MASK
     }
 
-    /// Read the raw `xthread_id` (owner tid **with** the flag bits) without
-    /// forming a `&Page`. This is what the free fast path XORs against the
-    /// current thread id so the owner-vs-cross-thread decision and the
-    /// full/interior flag check collapse into one compare (ports
-    /// `mi_page_xthread_id` as used in `mi_free_ex`, `free.c:185`).
+    /// Read the raw `xthread_id` (owner tid **with** flag bits) without forming a
+    /// `&Page`; XORed by the free fast path (ports `mi_page_xthread_id` in
+    /// `mi_free_ex`, free.c:185).
     ///
     /// # Safety
     /// `page` must point at a live page header.
@@ -413,11 +336,8 @@ impl Page {
         xid.load(Ordering::Acquire)
     }
 
-    /// Set or clear the `in_full` flag (a page is in the heap's full queue). The
-    /// flag lives in `xthread_id`'s low bits so the free fast path sees it for
-    /// free; we use atomic or/and because a non-owner may concurrently set
-    /// `has_interior`. Owner-only caller (queue accounting). Ports
-    /// `mi_page_set_in_full`.
+    /// Set or clear the `in_full` flag (ports `mi_page_set_in_full`). Atomic
+    /// or/and because a non-owner may concurrently set `has_interior`.
     #[inline]
     pub fn set_in_full(&self, in_full: bool) {
         if in_full {
@@ -435,12 +355,8 @@ impl Page {
         self.xthread_id.load(Ordering::Acquire) & MI_PAGE_IN_FULL_QUEUE != 0
     }
 
-    /// Mark that this page has handed out an interior pointer (from a
-    /// large-alignment `alloc_aligned`), so the free fast path routes its
-    /// pointers through the unalign (block-start recovery) path instead of
-    /// assuming a block-start pointer. Set via atomic or — may be called from a
-    /// non-owner. Ports `mi_page_set_has_interior_pointers` / the
-    /// `MI_PAGE_HAS_INTERIOR_POINTERS` flag.
+    /// Mark that this page has handed out an interior pointer (ports
+    /// `mi_page_set_has_interior_pointers`). Atomic or — may be set by a non-owner.
     #[inline]
     pub fn set_has_interior(&self) {
         self.xthread_id
@@ -468,16 +384,10 @@ impl Page {
         unsafe { core::ptr::read(core::ptr::addr_of!((*page).page_start)) }
     }
 
-    /// Push `block` onto the page's cross-thread free stack (the freeing thread
-    /// is *not* the owner), marking the head **owned**. Touches only the atomic
-    /// head and the block's own memory, so it is sound to call concurrently with
-    /// the owner. Ports `mi_free_block_mt`'s atomic push.
-    ///
-    /// Returns `true` if this push **claimed** the page — i.e. the head was
-    /// *unowned* before (the page was abandoned) and is now owned by us, so the
-    /// caller must run the collect-on-free protocol. Returns `false` if the page
-    /// was already owned (a live or already-claimed page); then the owner will
-    /// collect the block later.
+    /// Push `block` onto the cross-thread free stack and mark the head **owned**
+    /// (ports `mi_free_block_mt`'s atomic push). Returns `true` if this push
+    /// **claimed** a previously-abandoned page (head was unowned), so the caller
+    /// must run the collect-on-free protocol.
     ///
     /// # Safety
     /// `page` is a live page header; `block` is a live block of that page no
@@ -488,9 +398,6 @@ impl Page {
         let head = unsafe { &*core::ptr::addr_of!((*page).xthread_free) };
         let keys = unsafe { Page::raw_keys(page) };
         let bp = block.as_ptr() as *mut Block;
-        // The next link is written through `Block::set_next`, so it shares the
-        // owner free list's (optionally encoded) representation — under `secure`/
-        // `debug` the cross-thread links are encoded too, not stored in the clear.
         // SAFETY: the block is exclusively ours until the CAS publishes it.
         let b = unsafe { &*(bp as *const Block) };
         loop {
@@ -499,8 +406,7 @@ impl Page {
             unsafe {
                 b.set_next(tf_block(cur), keys);
             }
-            // Always publish as owned: either the page was already owned (no-op on
-            // the bit) or we are claiming a previously-abandoned page.
+            // Always publish as owned (no-op if already owned, else a claim).
             let new = tf_create(bp, true);
             match head.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return !tf_is_owned(cur),
@@ -536,12 +442,8 @@ impl Page {
         false
     }
 
-    /// Allocate one block, or `None` if the page is full.
-    ///
-    /// Fast path: pop the head of `free`. When `free` is empty the refill
-    /// (collect cross-thread frees, then lazily extend) lives in [`Page::alloc_slow`]
-    /// — mirroring C's force-inlined `mi_page_malloc_zero` over the noinline generic
-    /// refill. The optimizer folds `alloc_slow` back in (no forced call on the refill path).
+    /// Allocate one block, or `None` if the page is full. Fast path pops the head
+    /// of `free`; the refill lives in [`Page::alloc_slow`].
     #[inline]
     pub fn alloc(&self) -> Option<NonNull<u8>> {
         let b = self.free.get();
@@ -552,15 +454,12 @@ impl Page {
         Some(unsafe { self.pop(b) })
     }
 
-    /// Cold refill path: `free` was empty, so reclaim local/cross-thread frees
-    /// and, if still empty, initialize the next batch of blocks on demand.
-    /// (See [`Page::alloc`].)
+    /// Cold refill path (see [`Page::alloc`]): collect frees, else extend.
     fn alloc_slow(&self) -> Option<NonNull<u8>> {
         // SAFETY: owner path — reclaim any local/cross-thread frees first.
         unsafe { self.collect() };
         let mut b = self.free.get();
         if b.is_null() {
-            // Still empty: initialize the next batch of blocks on demand.
             // SAFETY: owner path; only runs when `free` is empty.
             unsafe { self.extend_free() };
             b = self.free.get();
@@ -578,9 +477,7 @@ impl Page {
     /// `b` must be the current (non-null) value of `self.free`.
     #[inline]
     unsafe fn pop(&self, b: *mut Block) -> NonNull<u8> {
-        // Debug: every block handed out must lie on the page's block grid; a
-        // violation means the free list was corrupted (e.g. an interior pointer
-        // was pushed onto it).
+        // Debug: a handed-out block off the block grid means free-list corruption.
         debug_assert_eq!(
             (b.addr() - self.page_start.addr()) % self.block_size,
             0,
@@ -606,14 +503,11 @@ impl Page {
             (*b).set_next(self.local_free.get(), self.keys);
         }
         self.local_free.set(b);
-        // A live block always has `used > 0`; a violation here means a double
-        // free or a foreign pointer (caller-contract violation).
         debug_assert!(self.used.get() > 0, "free of non-live block (double free?)");
         self.used.set(self.used.get().saturating_sub(1));
     }
 
-    /// Record the owning heap, arena, and bin (called once after init, on the
-    /// owner thread). Enables retiring the page when it empties.
+    /// Record the owning heap, arena, and bin (once after init, owner thread).
     #[inline]
     pub fn set_provenance(
         &self,
@@ -644,8 +538,7 @@ impl Page {
         self.bin.get()
     }
 
-    /// Migrate cross-thread + local frees into the `free` list (owner path).
-    /// Called when adopting an abandoned page or before checking emptiness.
+    /// Migrate cross-thread + local frees into `free` (owner path).
     ///
     /// # Safety
     /// Caller must own the page (no other thread runs the owner path).
@@ -661,11 +554,9 @@ impl Page {
         tf_is_owned(self.xthread_free.load(Ordering::Acquire))
     }
 
-    /// Try to claim ownership of an abandoned page (set the ownership bit).
-    /// Returns `true` if we transitioned unowned→owned (we now exclusively own
-    /// it), `false` if it was already owned. Ports `mi_page_claim_ownership`
-    /// (a CAS loop since stable `AtomicPtr` has no `fetch_or`). Sound to call
-    /// from any thread — touches only the atomic head.
+    /// Try to claim ownership of an abandoned page (ports `mi_page_claim_ownership`).
+    /// Returns `true` on unowned→owned. Rust: a CAS loop, since stable `AtomicPtr`
+    /// has no `fetch_or`.
     #[inline]
     pub fn claim_ownership(&self) -> bool {
         loop {
@@ -684,12 +575,10 @@ impl Page {
         }
     }
 
-    /// Release ownership of a page we hold, returning it to the unowned
-    /// (abandoned) state. Expects the head to be `(NULL, owned)` — the state
-    /// after a full `collect`. Returns `true` if it cleanly unowned; `false` if a
-    /// concurrent freer pushed a block in the window (so the caller must
-    /// re-collect and retry the collect-on-free ladder). Ports the CAS of
-    /// `mi_abandoned_page_unown_from_free` (full-collect variant).
+    /// Release ownership back to the unowned (abandoned) state (ports
+    /// `mi_abandoned_page_unown_from_free`). Expects head `(NULL, owned)` after a
+    /// full `collect`; returns `false` if a freer pushed in the window, so the
+    /// caller must re-collect and retry.
     ///
     /// # Safety
     /// Caller currently owns the page and has just collected it.
@@ -702,12 +591,9 @@ impl Page {
             .is_ok()
     }
 
-    /// Clear the ownership bit (hand the page off / abandon it), **preserving**
-    /// any queued cross-thread block list. Unlike [`try_unown`], this is
-    /// unconditional: it is used when a heap relinquishes a page at thread exit,
-    /// where there is no collect-and-retry ladder — a block freed concurrently
-    /// simply stays queued for whoever next claims the page. CAS-loop since stable
-    /// `AtomicPtr` has no `fetch_and`.
+    /// Clear the ownership bit unconditionally (hand the page off at thread
+    /// exit), preserving any queued cross-thread blocks. Unlike [`try_unown`],
+    /// there is no retry ladder. Rust: CAS loop, no `AtomicPtr::fetch_and`.
     ///
     /// # Safety
     /// Caller currently owns the page and is giving it up.
@@ -746,26 +632,21 @@ impl Page {
         self.used.get()
     }
 
-    /// Does the page have a block ready to hand out *right now* (`free` is
-    /// non-empty)? Cheap (no collect) — the page search checks this first and
-    /// only collects on a miss (ports `mi_page_immediate_available`). Owner-only.
+    /// Does `free` hold a block right now (ports `mi_page_immediate_available`)?
+    /// Cheap — no collect. Owner-only.
     #[inline]
     pub fn has_free(&self) -> bool {
         !self.free.get().is_null()
     }
 
-    /// Can the page still initialize more blocks (capacity below reserved)? Such
-    /// a page is not "full" — `alloc` will extend it on demand (ports
-    /// `mi_page_is_expandable`). Owner-only.
+    /// Can the page initialize more blocks (ports `mi_page_is_expandable`)?
+    /// Owner-only.
     #[inline]
     pub fn is_expandable(&self) -> bool {
         self.capacity.get() < self.reserved
     }
 
-    /// Is the page ≥7/8 used (few free slots left)? Ports `mi_page_is_mostly_used`
-    /// — a page with plenty of free space (not mostly used) is worth taking over
-    /// (cross-thread reclaim) so its frees become local; a mostly-used one is left
-    /// to drain. Owner-only.
+    /// Is the page ≥7/8 used (ports `mi_page_is_mostly_used`)? Owner-only.
     #[inline]
     pub fn is_mostly_used(&self) -> bool {
         let frac = self.reserved / 8;
@@ -790,10 +671,8 @@ impl Page {
         self.used.get() == 0
     }
 
-    /// Is the page unable to serve another allocation? It is full only when the
-    /// free list is empty after a collect **and** there is no uninitialized
-    /// capacity left to extend (`capacity == reserved`); an extendable page can
-    /// still serve, so it is not full.
+    /// Is the page unable to serve another allocation? Full only when `free` is
+    /// empty after a collect **and** `capacity == reserved`.
     pub fn is_full(&self) -> bool {
         if !self.free.get().is_null() {
             return false;
@@ -820,7 +699,6 @@ mod tests {
     use crate::arena::Arena;
 
     fn with_page<R>(block_size: usize, f: impl FnOnce(&Page) -> R) -> R {
-        // A single 64 KiB slice page.
         let arena = Arena::create(8, true).unwrap();
         // SAFETY: fresh arena.
         unsafe {
@@ -1024,13 +902,10 @@ mod loom_tests {
         });
     }
 
-    // Models the FE1b ownership-claim protocol abstractly: the `xthread_free`
-    // head as `block<<1 | owned` (LSB = ownership token). These prove the
-    // *exactly-once* claim invariant — the property that makes collect-on-free of
-    // an abandoned page safe (only the single claimer frees/reabandons it).
+    // Model the ownership-claim protocol abstractly (LSB = ownership token),
+    // proving the exactly-once claim invariant for collect-on-free.
 
-    /// `thread_free_push` marking owned: CAS the head to `(block, owned=1)`;
-    /// the push *claimed* the page iff the prior head was unowned.
+    /// `thread_free_push` marking owned: claimed iff the prior head was unowned.
     fn push_claim(head: &AtomicUsize, block: usize) -> bool {
         loop {
             let cur = head.load(Ordering::Acquire);

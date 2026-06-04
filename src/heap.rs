@@ -1,15 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Heaps (ports the allocation core of `src/heap.c` / `src/alloc.c`).
-//!
-//! A heap owns one [`PageQueue`] per size-class bin and turns size requests into
-//! blocks: pick the bin, find a page with a free block (or carve a new page from
-//! an arena via the [`crate::subproc`]), and pop a block. Freeing is heap
-//! independent — it finds the owning page through the [`crate::page_map`].
-//!
-//! The heap is single-owner (per thread). It has a `pages_free_direct` fast
-//! array (skip the bin-queue scan for small sizes), retires empty pages to the
-//! arena, and on thread exit abandons/releases its pages (see [`crate::page`]
-//! and [`crate::subproc`]). The `mi_theap_t`/`tld` split remains follow-up work.
+//! Heaps (ports `src/heap.c` / `src/alloc.c`). Single-owner (per thread).
 
 use core::cell::Cell;
 use core::ptr::NonNull;
@@ -30,14 +20,10 @@ use crate::page_map;
 use crate::page_queue::PageQueue;
 use crate::subproc::{subproc_main, Subproc};
 
-/// Canonical block size for each bin (the largest request the bin serves),
-/// evaluated at compile time. C reads `pages[bin].block_size` (a plain field);
-/// computing this table as a `const` makes `bin_block_size` a bare array index
-/// with no runtime initialization atomic on the direct-miss alloc path.
+/// Largest request each bin serves. Rust: a `const` table (vs C's runtime
+/// `pages[bin].block_size` field), so `bin_block_size` is a bare array index.
 const BIN_SIZES: [usize; MI_BIN_COUNT] = {
     let mut t = [0usize; MI_BIN_COUNT];
-    // Scan every word size up to the largest non-huge object and record the
-    // maximum byte size landing in each bin.
     let max_wsize = MI_LARGE_MAX_OBJ_SIZE / MI_INTPTR_SIZE;
     let mut w = 1;
     while w <= max_wsize {
@@ -57,8 +43,7 @@ fn bin_block_size(b: usize) -> usize {
     BIN_SIZES[b]
 }
 
-/// The usable size a `malloc(size)` would yield (`mi_good_size`): the block
-/// size of the bin the request maps to (huge requests round up to a slice).
+/// The usable size a `malloc(size)` would yield (`mi_good_size`).
 pub fn good_size(size: usize) -> usize {
     let size = size.max(MI_INTPTR_SIZE);
     let b = bin(size);
@@ -69,8 +54,7 @@ pub fn good_size(size: usize) -> usize {
     }
 }
 
-/// How many 64 KiB slices a page serving `block_size` blocks should span
-/// (small ⇒ 1, medium ⇒ 8, large ⇒ 64), mirroring `mi_page_kind_t`.
+/// Slices a page serving `block_size` should span (mirrors `mi_page_kind_t`).
 fn page_slices_for(block_size: usize) -> usize {
     if block_size <= MI_SMALL_MAX_OBJ_SIZE {
         1
@@ -92,15 +76,9 @@ pub struct Heap {
     tseq: Cell<usize>,
     /// One page queue per bin (`MI_BIN_COUNT` includes the full/huge queues).
     pages: [PageQueue; MI_BIN_COUNT],
-    /// Fast-path lookup (`mi_theap_t.pages_free_direct`): for each small word
-    /// size, the page that most recently served it. The malloc fast path tries
-    /// this page directly, skipping the bin-queue scan.
-    ///
-    /// Invariant: a non-null entry points at a live page owned by this heap.
-    /// Maintained because (a) the array is per-heap and only ever stores pages
-    /// this heap allocated from, (b) `retire_page` clears matching entries
-    /// before releasing slices, and (c) `Heap::drop` releases/abandons pages and
-    /// then the array itself is dropped — so an entry can never outlive its page.
+    /// `mi_theap_t.pages_free_direct`: per small word size, the page that last
+    /// served it. Invariant: a non-null entry points at a live page owned by
+    /// this heap (entries are cleared in `retire_page` before slices are freed).
     pages_free_direct: [Cell<*mut Page>; MI_PAGES_DIRECT],
 }
 
@@ -118,10 +96,8 @@ impl Heap {
         }
     }
 
-    /// Allocate a first-class heap from metadata memory (mirrors `mi_heap_new`).
-    /// The returned heap is owned by `tid` and must be released with
-    /// [`Heap::delete`] (keeps live blocks valid) or [`Heap::destroy`] (frees
-    /// all its blocks at once). Returns `None` on metadata OOM.
+    /// Allocate a first-class heap from metadata memory (`mi_heap_new`). Release
+    /// with [`Heap::delete`] or [`Heap::destroy`]. Returns `None` on metadata OOM.
     pub fn new_boxed(keys: [usize; 2], tid: usize) -> Option<NonNull<Heap>> {
         let mem = meta_zalloc(core::mem::size_of::<Heap>())?;
         let p = mem.as_ptr() as *mut Heap;
@@ -130,9 +106,8 @@ impl Heap {
         NonNull::new(p)
     }
 
-    /// Delete a first-class heap (mirrors `mi_heap_delete`): hands off its pages
-    /// via the normal drop path (empty pages released, non-empty abandoned so
-    /// outstanding blocks stay valid and reclaimable), then frees the heap.
+    /// Delete a first-class heap (`mi_heap_delete`): hand off its pages via the
+    /// drop path (live blocks stay valid), then free the heap.
     ///
     /// # Safety
     /// `heap` must come from [`Heap::new_boxed`] and not be used afterwards.
@@ -144,9 +119,8 @@ impl Heap {
         }
     }
 
-    /// Destroy a first-class heap (mirrors `mi_heap_destroy`): free **all** of
-    /// its pages and their blocks in bulk, then free the heap. All pointers
-    /// allocated from this heap become invalid.
+    /// Destroy a first-class heap (`mi_heap_destroy`): free **all** of its pages
+    /// and blocks in bulk, then free the heap. All pointers from it become invalid.
     ///
     /// # Safety
     /// `heap` must come from [`Heap::new_boxed`], no block of it may be used
@@ -169,7 +143,6 @@ impl Heap {
                 cur = next;
             }
         }
-        // Free the heap struct itself (no Drop: its pages are already released).
         // SAFETY: heap memory is a metadata block no longer referenced.
         unsafe { meta_free(heap.cast::<u8>(), core::mem::size_of::<Heap>()) };
     }
@@ -186,7 +159,6 @@ impl Heap {
     #[inline]
     pub fn alloc(&self, size: usize) -> Option<NonNull<u8>> {
         let r = self.alloc_impl(size);
-        // Account by block size (matches `free`); only compiled under `stats`.
         #[cfg(feature = "stats")]
         if let Some(p) = r {
             // SAFETY: `p` is a block-start allocation we just made.
@@ -196,15 +168,9 @@ impl Heap {
         r
     }
 
-    /// Allocation fast path: serve from the page that last served this word size
-    /// (`pages_free_direct`), which usually still has a free block. The cold
-    /// queue-scan / reclaim / fresh-page work lives in `alloc_generic`.
-    ///
-    /// `alloc_generic` is left un-hinted: the statically-linked `#[global_allocator]`
-    /// caller sees the whole chain and inlines holistically (mirroring C's
-    /// force-inlined `mi_page_malloc_zero` over the noinline `_mi_malloc_generic`),
-    /// so we let the optimizer fold it back in — forcing it out of line measurably
-    /// regresses the small-alloc hot path (phase 1).
+    /// Allocation fast path: serve from `pages_free_direct[wsize]`. The cold
+    /// queue-scan / reclaim / fresh-page work lives in `alloc_generic`, left
+    /// un-hinted so the static `#[global_allocator]` build folds the whole chain.
     #[inline]
     fn alloc_impl(&self, size: usize) -> Option<NonNull<u8>> {
         let size = size.max(MI_INTPTR_SIZE);
@@ -223,18 +189,13 @@ impl Heap {
         self.alloc_generic(size, wsize)
     }
 
-    /// Cold allocation path: no direct page was available — map the size to its
-    /// bin and scan the bin queue, reclaim an abandoned page, or carve a fresh
-    /// one. (See `alloc_impl`.)
+    /// Cold allocation path (see `alloc_impl`).
     fn alloc_generic(&self, size: usize, wsize: usize) -> Option<NonNull<u8>> {
         let b = bin(size);
         if b >= MI_BIN_HUGE {
             return self.alloc_huge(size);
         }
         let bs = bin_block_size(b);
-        // Pick the page that will serve this request: scan the bin queue, else
-        // reclaim an abandoned page, else carve a fresh one; record it for the
-        // fast path.
         let mut pg = match self.find_free_page(b) {
             Some(p) => p,
             None => self.new_page(b, bs, page_slices_for(bs))?,
@@ -242,8 +203,7 @@ impl Heap {
         // SAFETY: `pg` is a live page owned by this heap.
         let mut blk = unsafe { (*pg).alloc() };
         if blk.is_none() {
-            // The chosen page had no free block (e.g. a reclaimed page whose
-            // blocks are all still live) — carve a fresh page instead.
+            // Chosen page had no free block (e.g. a reclaimed page still full).
             pg = self.new_page(b, bs, page_slices_for(bs))?;
             // SAFETY: freshly created, non-full page.
             blk = unsafe { (*pg).alloc() };
@@ -254,8 +214,8 @@ impl Heap {
         blk
     }
 
-    /// Find a page in bin `b` with a free block, else reclaim an abandoned page,
-    /// else `None` (the caller carves a fresh page). First-fit scan.
+    /// First-fit page in bin `b` with a free block, else reclaim an abandoned
+    /// page, else `None` (caller carves a fresh page).
     #[inline]
     fn find_free_page(&self, b: usize) -> Option<*mut Page> {
         let mut cur = self.pages[b].first();
@@ -271,9 +231,7 @@ impl Heap {
         self.try_reclaim(b)
     }
 
-    /// Adopt an abandoned page of `bin` (left by an exited thread): claim
-    /// ownership, drain the cross-thread frees that accumulated while it was
-    /// abandoned, re-home it into this heap, and return it.
+    /// Adopt an abandoned page of `bin` (left by an exited thread).
     fn try_reclaim(&self, bin: usize) -> Option<*mut Page> {
         let page_ptr = self.subproc.reclaim_page(bin, self.next_tseq())?;
         // SAFETY: popped from the abandoned stack — exclusively ours now.
@@ -281,9 +239,7 @@ impl Heap {
         let arena = page.owning_arena();
         page.set_owner(self.tid);
         page.set_provenance(self as *const Heap as *mut Heap, arena, bin as u32);
-        // Collect blocks freed cross-thread while the page was abandoned.
-        // SAFETY: owner now; drains the cross-thread frees accumulated while
-        // abandoned, then links the now-owned page into our bin queue.
+        // SAFETY: owner now; drain cross-thread frees, then link into our queue.
         unsafe {
             page.collect_free();
             self.pages[bin].push_front(page_ptr);
@@ -291,28 +247,21 @@ impl Heap {
         Some(page_ptr)
     }
 
-    /// Allocate `size` bytes aligned to `align` (a power of two).
-    ///
-    /// For `align <= MI_INTPTR_SIZE` every block is already suitably aligned.
-    /// For larger alignments we over-allocate so an aligned pointer fits inside
-    /// one block; [`free`] recovers the block start from the interior pointer
-    /// via the page-map, so no extra bookkeeping is needed.
+    /// Allocate `size` bytes aligned to `align` (a power of two). For larger
+    /// alignments, over-allocate so an aligned interior pointer fits in one
+    /// block; [`free`] recovers the block start via the page-map.
     pub fn alloc_aligned(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
         debug_assert!(align.is_power_of_two());
         if align <= MI_INTPTR_SIZE {
             return self.alloc(size);
         }
-        // Guard the over-allocation against overflow (e.g. a huge `size` with a
-        // large alignment) — return null rather than wrapping to a tiny block.
+        // Guard against overflow — return null rather than wrap to a tiny block.
         let total = size.checked_add(align - 1)?;
         let p = self.alloc(total)?;
         let aligned = align_up(p.addr().get(), align);
         if aligned != p.addr().get() {
-            // We are handing out an *interior* pointer. Flag the page so the free
-            // fast path recovers the block start instead of assuming a block-start
-            // pointer (ports `mi_page_set_has_interior_pointers` in
-            // `alloc-aligned.c`). Only the rare large-alignment path pays the
-            // page-map lookup.
+            // Interior pointer: flag the page (ports `mi_page_set_has_interior_pointers`,
+            // alloc-aligned.c) so the free fast path recovers the block start.
             let page = page_map::lookup(p.addr().get()) as *mut Page;
             debug_assert!(!page.is_null(), "just-allocated block must be mapped");
             // SAFETY: the block we just allocated is registered in the page-map.
@@ -325,7 +274,6 @@ impl Heap {
 
     /// Allocate an object too large for any size class as its own page.
     fn alloc_huge(&self, size: usize) -> Option<NonNull<u8>> {
-        // One block occupying the whole page area.
         let header = align_up(core::mem::size_of::<Page>(), MI_MAX_ALIGN_SIZE);
         let need = align_up(header + size, MI_ARENA_SLICE_SIZE);
         let slices = need / MI_ARENA_SLICE_SIZE;
@@ -339,21 +287,15 @@ impl Heap {
     /// register it in the page-map, and push it on the bin queue.
     fn new_page(&self, bin: usize, bs: usize, slices: usize) -> Option<*mut Page> {
         let tseq = self.next_tseq();
-        // `eager_commit` (option) controls whether a freshly reserved arena is
-        // committed up front or committed per-slice on demand (lower RSS).
         let eager = crate::options::eager_commit();
         let (arena, idx, p) = self.subproc.alloc_slices(slices, eager, tseq)?;
         // SAFETY: `p` is `slices` committed, slice-aligned slices owned by us.
         let page = unsafe { Page::init(p, idx, slices, bs, self.keys) };
         let page_ptr = page.as_ptr();
-        // Stamp ownership so cross-thread frees route to `xthread_free`, and
-        // record heap/arena/bin so the page can be retired when it empties.
         // SAFETY: page just created and owned by this thread.
         unsafe {
-            // Fresh, unpublished page (flags are 0, no other thread can see it):
-            // a plain store, not the flag-preserving CAS used when reclaiming a
-            // live page — the per-page creation cost shows up directly on the
-            // huge workload (one page per allocation).
+            // Fresh, unpublished page: a plain store, not the flag-preserving CAS
+            // used when reclaiming a live page.
             page.as_ref().set_owner_fresh(self.tid);
             page.as_ref().set_provenance(
                 self as *const Heap as *mut Heap,
@@ -361,9 +303,7 @@ impl Heap {
                 bin as u32,
             );
         }
-        // Map every slice of the page back to its header.
-        // Debug guard: a freshly carved slice run must not already be mapped to
-        // another page (would indicate an arena double-allocation).
+        // Debug guard against an arena double-allocation.
         #[cfg(debug_assertions)]
         for s in 0..slices {
             let a = p.addr().get() + s * MI_ARENA_SLICE_SIZE;
@@ -375,8 +315,7 @@ impl Heap {
         // SAFETY: range is slice-aligned and live; header pointer is valid.
         unsafe {
             if !page_map::register(p.addr().get(), slices, page_ptr as *mut u8) {
-                // OOM in the page-map (register rolled back its own entries):
-                // return the slices to the arena so nothing leaks.
+                // Page-map OOM (register rolled itself back): return the slices.
                 arena.as_ref().free_slices(idx, slices);
                 return None;
             }
@@ -392,35 +331,20 @@ impl Heap {
         self.keys
     }
 
-    /// Reclaim memory held by this heap (mirrors `mi_heap_collect`): walk every
-    /// bin queue, drain each page's pending cross-thread + local frees, and
-    /// return now-empty pages to the arena so footprint tracks the live set.
+    /// Reclaim memory held by this heap (`mi_heap_collect`): drain each page's
+    /// cross-thread + local frees and return now-empty pages to the arena.
+    /// `force` also releases the sole kept page of a bin (see [`retire_page`]).
     ///
-    /// When `force` is set, collection is more aggressive: even the sole kept
-    /// page of a bin (normally retained to avoid rebuild churn — see
-    /// [`retire_page`]) is released. Otherwise the keep-sole rule is honored.
-    ///
-    /// This is a safe `&self` method but internally relies on owner-only access
-    /// to each page's local free lists and bin queues, exactly like
-    /// [`Page::collect_free`]. Per the documented `mi_heap_*` single-thread
-    /// contract it must be called from the heap's owning thread; calling it from
-    /// any other thread is a logic error (the blocks freed cross-thread are still
-    /// reclaimed safely, but the owner-only `Cell` accesses are not synchronized).
-    ///
-    /// Unlike the C `mi_heap_collect`, this does not (yet) purge empty arena
-    /// ranges back to the OS or merge per-thread statistics — `force` is more
-    /// aggressive only about releasing pages, not about driving down RSS. Those
-    /// are tracked as follow-up work (see the module header).
+    /// Must be called from the heap's owning thread (the `mi_heap_*` contract):
+    /// internally relies on owner-only `Cell` access like [`Page::collect_free`].
     pub fn collect(&self, force: bool) {
-        // Owner-only contract: fail fast in hardened/test builds if a non-owning
-        // thread calls in (matches the C reference's owner-tid guard).
+        // Owner-only contract: fail fast in hardened/test builds.
         #[cfg(all(feature = "std", any(debug_assertions, feature = "secure")))]
         debug_assert_eq!(
             self.tid,
             crate::init::current_tid(),
             "Heap::collect called from a non-owning thread (mi_heap_* is owner-thread-only)"
         );
-        // Fire any registered deferred-free callback (our heartbeat point).
         #[cfg(feature = "std")]
         crate::init::run_deferred_free(force);
         for b in 0..MI_BIN_COUNT {
@@ -435,10 +359,8 @@ impl Heap {
                 // Owner thread; reading our own page's used count.
                 if p.is_all_free() {
                     if force {
-                        // Aggressive: release even the sole kept page. Clear any
-                        // fast-path entries pointing at it first so the direct
-                        // lookup can never dangle (the same guard `retire_page`
-                        // applies). Every page in `self.pages[b]` is heap-managed.
+                        // Release even the sole kept page; clear fast-path entries
+                        // pointing at it first so the direct lookup cannot dangle.
                         for slot in self.pages_free_direct.iter() {
                             if slot.get() == cur {
                                 slot.set(core::ptr::null_mut());
@@ -459,42 +381,28 @@ impl Heap {
                 cur = next;
             }
         }
-        // Return any due (and, with `force`, all) freed-but-still-resident arena
-        // slices to the OS. This is the heartbeat that drives delayed purging.
+        // Heartbeat that drives delayed purging back to the OS.
         self.subproc.try_purge(force);
     }
 }
 
-/// Whether `ptr` points into a region this allocator manages (i.e. it lies
-/// within one of our arenas). Foreign pointers (system malloc, the dynamic
-/// linker, TLS, etc.) return false. This is the basis for the override fallback
-/// and for `mi_is_in_heap_region`.
-///
-/// This tests **arena membership**, not page-map presence (mirroring the C
-/// `mi_is_in_heap_region`, which tests arena/region membership). A page-map
-/// lookup is null for both genuinely foreign pointers *and* our own pointers
-/// whose page was retired/unregistered (a double-free, a free racing a retire,
-/// or freeing an already-reclaimed block). Such a pointer is still inside our
-/// arena — arenas are never unmapped back to the OS — so handing it to the
-/// system allocator (under `override`) would abort. Arena membership separates
-/// "ours but not currently mapped" from "truly foreign".
+/// Whether `ptr` lies within one of our arenas (`mi_is_in_heap_region`). Tests
+/// **arena membership**, not page-map presence: a retired/unregistered block is
+/// still in our arena (arenas are never unmapped), so this separates "ours but
+/// not currently mapped" from "truly foreign".
 pub fn is_in_heap_region(ptr: *const u8) -> bool {
     !ptr.is_null() && subproc_main().owns_address(ptr)
 }
 
 /// Cold free path for a pointer with no page-map entry. In a rust-native global
-/// allocator such a pointer is always *ours* whose page was retired/unregistered
-/// (a double-free, a free racing a concurrent retire, or freeing an
-/// already-reclaimed block) — never foreign, since every pointer reaching this
-/// allocator's `free` originated from its `alloc`. Arenas are never unmapped, so
-/// the block is still inside one of our arenas.
+/// allocator such a pointer is always an invalid/double free of one of our own
+/// blocks whose page was retired (never foreign): no-op by default, abort under
+/// hardened builds.
 ///
 /// # Safety
 /// `ptr` was passed to `free` and has no page-map entry.
 unsafe fn free_foreign_or_invalid(ptr: NonNull<u8>) {
     let _ = ptr;
-    // Ours-but-unmapped: an invalid/double free of one of our blocks. Default
-    // builds treat it as a no-op; hardened builds abort.
     #[cfg(any(feature = "secure", feature = "debug"))]
     report_corruption_and_abort(
         "mimalloc-rs: invalid free (pointer not owned by this allocator)\n",
@@ -502,10 +410,6 @@ unsafe fn free_foreign_or_invalid(ptr: NonNull<u8>) {
 }
 
 /// Free a block previously returned by [`Heap::alloc`] (heap-independent).
-///
-/// Finds the owning page through the page-map and returns the block to it.
-/// Owner frees take the local deferred-free path; non-owner (cross-thread)
-/// frees push the block onto the page's atomic `xthread_free` list.
 ///
 /// # Safety
 /// `ptr` must be a live allocation from this allocator.
@@ -518,22 +422,14 @@ pub unsafe fn free(ptr: NonNull<u8>) {
     }
     #[cfg(feature = "std")]
     {
-        // Fold the owner-vs-cross-thread decision and the page flag check into a
-        // single XOR (ports `mi_free_ex`, `free.c:185-205`): `xtid == 0` means we
-        // own the page *and* it carries no flags (not full, no interior) *and* the
-        // pointer is a block start — the hot local path. Every other case (an
-        // owner free into a full/interior-flagged page, or a cross-thread /
-        // abandoned-page free) is rare and handled out of line in [`free_cold`],
-        // so this path touches only the page header + free list and stays a tight
-        // near-leaf (no callee-saved spills, no block-size load), matching C's
-        // "written carefully to prevent register spilling" `mi_free_ex` fast path.
+        // Flag-folded dispatch (ports `mi_free_ex`, free.c:185-205): `xtid == 0`
+        // ⇒ we own the page, it carries no flags, and `ptr` is a block start —
+        // the hot local path. Everything else goes out of line via [`free_cold`].
         // SAFETY: reads the raw xthread_id atomically without forming `&Page`.
         let raw = unsafe { Page::xthread_id_raw(page_ptr) };
         let xtid = crate::init::current_tid() ^ raw;
         if xtid == 0 {
-            // Hardened builds: detect frees of pointers outside the block area and
-            // double frees before mutating the free list. (`xtid == 0` ⇒ the page
-            // carries no flags, so `ptr` is already the block start.)
+            // Hardened builds: detect out-of-block and double frees first.
             #[cfg(any(feature = "secure", feature = "debug"))]
             // SAFETY: this thread owns the page.
             unsafe {
@@ -547,15 +443,11 @@ pub unsafe fn free(ptr: NonNull<u8>) {
                     report_corruption_and_abort("mimalloc-rs: double free detected\n");
                 }
             }
-            // Block size only feeds the stats counter; with `stats` off the load
-            // is dead and is eliminated, keeping the header's first touch the only
-            // page-header access on this path.
             // SAFETY: live header; const field read.
             crate::stats::on_free(unsafe { Page::raw_block_size(page_ptr) });
             // SAFETY: this thread owns the page; `ptr` is a block start.
             unsafe {
                 (*page_ptr).free_local(ptr);
-                // If the page is now fully free, retire it (return its slices).
                 if (*page_ptr).is_all_free() {
                     retire_page(page_ptr);
                 }
@@ -567,8 +459,7 @@ pub unsafe fn free(ptr: NonNull<u8>) {
     }
     #[cfg(not(feature = "std"))]
     {
-        // Without std TLS we assume single-owner frees; embedders that share
-        // heaps across tasks must route cross-task frees themselves.
+        // Without std TLS we assume single-owner frees.
         // SAFETY: live header; const field read.
         let bs = unsafe { Page::raw_block_size(page_ptr) };
         crate::stats::on_free(bs);
@@ -584,9 +475,7 @@ pub unsafe fn free(ptr: NonNull<u8>) {
 }
 
 /// Recover the block start from a (possibly interior) pointer. A block-start
-/// pointer (`off == 0`, the overwhelmingly common case) skips the divide; only an
-/// interior pointer from a large-alignment `alloc_aligned` — which sets the page's
-/// `has_interior` flag — needs the normalization.
+/// pointer (`off == 0`, the common case) skips the divide.
 ///
 /// # Safety
 /// `page_ptr` is a live header; `p` lies within its block area; `bs` is the page's
@@ -605,19 +494,16 @@ unsafe fn recover_block_start(page_ptr: *mut Page, p: NonNull<u8>, bs: usize) ->
     unsafe { NonNull::new_unchecked(bstart) }
 }
 
-/// Cold free paths split out of [`free`] so the common local free stays a tight
-/// near-leaf: an **owner** free into a full / interior-flagged page (`xtid` within
-/// the flag mask), or a **cross-thread / abandoned-page** free (`xtid` above the
-/// mask). Ports the non-fast arms of `mi_free_ex` (`free.c:185-205`). Left
-/// un-hinted; a static `#[global_allocator]` build lets the optimizer fold it
-/// back holistically.
+/// Cold free arms of `mi_free_ex` (free.c:185-205): an **owner** free into a
+/// full / interior-flagged page (`xtid` within the flag mask), or a
+/// **cross-thread / abandoned-page** free (`xtid` above the mask).
 #[cfg(feature = "std")]
 unsafe fn free_cold(ptr: NonNull<u8>, page_ptr: *mut Page, xtid: usize) {
     // SAFETY: live header; const field read.
     let bs = unsafe { Page::raw_block_size(page_ptr) };
     crate::stats::on_free(bs);
     if xtid & !MI_PAGE_FLAG_MASK == 0 {
-        // Owner, but the page is full / holds interior pointers: recover the start.
+        // Owner, but page is full / interior-flagged: recover the start.
         // SAFETY: live page owned by this thread.
         let block = unsafe { recover_block_start(page_ptr, ptr, bs) };
         #[cfg(any(feature = "secure", feature = "debug"))]
@@ -641,9 +527,7 @@ unsafe fn free_cold(ptr: NonNull<u8>, page_ptr: *mut Page, xtid: usize) {
             }
         }
     } else {
-        // Cross-thread (or abandoned) page: atomic Treiber push (touches only the
-        // atomic + block). `xtid & FLAG_MASK == 0` ⇒ block-start pointer; a flagged
-        // page → recover the block start.
+        // Cross-thread (or abandoned) page: atomic Treiber push.
         let block = if xtid & MI_PAGE_FLAG_MASK == 0 {
             ptr
         } else {
@@ -653,9 +537,7 @@ unsafe fn free_cold(ptr: NonNull<u8>, page_ptr: *mut Page, xtid: usize) {
         // SAFETY: live page and block.
         let claimed = unsafe { Page::thread_free_push(page_ptr, block) };
         if claimed {
-            // The page was abandoned and this push transitioned it unowned→owned:
-            // we now exclusively own it and must collect it, then free / reabandon /
-            // unown (ports mi_free_block_mt → mi_free_try_collect_mt).
+            // This push transitioned the abandoned page unowned→owned.
             // SAFETY: we exclusively own the page now; `block` is the head we just
             // pushed (enables the no-atomic partial collect).
             unsafe {
@@ -665,8 +547,7 @@ unsafe fn free_cold(ptr: NonNull<u8>, page_ptr: *mut Page, xtid: usize) {
     }
 }
 
-/// Report memory corruption (invalid/double free) and abort. Hardened builds
-/// only (`secure`/`debug`); mirrors mimalloc's fail-fast on detected misuse.
+/// Report memory corruption (invalid/double free) and abort. Hardened builds only.
 #[cfg(any(feature = "secure", feature = "debug"))]
 #[cold]
 #[inline(never)]
@@ -678,18 +559,16 @@ fn report_corruption_and_abort(msg: &str) -> ! {
     }
     #[cfg(not(feature = "std"))]
     {
-        // No portable abort without std; halt this thread so the corruption
-        // cannot propagate (embedders may install their own panic/abort hook).
+        // No portable abort without std; halt this thread.
         loop {
             core::hint::spin_loop();
         }
     }
 }
 
-/// Retire a now-empty page: return its slices to the owning arena and clear its
-/// page-map entries, so memory footprint tracks the live set rather than the
-/// peak. To avoid alloc/free churn on the common single-page case, the sole
-/// remaining page of a (non-huge) bin is kept for reuse.
+/// Retire a now-empty page: return its slices to the arena and clear its
+/// page-map entries. The sole remaining page of a (non-huge) bin is kept to
+/// avoid alloc/free churn.
 ///
 /// # Safety
 /// `page_ptr` is a live, fully-free page owned by the calling (owner) thread,
@@ -704,13 +583,11 @@ unsafe fn retire_page(page_ptr: *mut Page) {
     }
     // SAFETY: heap is this thread's heap (owner-only access is safe here).
     let heap = unsafe { &*heap };
-    // Keep the last page of a normal bin to avoid rebuild churn; always retire
-    // huge pages (each is a distinct large mapping) and surplus pages.
+    // Keep the last page of a normal bin; always retire huge pages.
     if bin != MI_BIN_HUGE && heap.pages[bin].len() <= 1 {
         return;
     }
-    // Clear any fast-path entries pointing at this page before its memory is
-    // released, so the direct lookup can never dangle.
+    // Clear fast-path entries pointing at this page before release.
     for slot in heap.pages_free_direct.iter() {
         if slot.get() == page_ptr {
             slot.set(core::ptr::null_mut());
@@ -721,25 +598,17 @@ unsafe fn retire_page(page_ptr: *mut Page) {
         heap.pages[bin].remove(page_ptr);
         release_page_slices(page_ptr);
     }
-    // Drive delayed purging opportunistically as pages drain (cheap when nothing
-    // is due). Mirrors v3 retiring a page → `_mi_arenas_collect` → try-purge.
+    // Mirrors v3 retire → `_mi_arenas_collect` → try-purge.
     heap.subproc.try_purge(false);
 }
 
 /// Return a page's slices to its arena and drop its address→page mappings.
 ///
-/// ## Cross-thread safety (why releasing an empty page cannot race a foreign free)
-/// A block freed by a non-owner thread is pushed onto `xthread_free` and stays
-/// counted in `Page::used` until the owner *collects* it; a cross-thread free
-/// never decrements `used`. Therefore `used == 0` (the precondition for getting
-/// here) implies every block — including any freed by other threads — has
-/// already been collected. Collection swaps `xthread_free` with `Acquire`, which
-/// synchronizes-with the foreign push's `Release` CAS; so every access a foreign
-/// freer makes to this page (page-map lookup, header reads, the block-link write,
-/// the CAS) *happens-before* the collect, hence before this release. A foreign
-/// freer performs no access to the page after its push returns. Thus when the
-/// slices are returned here, no other thread can still be touching the page.
-/// (Double frees are caller UB and are caught separately under `secure`/`debug`.)
+/// Cross-thread safety: a cross-thread free pushes onto `xthread_free` and never
+/// decrements `used`, so `used == 0` implies every such block was already
+/// collected. Collection's `Acquire` swap synchronizes-with the foreign push's
+/// `Release` CAS, so all foreign-freer accesses happen-before this release and
+/// no other thread can still touch the page here.
 ///
 /// # Safety
 /// `page_ptr` must be an empty page (`used == 0`), already unlinked from any
@@ -777,15 +646,12 @@ unsafe fn unabandon_if_mapped(page_ptr: *mut Page) {
     }
 }
 
-/// We just claimed a previously-abandoned page by freeing a block into it
-/// (ports `mi_free_try_collect_mt`). With the page exclusively ours: collect, then
-/// (1) free it if now empty, else (2) reabandon-to-mapped if it has space again,
-/// else (3) release ownership.
+/// We just claimed a previously-abandoned page (ports `mi_free_try_collect_mt`):
+/// collect, then (1) free if empty, (2) reabandon-to-mapped if it has space, or
+/// (3) release ownership.
 ///
-/// `mt_free` is the block the caller just pushed onto `xthread_free` (its head),
-/// letting the first collect use the no-atomic [`Page::collect_partly`] for small
-/// blocks (ports `mi_free_try_collect_mt`'s `_partly` fast path); larger blocks
-/// and all retries take the full atomic [`Page::collect_free`].
+/// `mt_free` is the block the caller just pushed (the `xthread_free` head),
+/// enabling the no-atomic [`Page::collect_partly`] fast path for small blocks.
 ///
 /// # Safety
 /// The calling thread exclusively owns `page_ptr` (claimed via the ownership bit);
@@ -799,18 +665,15 @@ unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_lis
     let mut first = true;
     loop {
         if first && small {
-            // First pass: collect the rest of the thread-free list without the
-            // atomic swap (we already hold `mt_free`, the current head).
-            // SAFETY: owner; `mt_free` is the just-pushed head.
+            // SAFETY: owner; `mt_free` is the just-pushed head (no atomic swap).
             unsafe { page.collect_partly(mt_free) };
         } else {
-            // SAFETY: we own the page; drain cross-thread + local frees (used).
+            // SAFETY: we own the page; drain cross-thread + local frees.
             unsafe { page.collect_free() };
         }
         first = false;
 
-        // 1. All blocks free → unabandon (clear any registry bit) and return the
-        //    slices to the arena.
+        // 1. Empty → unabandon and return the slices.
         if page.is_all_free() {
             // SAFETY: owner; provenance set at creation. (`page` is dead after
             // `release_page_slices` returns the header's slice to the arena.)
@@ -821,10 +684,8 @@ unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_lis
             return;
         }
 
-        // 2. Reabandon-to-mapped: a page with free space that is not yet mapped
-        //    becomes findable for reclaim-on-alloc. Register it (set the bitmap
-        //    bit) and stamp the mapped state *before* releasing ownership, so a
-        //    concurrent reclaimer that finds the bit must lose the ownership race.
+        // 2. Reabandon-to-mapped: register + stamp the mapped state *before*
+        //    releasing ownership, so a concurrent reclaimer loses the race.
         if !page.is_full() && !page.is_abandoned_mapped() {
             let bin = page.bin() as usize;
             let arena = page.owning_arena();
@@ -837,9 +698,7 @@ unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_lis
             }
         }
 
-        // 3. Release ownership. If a concurrent free pushed a block in the
-        //    window, `try_unown` fails — loop to re-collect and re-evaluate (the
-        //    page may now be freeable, or already mapped).
+        // 3. Release ownership; a racing free makes `try_unown` fail → re-loop.
         // SAFETY: owner; just collected.
         if unsafe { page.try_unown() } {
             return;
@@ -847,13 +706,11 @@ unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_lis
     }
 }
 
-/// Hand a page we own off to the abandoned state (on thread exit, from
-/// [`Heap`]'s `Drop`). Collect it, then: empty →
-/// return its slices to the arena; full → abandoned **unmapped** (resurrected
-/// only by a later free-claim); otherwise → abandoned **mapped** (registered in
-/// `pages_abandoned[bin]`, findable for reclaim-on-alloc). Ownership is released
-/// last, after the state is stamped, so a concurrent free cannot claim it
-/// mid-handoff. Ports `_mi_page_abandon`.
+/// Hand a page we own off to the abandoned state (ports `_mi_page_abandon`),
+/// on thread exit from [`Heap`]'s `Drop`. Collect, then: empty → return slices;
+/// full → abandoned **unmapped**; otherwise → abandoned **mapped** (findable for
+/// reclaim-on-alloc). Ownership is released last so a free cannot claim it
+/// mid-handoff.
 ///
 /// # Safety
 /// `page_ptr` is a live page owned by the caller, already unlinked from any bin
@@ -869,14 +726,13 @@ unsafe fn abandon_owned_page(subproc: &Subproc, page_ptr: *mut Page, bin: usize)
         // returns the header's slice to the arena.)
         unsafe { release_page_slices(page_ptr) };
     } else if page.is_full() {
-        // Full ⇒ abandoned but unmapped (kept out of the registry).
         // SAFETY: owner.
         unsafe {
             page.set_owner(MI_THREADID_ABANDONED);
             page.set_unowned();
         }
     } else {
-        // Has free space ⇒ abandoned mapped: register, stamp, then release.
+        // Abandoned mapped: register, stamp, then release.
         // SAFETY: owner; the page's slices belong to its arena.
         unsafe {
             subproc.abandon_page(page_ptr, bin);
@@ -887,10 +743,8 @@ unsafe fn abandon_owned_page(subproc: &Subproc, page_ptr: *mut Page, bin: usize)
 }
 
 impl Drop for Heap {
-    /// On thread exit, hand off this heap's pages so their memory is not
-    /// stranded: empty pages are released to the arena; pages with live blocks
-    /// (still held by the application, to be freed cross-thread later) are
-    /// abandoned for another thread to reclaim.
+    /// On thread exit, hand off this heap's pages: empty pages are released to
+    /// the arena, pages with live blocks are abandoned for another thread.
     fn drop(&mut self) {
         for b in 0..MI_BIN_COUNT {
             let mut cur = self.pages[b].first();
@@ -909,22 +763,16 @@ impl Drop for Heap {
     }
 }
 
-/// Usable bytes reachable from `ptr` within its block.
-///
-/// For a block-start pointer this is the full block size; for an *interior*
-/// pointer (handed out by [`Heap::alloc_aligned`] for large alignments) it is
-/// the block size minus the in-block offset — i.e. exactly the space the caller
-/// may write. Returning the full block size here would be unsound: `realloc`
-/// would believe more space is available than there is.
+/// Usable bytes reachable from `ptr` within its block. For an interior pointer
+/// (from [`Heap::alloc_aligned`]) this is the block size minus the in-block
+/// offset — the space the caller may safely write.
 ///
 /// # Safety
 /// `ptr` must be a live allocation from this allocator.
 pub unsafe fn usable_size(ptr: NonNull<u8>) -> usize {
     let page_ptr = page_map::lookup(ptr.addr().get()) as *mut Page;
     if page_ptr.is_null() {
-        // A null page-map lookup means `ptr` is not a live block of ours (its
-        // page was retired/unregistered), so it has no usable size.
-        return 0;
+        return 0; // not a live block of ours
     }
     // SAFETY: valid page header; const fields read via raw projection.
     let (bs, pstart) = unsafe {
@@ -952,11 +800,10 @@ mod tests {
     #[test]
     fn bin_size_table_monotonic() {
         let t = &BIN_SIZES;
-        // small bins have the expected double-word sizes
         assert_eq!(t[1], 8);
         assert_eq!(t[2], 16);
         assert_eq!(t[bin(24)], 32);
-        // non-decreasing across bins that are populated
+        // non-decreasing across populated bins
         let mut last = 0;
         for &s in t.iter() {
             if s != 0 {
@@ -1107,16 +954,11 @@ mod tests {
         }
     }
 
-    // The following cross-thread tests free *reconstructed raw addresses* from
-    // worker threads, exercising the retire/abandon/reclaim machinery against
-    // the process-global page-map and arena. Run in one process alongside many
-    // other heaps, a freed address can land in the brief window where its page
-    // was retired (page-map entry cleared, slices returned to the arena) — a
-    // null page-map lookup. They run under every feature combo, including
-    // `override`: the foreign-vs-ours decision is made by *arena membership*
-    // (`Subproc::owns_address`), not page-map presence, so an our-arena address
-    // with a cleared page-map entry is correctly treated as ours (no-op /
-    // hardened-build abort) and is never forwarded to the system allocator.
+    // The following cross-thread tests free reconstructed raw addresses from
+    // worker threads, exercising retire/abandon/reclaim against the global
+    // page-map and arena. The foreign-vs-ours decision uses arena membership
+    // (`Subproc::owns_address`), so a retired (unmapped) our-arena address is
+    // still treated as ours.
     #[test]
     fn collect_reclaims_cross_thread_frees() {
         // The owner allocates N blocks; a worker thread frees them all
