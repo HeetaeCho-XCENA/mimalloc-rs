@@ -42,31 +42,35 @@ cargo build --release --features bench-system && ./target/release/xmalloc_test
 MI_SRC=~/repos/mimalloc-v3 CBENCH=/path/to/mimalloc-bench/bench REPS=5 bash run.sh
 ```
 
-## Sample results (pinned i7-14700K, cores 2–9, interleaved median ×5, 8T)
+## Sample results (pinned i7-14700K, cores 2–9, interleaved median, 8T)
 
-| workload | metric | mimalloc-rs | system (glibc) | mimalloc-c |
-|---|---|---|---|---|
-| xmalloc-test (producer/consumer) | free/sec ↑ | **235 M** | 60 M | 62 M |
-| larson (server MT) | ops/sec ↑ | **304 M** | 94 M | 87 M |
-| alloc-test (fast path) | sec ↓ | **0.12** | 0.14 | — (C iters differ) |
-| cache-thrash (false-share, 1 B) | sec ↓ | 0.11 | 0.09 | 0.09 |
-| malloc-large (5–25 MiB) | sec ↓ | 2.06 | 1.97 | 2.33 |
+Both allocators are compared to glibc **on their own faithful harness** (a
+same-binary allocator swap), and the cross-language comparison is the **speedup
+over glibc** — the two harnesses are different programs of the same pattern, so
+the absolute rs-vs-mimalloc-c numbers are not directly comparable.
+
+| pattern | mimalloc-rs / glibc | mimalloc-c / glibc |
+|---|---|---|
+| xmalloc-test (producer/consumer cross-thread free) | **3.9×** | **4.8×** |
+| alloc-test (fast path) | **1.27×** | **1.27×** |
+| larson (server MT) | **1.19×** | 1.04× |
+| malloc-large (5–25 MiB) | **0.95×** | 1.11× |
+| cache-thrash (false-share, 1 B) | **0.82×** | 1.00× |
 
 **Reading it:**
-- On **contended / multi-threaded** patterns mimalloc-rs is **decisively faster
-  than glibc** (xmalloc-test ~3.9×, larson ~3.2×, alloc-test ~1.15×) and **matches
-  or beats mimalloc-c** (xmalloc-test, larson, malloc-large).
-- On **pure huge allocation** (malloc-large) glibc's direct `mmap` is ~5% ahead;
-  rs still beats mimalloc-c there.
-- **cache-thrash** with 1-byte objects is dominated by the write loop, not
-  allocation; rs is ~within noise of glibc/C.
+- The big win for *both* allocators over glibc is **xmalloc-test** (pure
+  cross-thread free, glibc's weak spot): rs ~3.9×, mimalloc-c ~4.8×.
+- mimalloc-rs and mimalloc-c are otherwise **in the same league** vs glibc:
+  alloc-test tie (1.27×), larson rs slightly ahead.
+- **mimalloc-rs is slower than glibc** on **malloc-large** (0.95×) and
+  **cache-thrash** (0.82×) — both cases where mimalloc-c stays ≥ glibc, so they
+  are genuine rs weak spots (large-block/purge handling; tiny-object placement).
+  cache-thrash at 1-byte objects is largely write-loop-bound, so its number mixes
+  placement with noise.
 
-The takeaway matches the project's scope: as a Rust-native `#[global_allocator]`,
-mimalloc-rs is on par with mimalloc-c and a large win over the default allocator
-on the multi-threaded patterns that matter.
-
-> Caveat: `rs` vs `system` is a perfectly fair same-binary comparison. The
-> `mimalloc-c` column runs a different (C) implementation of the same pattern; it
-> is most directly comparable on the rate-based benches (xmalloc-test, larson)
-> and the matched-parameter ones (malloc-large, cache-thrash). alloc-test's C
-> original hardcodes a much larger iteration count, so only rs-vs-system is shown.
+> **Methodology note (important).** The `mimalloc-c` column is measured by
+> `LD_PRELOAD`-ing a real mimalloc `.so` (CMake Release) over the **original**
+> mimalloc-bench binaries — `run.sh` does this. Do **not** link mimalloc's
+> `static.c` into these C benches: they call `malloc`/`new`, which static-link to
+> **glibc** unless interposed, silently turning the "mimalloc-c" column into
+> glibc. (An earlier version of this file made exactly that mistake.)

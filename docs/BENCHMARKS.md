@@ -61,19 +61,25 @@ mimalloc-c peak (original C bench + `src/static.c -O3 -flto`) for a 3-way table:
 MI_SRC=~/repos/mimalloc-v3 CBENCH=/path/to/mimalloc-bench/bench bash benchmark/run.sh
 ```
 
-Results (pinned i7-14700K, cores 2–9, interleaved median ×5, 8 threads):
+Each allocator is compared to glibc on its **own** faithful harness (a same-binary
+swap); the cross-language comparison is the **speedup over glibc** (the rs ports
+and the original C benches are different programs of the same pattern). mimalloc-c
+is measured by `LD_PRELOAD`-ing a real mimalloc `.so` over the original
+mimalloc-bench binaries (i7-14700K, cores 2–9, 8T, median):
 
-| workload | metric | mimalloc-rs | system (glibc) | mimalloc-c |
-|---|---|---|---|---|
-| xmalloc-test (producer/consumer cross-thread free) | free/sec ↑ | **235 M** | 60 M | 62 M |
-| larson (server MT) | ops/sec ↑ | **304 M** | 94 M | 87 M |
-| alloc-test (fast path) | sec ↓ | **0.12** | 0.14 | — |
-| cache-thrash (false-share, 1 B) | sec ↓ | 0.11 | 0.09 | 0.09 |
-| malloc-large (5–25 MiB) | sec ↓ | 2.06 | 1.97 | 2.33 |
+| pattern | mimalloc-rs / glibc | mimalloc-c / glibc |
+|---|---|---|
+| xmalloc-test (producer/consumer cross-thread free) | **3.9×** | **4.8×** |
+| alloc-test (fast path) | **1.27×** | **1.27×** |
+| larson (server MT) | **1.19×** | 1.04× |
+| malloc-large (5–25 MiB) | **0.95×** | 1.11× |
+| cache-thrash (false-share, 1 B) | **0.82×** | 1.00× |
 
-On the multi-threaded / contended patterns mimalloc-rs is **~3–4× glibc** and
-**on par with or ahead of mimalloc-c**; glibc's direct `mmap` edges it on pure
-huge allocation. See `benchmark/README.md` for per-bench detail and caveats.
+mimalloc-rs and mimalloc-c are in the same league vs glibc; the big shared win is
+xmalloc-test (cross-thread free). mimalloc-rs is **slower than glibc** on
+malloc-large and cache-thrash (where mimalloc-c stays ≥ glibc) — genuine rs weak
+spots. See `benchmark/README.md` for per-bench detail, the methodology, and the
+caveat about not static-linking `static.c` (it silently makes the C column glibc).
 
 ## Criterion micro-benchmarks
 
