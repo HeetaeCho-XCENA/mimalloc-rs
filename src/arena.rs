@@ -76,6 +76,18 @@ impl Arena {
     /// region is only reserved and committed per allocation.
     ///
     /// Returns a pointer to the descriptor (in metadata memory), or `None` on OOM.
+    /// Number of contiguous hot bitmaps (free, commit, purge, dirty), each
+    /// `[chunkmap][chunks]`. `create` allocates this many and `destroy` frees the
+    /// same amount — keep them in lockstep via [`Arena::hot_bitmap_bytes`].
+    const HOT_BITMAPS: usize = 4;
+
+    /// Bytes of metadata backing all hot bitmaps for an arena of `chunk_count`
+    /// chunks. Single source of truth so `create`/`destroy` cannot drift.
+    #[inline]
+    const fn hot_bitmap_bytes(chunk_count: usize) -> usize {
+        Self::HOT_BITMAPS * (chunk_count + 1) * core::mem::size_of::<BChunk>()
+    }
+
     pub fn create(slice_count: usize, commit: bool) -> Option<NonNull<Arena>> {
         debug_assert!(slice_count > 0);
         let chunk_count = chunks_for(slice_count);
@@ -87,11 +99,11 @@ impl Arena {
         let size = slice_count * MI_ARENA_SLICE_SIZE;
         let (start, memid) = os::alloc_aligned(size, MI_ARENA_SLICE_SIZE, commit, false)?;
 
-        // Hot bitmaps (free + commit + purge), each `[chunkmap][chunks]`, laid out
-        // contiguously in the compact meta region (touched on every slice op).
+        // Hot bitmaps (free + commit + purge + dirty), each `[chunkmap][chunks]`,
+        // laid out contiguously in the compact meta region (touched on every slice
+        // op). `create`/`destroy` must agree on the size — share `hot_bitmap_bytes`.
         let stride = chunk_count + 1;
-        let hot_bchunks = 4 * stride;
-        let hot_bytes = hot_bchunks * core::mem::size_of::<BChunk>();
+        let hot_bytes = Self::hot_bitmap_bytes(chunk_count);
         let bm_mem = match meta_zalloc(hot_bytes) {
             Some(p) => p,
             None => {
@@ -101,7 +113,7 @@ impl Arena {
             }
         };
         let bm_base = bm_mem.as_ptr() as *mut BChunk;
-        // SAFETY: bm_mem is `hot_bchunks` zeroed BChunks laid out contiguously.
+        // SAFETY: bm_mem is `HOT_BITMAPS * stride` zeroed BChunks laid out contiguously.
         let (
             free_chunkmap,
             free_chunks,
@@ -512,7 +524,7 @@ impl Arena {
         unsafe {
             let a = arena.as_ref();
             let memid = a.memid;
-            let hot_bytes = 3 * (a.chunk_count + 1) * core::mem::size_of::<BChunk>();
+            let hot_bytes = Self::hot_bitmap_bytes(a.chunk_count);
             let bm_mem = a.free_chunkmap.cast::<u8>();
             os::free(&memid);
             // Free the lazily-mapped abandoned registry, if it was ever allocated.
@@ -560,6 +572,28 @@ mod tests {
             assert_eq!(a.free_slice_count(), 64, "no slice leak");
 
             Arena::destroy(arena);
+        }
+    }
+
+    #[test]
+    fn hot_bitmap_alloc_covers_every_bitmap() {
+        // Regression guard for the create/destroy size-mismatch bug: `create` lays
+        // out 4 hot bitmaps (free/commit/purge/dirty), the last (`dirty`) ending at
+        // BChunk index `3*stride + 1 + (chunk_count-1)`. The metadata block must
+        // span through that last BChunk, else `destroy` (and any reuse) leaks /
+        // overruns the dirty-bitmap region. `hot_bitmap_bytes` is the single source
+        // both paths use, so this also pins them in lockstep.
+        for chunk_count in [1usize, 2, 7, 64, CHUNK_BITS] {
+            let stride = chunk_count + 1;
+            let bchunks = Arena::hot_bitmap_bytes(chunk_count) / core::mem::size_of::<BChunk>();
+            // highest BChunk index touched by the 4th bitmap's `chunk_count` chunks
+            let last_touched = 3 * stride + 1 + (chunk_count - 1);
+            assert!(
+                bchunks > last_touched,
+                "hot bitmap region ({bchunks} BChunks) must cover the dirty bitmap \
+                 (last index {last_touched}) for chunk_count={chunk_count}",
+            );
+            assert_eq!(bchunks, 4 * stride, "exactly 4 bitmaps, no waste");
         }
     }
 
