@@ -307,13 +307,45 @@ impl Heap {
 
     /// Allocate an object too large for any size class as its own page.
     fn alloc_huge(&self, size: usize) -> Option<NonNull<u8>> {
-        let header = align_up(core::mem::size_of::<Page>(), MI_MAX_ALIGN_SIZE);
-        let need = align_up(header + size, MI_ARENA_SLICE_SIZE);
-        let slices = need / MI_ARENA_SLICE_SIZE;
         let bs = align_up(size, MI_MAX_ALIGN_SIZE);
-        let page = self.new_page(MI_BIN_HUGE, bs, slices)?;
-        // SAFETY: fresh huge page with a single block.
-        unsafe { (*page).alloc() }
+        let slices = align_up(bs, MI_ARENA_SLICE_SIZE) / MI_ARENA_SLICE_SIZE;
+        let tseq = self.next_tseq();
+        let eager = crate::options::eager_commit();
+        let (arena, idx, p, is_zero) = self.subproc.alloc_slices(slices, eager, tseq)?;
+        // The header lives off the data slice (ports MI_PAGE_META_IS_SEPARATED):
+        // never writing the region means allocating a huge block cannot fault —
+        // and so cannot make THP zero the multi-MiB the OS already handed us.
+        let hdr = match meta_zalloc(core::mem::size_of::<Page>()) {
+            Some(h) => h,
+            // SAFETY: we exclusively hold the freshly-claimed slices.
+            None => {
+                unsafe { arena.as_ref().free_slices(idx, slices) };
+                return None;
+            }
+        };
+        // SAFETY: `hdr` is zeroed meta; `p` is `slices` committed slices we own.
+        let page = unsafe { Page::init_huge(hdr, p, idx, slices, bs, self.keys, is_zero) };
+        let page_ptr = page.as_ptr();
+        // SAFETY: page just created and owned by this thread.
+        unsafe {
+            page.as_ref().set_owner_fresh(self.tid);
+            page.as_ref().set_provenance(
+                self as *const Heap as *mut Heap,
+                arena.as_ptr(),
+                MI_BIN_HUGE as u32,
+            );
+            // Map the slice addresses to the off-slice header.
+            if !page_map::register(p.addr().get(), slices, page_ptr as *mut u8) {
+                arena.as_ref().free_slices(idx, slices);
+                meta_free(hdr, core::mem::size_of::<Page>());
+                return None;
+            }
+            self.pages[MI_BIN_HUGE].push_front(page_ptr);
+        }
+        crate::stats::on_page_created();
+        // Serve the single block directly — no free-list write touches the slice.
+        // SAFETY: freshly created huge page owned by this thread.
+        Some(unsafe { page.as_ref().serve_huge() })
     }
 
     /// Carve a new page of `slices` slices for `bin` with block size `bs`,
@@ -653,11 +685,24 @@ unsafe fn release_page_slices(page_ptr: *mut Page) {
     if arena.is_null() {
         return;
     }
-    let base = (page_ptr as *mut u8).addr();
-    // SAFETY: range was registered for this page; arena owns the slices.
+    let (slice_index, slice_count, huge) = (page.slice_index, page.slice_count, page.is_huge());
+    // SAFETY: range was registered for this page; arena owns the slices. The
+    // slice base comes from the arena, not `page_ptr` — a huge page's header is
+    // off-slice, so `page_ptr` is not the slice base.
     unsafe {
-        page_map::unregister(base, page.slice_count);
-        (*arena).free_slices(page.slice_index, page.slice_count);
+        let base = (*arena).slice_ptr(slice_index).addr().get();
+        page_map::unregister(base, slice_count);
+        (*arena).free_slices(slice_index, slice_count);
+    }
+    // A huge page's header lives in metadata memory; return it.
+    if huge {
+        // SAFETY: `page_ptr` is a live off-slice header from `meta_zalloc`.
+        unsafe {
+            meta_free(
+                NonNull::new_unchecked(page_ptr as *mut u8),
+                core::mem::size_of::<Page>(),
+            )
+        };
     }
 }
 

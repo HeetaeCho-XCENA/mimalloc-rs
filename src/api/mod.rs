@@ -165,6 +165,31 @@ mod tests {
         }
     }
 
+    // Huge pages keep their header off the data slice (init_huge) and the block
+    // is served directly. Exercise write/read integrity at both ends of the
+    // block, plus many alloc/free cycles (retire → meta_free + page-map
+    // register/unregister round-trip) to catch any UAF/leak in that path.
+    #[test]
+    fn huge_offslice_alloc_free_integrity() {
+        let mm = MiMalloc;
+        let size = 3 * 1024 * 1024; // huge (> 512 KiB)
+        let l = Layout::from_size_align(size, 16).unwrap();
+        // SAFETY: matched alloc/dealloc with one layout.
+        unsafe {
+            for k in 0..64u8 {
+                let p = mm.alloc(l);
+                assert!(!p.is_null());
+                // Write a pattern at the first and last byte; the header is
+                // off-slice, so neither must corrupt metadata nor be lost.
+                *p = k;
+                *p.add(size - 1) = k ^ 0xFF;
+                assert_eq!(*p, k);
+                assert_eq!(*p.add(size - 1), k ^ 0xFF);
+                mm.dealloc(p, l);
+            }
+        }
+    }
+
     #[test]
     fn allocator_api2_box_and_vec() {
         use allocator_api2::boxed::Box;
