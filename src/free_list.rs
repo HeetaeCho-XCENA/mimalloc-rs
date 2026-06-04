@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: MIT
-//! Free-list blocks and their (optionally encoded) `next` links
-//! (ports the `mi_block_t` / `mi_block_next` parts of `free.c` + `internal.h`).
-//!
-//! A free block stores its successor pointer in its own first word. Two modes:
-//!
-//! * **plain** (default release): the word is a real `*mut Block`, so pointer
-//!   provenance is preserved and the code is strict-provenance clean.
-//! * **encoded** (`secure`/`debug` features ⇒ `MI_ENCODE_FREELIST`): the word
-//!   holds `rotl(addr ^ keys[1], keys[0]) + keys[0]`, which detects free-list
-//!   corruption and invalid frees. Encoding is an integer transform, so it uses
-//!   exposed provenance (`expose_provenance`/`with_exposed_provenance`).
+//! Free-list blocks and their (optionally encoded) `next` links (ports the
+//! `mi_block_t` parts of `free.c` + `internal.h`). A free block stores its
+//! successor in its first word: **plain** (a real `*mut Block`, provenance
+//! preserved) or **encoded** under `secure`/`debug` (`MI_ENCODE_FREELIST`, an
+//! integer transform using exposed provenance) to detect free-list corruption.
 
 use core::cell::Cell;
 

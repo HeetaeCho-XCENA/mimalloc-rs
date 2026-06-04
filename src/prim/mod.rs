@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! The primitive portability layer: the OS abstraction every platform must
-//! implement (ports `include/mimalloc/prim.h`).
-//!
-//! mimalloc selects a single `prim` implementation at compile time. We mirror
-//! that with the [`Prim`] trait, whose methods are *associated* (stateless), and
-//! a per-platform implementor re-exported as [`DefaultPrim`].
-//!
-//! The trait covers raw OS memory management (reserve/commit/decommit/reset/
-//! protect/free) plus the small system queries the allocator needs (page
-//! config, NUMA, clock, randomness, env, yield, stderr). Thread-local storage
-//! and the thread-exit hook (`_mi_prim_thread_init_auto_done`) are layered in
-//! where the heap lifecycle lives.
+//! The primitive portability layer (ports `include/mimalloc/prim.h`). Rust: the
+//! compile-time-selected `prim` is the [`Prim`] trait (stateless associated
+//! methods) with a per-platform implementor re-exported as [`DefaultPrim`].
 
 #[cfg(target_os = "linux")]
 mod linux;

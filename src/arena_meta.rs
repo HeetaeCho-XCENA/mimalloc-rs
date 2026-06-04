@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! Metadata allocator (ports `src/arena-meta.c`).
-//!
-//! The allocator must allocate its *own* bookkeeping (arena descriptors, heap
-//! and thread-local structures, bitmap storage) **without** recursing into the
-//! global allocator. This module hands out small, zeroed blocks carved directly
-//! from OS memory, breaking the bootstrap cycle: a fixed static seed chunk lets
-//! the very first allocation succeed before any heap exists.
-//!
-//! Large metadata (page-map tables/submaps) is page-sized and goes straight to
-//! [`crate::os`] instead; this allocator only serves small descriptors.
+//! Metadata allocator (ports `src/arena-meta.c`): hands out small zeroed blocks
+//! carved directly from OS memory for the allocator's own bookkeeping, without
+//! recursing into the global allocator. Large metadata uses [`crate::os`].
 
 use core::ptr::NonNull;
 

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! The OS memory layer (`src/os.c`): reserve/commit/decommit/reset/purge built
-//! on top of the [`Prim`] primitive interface, plus provenance tracking via
-//! [`MemId`].
-//!
-//! This layer owns the aligned-allocation strategy (over-allocate and trim on
-//! platforms with partial free, like `mmap`) and the commit/zero bookkeeping
-//! the arena layer relies on.
+//! The OS memory layer (`src/os.c`): reserve/commit/decommit/reset/purge over
+//! the [`Prim`] interface, plus provenance tracking via [`MemId`]. Owns the
+//! aligned-allocation strategy (over-allocate-and-trim where partial free works).
 
 use core::ptr::NonNull;
 
@@ -194,8 +190,7 @@ pub fn alloc_aligned(
         return Some((unsafe { NonNull::new_unchecked(aligned) }, memid));
     }
 
-    // Platforms without partial free (e.g. Windows) reserve uncommitted then
-    // commit only the aligned middle. Not reachable on Linux; revisited per-OS.
+    // No-partial-free platforms (e.g. Windows): not reachable on Linux.
     None
 }
 
@@ -251,17 +246,11 @@ pub unsafe fn reset(addr: NonNull<u8>, size: usize) {
     }
 }
 
-/// Purge `[addr, addr+size)`: hint the OS to drop the physical pages while the
-/// reservation stays mapped. Returns whether the range now **needs recommit**
-/// before reuse — `true` if it was decommitted (a later [`commit`] is required),
-/// `false` if it was reset or left untouched (still committed). Ports
-/// `_mi_os_purge_ex` (`src/os.c`).
-///
-/// Decision (mirrors v3): if purging is disabled (`purge_delay < 0`) it is a
-/// no-op; otherwise if `purge_decommits` is set it decommits; else if
-/// `allow_reset` (the whole range is committed) it resets; else it is a no-op.
-/// On Linux both decommit and reset issue `MADV_DONTNEED`, so the RSS drop is
-/// the same — the difference is the commit-accounting (`needs_recommit`).
+/// Purge `[addr, addr+size)`: drop the physical pages, keeping the reservation
+/// mapped (ports `_mi_os_purge_ex`). Returns `true` if the range was decommitted
+/// and **needs recommit** before reuse, `false` if reset or left committed.
+/// Disabled (`purge_delay < 0`) ⇒ no-op; else decommit if `purge_decommits`,
+/// else reset if `allow_reset`.
 ///
 /// # Safety
 /// `(addr, size)` must be a committed range owned by the caller.
@@ -351,11 +340,8 @@ mod tests {
             commit(p, 128 * 1024); // recommit before reuse
             assert_eq!(*p.as_ptr(), 0x00, "recommitted pages read as zero");
 
-            // (2) reset path: stays committed (no recommit needed) and remains
-            // accessible. NB: reset prefers MADV_FREE, which is *lazy* — contents
-            // are indeterminate (NOT guaranteed zero), so we only assert access,
-            // not the value. (A reset-purged slice is therefore "dirty"; a reuse
-            // that needs zero must zero it — handled by the commit/dirty path.)
+            // (2) reset path: stays committed and accessible. Reset prefers
+            // MADV_FREE (lazy), so contents are indeterminate — assert access only.
             options::set(Opt::PurgeDecommits, 0);
             core::ptr::write_bytes(p.as_ptr(), 0x22, 128 * 1024);
             assert!(

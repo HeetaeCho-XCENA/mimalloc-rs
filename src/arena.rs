@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Arenas (ports `src/arena.c`): large OS regions carved into 64 KiB slices by
-//! an atomic free bitmap. In v3 there are no segments — an arena hands slices
-//! directly to pages.
-//!
-//! Each arena owns:
-//! * a data region of `slice_count` slices (reserved or committed),
-//! * a **free** bitmap (`set = free slice`) for allocation, and
-//! * a **committed** bitmap tracking which slices are backed by physical memory
-//!   (commit-on-demand).
-//!
-//! The arena descriptor and its bitmap storage are allocated from the metadata
-//! allocator ([`crate::arena_meta`]), never the global allocator.
+//! atomic bitmaps (free / committed / purge-scheduled). The descriptor and
+//! bitmaps live in metadata memory ([`crate::arena_meta`]).
 
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
@@ -48,36 +39,30 @@ pub struct Arena {
     /// creation, so on-demand commit and recommit-after-purge share one path.
     commit_chunkmap: NonNull<BChunk>,
     commit_chunks: NonNull<BChunk>,
-    /// `set = scheduled for purge`. A freed slice's bit is set here (with a
-    /// delay); [`Arena::maybe_purge`] later returns the still-free ones to the OS.
+    /// `set = scheduled for purge`. [`Arena::maybe_purge`] later returns the
+    /// still-free ranges to the OS.
     purge_chunkmap: NonNull<BChunk>,
     purge_chunks: NonNull<BChunk>,
-    /// Per-bin **abandoned-page registry** (ports v3's `pages_abandoned[bin]`),
-    /// **lazily allocated**. Null until this arena first abandons a page; then it
-    /// points at an OS block of `MI_BIN_COUNT` bitmaps laid out contiguously, each
-    /// `[chunkmap][chunks; chunk_count]` (bin `b` at `+ b*(chunk_count+1)`).
-    /// `set = an abandoned page of that bin starts at this slice`.
-    ///
-    /// Lazy allocation keeps an arena that never abandons (e.g. the
-    /// single-thread huge workload) byte- and address-space-identical to a
-    /// no-registry arena — the ~45 KiB block is never mapped, so it cannot
-    /// perturb THP/placement of the huge data allocations.
+    /// Per-bin abandoned-page registry (ports v3's `pages_abandoned[bin]`),
+    /// **lazily allocated** on first abandon: an OS block of `MI_BIN_COUNT`
+    /// `[chunkmap][chunks; chunk_count]` bitmaps (bin `b` at `+ b*(chunk_count+1)`).
+    /// An arena that never abandons maps nothing (keeps the huge workload's THP
+    /// placement undisturbed).
     abandoned_base: AtomicPtr<BChunk>,
     /// `memid` of the lazily-allocated registry block; `Some` iff `abandoned_base`
     /// is non-null. Written once under `abandoned_lock`, read at `destroy`.
     abandoned_memid: UnsafeCell<Option<MemId>>,
     /// Serializes the one-time lazy allocation of the registry block.
     abandoned_lock: SpinLock,
-    /// Earliest time (`clock_now_msecs`) at which a scheduled purge is due, or 0
-    /// when nothing is pending. CAS'd 0→deadline by the first scheduler.
+    /// Earliest time (`clock_now_msecs`) a scheduled purge is due, or 0 when
+    /// nothing is pending. CAS'd 0→deadline by the first scheduler.
     purge_expire: AtomicI64,
 }
 
-// SAFETY: the mutable shared state is the atomic bitmaps (BChunk = atomics),
-// `purge_expire` (atomic), and the lazy abandoned registry — `abandoned_base`
-// (atomic) plus `abandoned_memid` (an `UnsafeCell` written once under
-// `abandoned_lock` and only read at single-threaded `destroy`). All other fields
-// are set once in `create`.
+// SAFETY: all mutable shared state is atomic (the bitmaps, `purge_expire`,
+// `abandoned_base`); `abandoned_memid` is an `UnsafeCell` written once under
+// `abandoned_lock` and read only at single-threaded `destroy`. Other fields are
+// set once in `create`.
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
@@ -89,20 +74,16 @@ impl Arena {
     pub fn create(slice_count: usize, commit: bool) -> Option<NonNull<Arena>> {
         debug_assert!(slice_count > 0);
         let chunk_count = chunks_for(slice_count);
-        // One chunkmap (512 bits) tracks at most CHUNK_BITS chunks ⇒ ≤ 16 GiB
-        // per arena bitmap. Refuse larger requests rather than index past it.
+        // One chunkmap tracks at most CHUNK_BITS chunks ⇒ ≤ 16 GiB per arena.
         if chunk_count > CHUNK_BITS {
             return None;
         }
 
-        // Data region.
         let size = slice_count * MI_ARENA_SLICE_SIZE;
         let (start, memid) = os::alloc_aligned(size, MI_ARENA_SLICE_SIZE, commit, false)?;
 
-        // Hot bitmaps: free + commit + purge, each a chunkmap + `chunk_count`
-        // chunks laid out contiguously. These are touched on **every** slice
-        // alloc/free, so they stay in the compact small-block meta region (cache
-        // warm), exactly as before the abandoned registry was added.
+        // Hot bitmaps (free + commit + purge), each `[chunkmap][chunks]`, laid out
+        // contiguously in the compact meta region (touched on every slice op).
         let stride = chunk_count + 1;
         let hot_bchunks = 3 * stride;
         let hot_bytes = hot_bchunks * core::mem::size_of::<BChunk>();
@@ -134,11 +115,8 @@ impl Arena {
             )
         };
 
-        // The per-bin abandoned registry is **not** allocated here — it is
-        // mapped lazily on the first abandon (see `ensure_abandoned`). Arenas
-        // that never abandon stay identical to a no-registry arena.
+        // The abandoned registry is mapped lazily (see `ensure_abandoned`).
 
-        // Descriptor.
         let desc_mem = match meta_zalloc(core::mem::size_of::<Arena>()) {
             Some(p) => p,
             None => {
@@ -170,12 +148,9 @@ impl Arena {
                 purge_expire: AtomicI64::new(0),
             });
             let a = &*arena;
-            // Mark all real slices free.
             a.free_bitmap().unsafe_set_n(0, slice_count);
-            // Eager arenas commit the whole region up front: pre-set every commit
-            // bit so the (authoritative) commit bitmap reflects reality and the
-            // alloc path does no per-slice commit. A lazy arena leaves the bits
-            // clear and commits on demand in `ensure_committed`.
+            // Eager arena: pre-set every commit bit (authoritative bitmap), so the
+            // alloc path does no per-slice commit. Lazy arenas commit on demand.
             if commit {
                 a.commit_bitmap().unsafe_set_n(0, slice_count);
             }
@@ -246,10 +221,8 @@ impl Arena {
         }
     }
 
-    /// Return the registry base, mapping it from the OS on first use. Returns
-    /// `None` only on OOM (a rare thread-exit/eviction abandon under memory
-    /// pressure). Ports the lazy `pages_abandoned[bin]` allocation, but deferred
-    /// to the first abandon so arenas that never abandon map nothing.
+    /// Return the registry base, mapping it from the OS on first use (`None` only
+    /// on OOM). Ports the lazy `pages_abandoned[bin]` allocation.
     fn ensure_abandoned(&self) -> Option<*mut BChunk> {
         let base = self.abandoned_base.load(Ordering::Acquire);
         if !base.is_null() {
@@ -269,12 +242,9 @@ impl Arena {
         Some(base)
     }
 
-    /// Register `page` (starting at `slice_index`, size-class `bin`) in the
-    /// abandoned registry so another thread can reclaim it on allocation (ports
-    /// the `mi_bitmap_set(pages_abandoned[bin], slice_index)` of
-    /// `_mi_arenas_page_abandon`). The caller must have just relinquished the page.
-    /// On registry-allocation OOM the page is left unregistered (its slices are
-    /// stranded — a leak, not corruption — only under memory pressure at abandon).
+    /// Register `page` (at `slice_index`, size-class `bin`) in the abandoned
+    /// registry (ports `_mi_arenas_page_abandon`). On registry OOM the page is
+    /// left unregistered (its slices stranded — a leak, not corruption).
     #[inline]
     pub fn page_abandon(&self, slice_index: usize, bin: usize) {
         let Some(base) = self.ensure_abandoned() else {
@@ -285,24 +255,20 @@ impl Arena {
         debug_assert!(was_clear, "page already in the abandoned registry");
     }
 
-    /// Reclaim one abandoned page of `bin`, returning its start slice index (and
-    /// removing it from the registry), or `None` if there are none (including when
-    /// the registry was never allocated). `tseq` spreads concurrent reclaimers.
-    /// Ports the find-and-clear of `mi_arenas_page_try_find_abandoned` (FE1a: no
-    /// ownership claim yet — reclaim is alloc-only, so the atomic clear is the
-    /// single claim point).
+    /// Reclaim one abandoned page of `bin`, returning its start slice index, or
+    /// `None`. `tseq` spreads concurrent reclaimers. Ports
+    /// `mi_arenas_page_try_find_abandoned`.
     #[inline]
     pub fn reclaim_abandoned(&self, bin: usize, tseq: usize) -> Option<usize> {
         let base = self.abandoned_base.load(Ordering::Acquire);
         if base.is_null() {
-            return None; // never abandoned ⇒ nothing to reclaim
+            return None; // never abandoned
         }
         // SAFETY: `base` is the mapped registry block; `bin < MI_BIN_COUNT`.
         let bitmap = unsafe { self.abandoned_bitmap_at(base, bin) };
-        // Claim the page's ownership *before* clearing its registry bit, so a
-        // concurrent free into the same page (which also claims ownership) and
-        // this alloc-reclaim cannot both take it — whoever wins the ownership CAS
-        // owns it; the loser skips. Ports `mi_arena_try_claim_abandoned`.
+        // Claim ownership *before* clearing the bit, so an alloc-reclaim and a
+        // concurrent free-claim cannot both take the page (ports
+        // `mi_arena_try_claim_abandoned`).
         bitmap.try_find_and_claim(tseq, |idx| {
             // SAFETY: a registered bit's slice index is a page start; the page
             // header lives at that slice and stays live while abandoned.
@@ -311,11 +277,8 @@ impl Arena {
         })
     }
 
-    /// Clear `page`'s entry (`slice_index`, `bin`) from the registry. The caller
-    /// already **owns** the page (it is freeing or reusing it), so no reclaimer
-    /// can concurrently take it — a plain clear is the ownership-gated unabandon
-    /// (ports `_mi_arenas_page_unabandon`; the busy-wait reader handshake is
-    /// unnecessary because ownership is the gate).
+    /// Clear `page`'s entry from the registry (ports `_mi_arenas_page_unabandon`).
+    /// The caller already owns the page, so a plain clear suffices.
     #[inline]
     pub fn page_unabandon(&self, slice_index: usize, bin: usize) {
         let base = self.abandoned_base.load(Ordering::Acquire);
@@ -363,14 +326,10 @@ impl Arena {
         Some((a - base) >> MI_ARENA_SLICE_SHIFT)
     }
 
-    /// Ensure slices `[idx, idx+n)` are committed. Returns false if the OS
-    /// refused to commit (e.g. `ENOMEM` on a `MAP_NORESERVE` reservation).
-    ///
-    /// The commit bitmap is **authoritative**: an eager arena pre-set all bits at
-    /// creation (so this is a no-op for it), and a purge that decommits clears
-    /// the bits, so reuse re-commits here. This is what makes purge-then-reuse
-    /// correct even under `debug`/`secure`, where decommit strips access
-    /// (`PROT_NONE`) and a real recommit (`mprotect`) is required.
+    /// Ensure slices `[idx, idx+n)` are committed (false if the OS refused).
+    /// The commit bitmap is authoritative, so a purge that decommits clears the
+    /// bits and reuse re-commits here (correct even under `debug`/`secure`, where
+    /// decommit strips access).
     fn ensure_committed(&self, idx: usize, n: usize) -> bool {
         if self.commit_bitmap().is_set_n(idx, n) {
             return true;
@@ -397,9 +356,8 @@ impl Arena {
         Some((idx, self.slice_ptr(idx)))
     }
 
-    /// Free `n` slices starting at `idx` (marks them free for reuse) and
-    /// schedule them for a (delayed) purge so their physical pages are returned
-    /// to the OS if they stay free. The slices are immediately reusable.
+    /// Free `n` slices at `idx` (immediately reusable) and schedule a delayed
+    /// purge of their physical pages.
     pub fn free_slices(&self, idx: usize, n: usize) {
         debug_assert!(idx + n <= self.slice_count);
         self.free_bitmap().set_n(idx, n);
@@ -427,7 +385,6 @@ impl Arena {
         }
         self.purge_bitmap().set_n(idx, n);
         if delay == 0 {
-            // Immediate purge (regardless of the expire timer).
             self.run_purge();
         } else {
             let expire = DefaultPrim::clock_now_msecs().saturating_add(delay);
@@ -438,16 +395,14 @@ impl Arena {
         }
     }
 
-    /// Purge any slices whose delay has elapsed, returning their pages to the OS.
-    /// Cheap when nothing is pending (one atomic load, no clock syscall). With
-    /// `force`, purges regardless of the timer. Returns whether anything was
-    /// purged. Ports `mi_arena_try_purge`; safe to call from any owner thread.
+    /// Purge slices whose delay has elapsed, returning their pages to the OS
+    /// (ports `mi_arena_try_purge`). Cheap when nothing is pending. `force`
+    /// purges regardless of the timer.
     pub fn maybe_purge(&self, force: bool) -> bool {
         if self.memid.is_pinned {
             return false;
         }
         if force {
-            // Force: reset the timer and scan unconditionally.
             self.purge_expire.store(0, Ordering::Release);
             return self.run_purge();
         }
@@ -458,11 +413,9 @@ impl Arena {
         if expire > DefaultPrim::clock_now_msecs() {
             return false; // not due yet
         }
-        // Due: claim this cycle by CAS-resetting the deadline to 0. Only the
-        // winner scans — this serializes concurrent purgers and, because a
-        // `schedule_purge` that re-armed `purge_expire` to a newer deadline makes
-        // this CAS fail, it can never clobber the deadline of a slice freed
-        // concurrently (that slice is then purged on the next cycle).
+        // Claim this cycle by CAS-resetting the deadline to 0; only the winner
+        // scans. A concurrent re-arm to a newer deadline makes this CAS fail
+        // (that slice is purged next cycle), so it never clobbers a fresh deadline.
         if self
             .purge_expire
             .compare_exchange(expire, 0, Ordering::AcqRel, Ordering::Relaxed)
@@ -473,11 +426,10 @@ impl Arena {
         self.run_purge()
     }
 
-    /// Walk the purge bitmap and return each still-free range to the OS. Claims
-    /// a range from the free bitmap before purging so a concurrent allocation
-    /// can never hand out memory mid-`madvise`; reallocated ranges are skipped.
-    /// The caller (`maybe_purge`, or `schedule_purge` for the immediate case)
-    /// owns resetting `purge_expire`. Mirrors `mi_arena_try_purge` + `mi_arena_purge`.
+    /// Walk the purge bitmap and return each still-free range to the OS (mirrors
+    /// `mi_arena_purge`). Claims each range from the free bitmap before purging
+    /// so an allocation can never race the `madvise`. The caller resets
+    /// `purge_expire`.
     fn run_purge(&self) -> bool {
         let mut purged = false;
         let mut idx = 0;
@@ -486,20 +438,16 @@ impl Arena {
                 idx += 1;
                 continue;
             }
-            // Extend the run, but never across a 64-bit **field** boundary: the
-            // free-bitmap claim below (`clear_n`) is atomic all-or-nothing only
-            // within a single field, and that single atomic claim is exactly what
-            // makes the purge race-free against allocation. (v3 likewise claims
-            // per bfield.) Adjacent fields are handled as separate runs.
+            // Extend the run, but never across a 64-bit field boundary: the
+            // `clear_n` claim below is atomic all-or-nothing only within a field
+            // (v3 likewise claims per bfield).
             let field_end = (idx / FIELD_BITS + 1) * FIELD_BITS;
             let mut end = idx + 1;
             while end < self.slice_count && end < field_end && self.purge_bitmap().is_set(end) {
                 end += 1;
             }
             let n = end - idx;
-            // Claim the range from the free bitmap (atomic, all-or-nothing): only
-            // purge if every slice is still free, so no allocation races the
-            // `madvise`. If reallocated, skip — it will reschedule when freed.
+            // Claim the range from the free bitmap (atomic); skip if reallocated.
             if self.free_bitmap().clear_n(idx, n) {
                 let all_committed = self.commit_bitmap().is_set_n(idx, n);
                 // SAFETY: the range is claimed (exclusively ours) and committed.
@@ -507,14 +455,11 @@ impl Arena {
                     os::purge_ex(self.slice_ptr(idx), n * MI_ARENA_SLICE_SIZE, all_committed)
                 };
                 if needs_recommit {
-                    // Decommitted: reuse must re-commit (see `ensure_committed`).
                     self.commit_bitmap().clear_n(idx, n);
                 }
-                // Release the range back to the free pool.
                 self.free_bitmap().set_n(idx, n);
                 purged = true;
             }
-            // Clear the purge marks for this run (claimed or not).
             self.purge_bitmap().clear_n(idx, n);
             idx = end;
         }
@@ -584,9 +529,7 @@ mod tests {
 
     #[test]
     fn recommit_after_commit_bit_clear() {
-        // The property PC2 relies on: a purge that clears commit bits must force
-        // a real recommit on the next allocation of that slice. Exercised here by
-        // decommitting + clearing the bits directly (eager arena, all bits preset).
+        // A purge that clears commit bits must force a real recommit on reuse.
         let arena = Arena::create(4, true).unwrap();
         // SAFETY: fresh arena; single-threaded test.
         unsafe {

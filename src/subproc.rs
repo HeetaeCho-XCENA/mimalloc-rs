@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! The sub-process: process-global owner of arenas and the main heap root
-//! (ports the single-subproc parts of `src/init.c` / `src/arena.c`).
-//!
-//! v1 implements only the **single main subproc**. Multi-tenant sub-interpreter
-//! isolation (`mi_subproc_new`) is deliberately out of scope and tracked as
-//! follow-up work. The main subproc is a `static`, which also serves as the
-//! bootstrap seed that terminates the metadata/arena allocation cycle.
+//! The sub-process: process-global owner of arenas (ports the single-subproc
+//! parts of `src/init.c` / `src/arena.c`). Only the single main subproc is
+//! implemented; it is a `static` that also seeds the metadata/arena bootstrap.
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -19,12 +15,8 @@ pub const MAX_ARENAS: usize = 160;
 /// Default slices reserved when growing the arena pool (256 MiB, committed on demand).
 pub const DEFAULT_ARENA_SLICES: usize = 4096;
 
-/// A sub-process: the arena registry shared by all its heaps.
-///
-/// Abandoned pages (left by exited threads, or evicted-full in FE2) live in the
-/// per-arena `pages_abandoned[bin]` bitmap registries ([`Arena::page_abandon`] /
-/// [`Arena::reclaim_abandoned`]), not in the subproc — so an abandoned page can
-/// be found and reclaimed by slice index without a lock-protected stack.
+/// A sub-process: the arena registry shared by all its heaps. Abandoned pages
+/// live in the per-arena `pages_abandoned[bin]` registries, not here.
 pub struct Subproc {
     lock: SpinLock,
     arenas: [AtomicPtr<Arena>; MAX_ARENAS],
@@ -60,18 +52,10 @@ impl Subproc {
         self.arena_count.load(Ordering::Acquire)
     }
 
-    /// Whether `ptr` lies within any registered arena's reserved data region.
-    ///
-    /// This is an **address-range** test over the arenas this subproc owns. It
-    /// is independent of whether the specific slice is currently mapped to a
-    /// page in the page-map: a retired/recycled page returns false from
-    /// [`crate::page_map::lookup`] but its address is still inside the arena
-    /// (arenas are never unmapped back to the OS — [`Arena::free_slices`] only
-    /// flips bitmap bits). This is the semantically-correct basis for
-    /// `mi_is_in_heap_region` and for deciding "foreign vs ours" in the
-    /// `override` fallback, where a null page-map lookup alone is ambiguous
-    /// (it covers both genuinely foreign pointers and our own already-retired
-    /// or double-freed blocks).
+    /// Whether `ptr` lies within any registered arena's data region. An
+    /// address-range test, independent of page-map presence: a retired page's
+    /// address is still inside its arena (arenas are never unmapped), so this is
+    /// the correct "foreign vs ours" basis for `mi_is_in_heap_region`.
     pub fn owns_address(&self, ptr: *const u8) -> bool {
         let count = self.arena_count();
         for i in 0..count {
@@ -91,11 +75,9 @@ impl Subproc {
         NonNull::new(self.arenas[i].load(Ordering::Acquire))
     }
 
-    /// Drive delayed purging across every registered arena, returning due,
-    /// still-free slices to the OS. Cheap when nothing is pending (one atomic
-    /// load per arena, no syscall). `force` ignores the delay timer. Called from
-    /// page retire and `collect` — there is no background purge thread (matching
-    /// v3, which drives purge from allocation/free/collect operations).
+    /// Drive delayed purging across every registered arena. `force` ignores the
+    /// delay timer. There is no background purge thread (matches v3, which drives
+    /// purge from alloc/free/collect).
     pub fn try_purge(&self, force: bool) {
         let count = self.arena_count();
         for i in 0..count {
@@ -148,9 +130,8 @@ impl Subproc {
         Some((arena, idx, p))
     }
 
-    /// Register a non-empty page in its arena's abandoned registry for `bin` so
-    /// another thread can reclaim it (called when the owning thread exits, and in
-    /// FE2 when a full page is evicted).
+    /// Register a non-empty page in its arena's abandoned registry for `bin`
+    /// (called on thread exit).
     ///
     /// # Safety
     /// `page` is a valid, no-longer-owned arena page; `bin` is its size-class bin.

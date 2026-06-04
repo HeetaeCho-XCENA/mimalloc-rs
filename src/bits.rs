@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! Platform constants, bit primitives, and the size-class (bin) mapping.
-//!
-//! Every constant here is re-derived directly from the v3.3.2 C headers
-//! (`include/mimalloc/bits.h`, `include/mimalloc/types.h`, `include/mimalloc.h`)
-//! for the default configuration. Values are given for a 64-bit target
-//! (`MI_INTPTR_SIZE == 8`), which is what the Linux-first port targets.
+//! Platform constants, bit primitives, and the size-class (bin) mapping,
+//! re-derived from the v3.3.2 C headers (`bits.h` / `types.h` / `mimalloc.h`)
+//! for a 64-bit target.
 
 #![allow(clippy::unreadable_literal)]
 
@@ -225,16 +222,11 @@ pub const fn wsize_from_size(size: usize) -> usize {
     size.div_ceil(MI_INTPTR_SIZE)
 }
 
-/// `mi_bin`: map an allocation size to its size-class bin.
-///
-/// Returns a value in `1..=MI_BIN_HUGE`. Faithful port of the **`MI_ALIGN2W`**
-/// branch (active when `MI_MAX_ALIGN_SIZE == 2 * MI_INTPTR_SIZE`, i.e. 16-byte
-/// max-align on a 64-bit target). Sizes `0..=8` words get exact bins; larger
-/// sizes are spaced exponentially in ~12.5% increments using the top 3 bits.
+/// `mi_bin`: map an allocation size to its size-class bin (`1..=MI_BIN_HUGE`).
+/// Ports the `MI_ALIGN2W` branch (16-byte max-align on a 64-bit target).
 #[inline]
 pub const fn bin(size: usize) -> usize {
     let mut wsize = wsize_from_size(size);
-    // MI_ALIGN2W: round small sizes to double-word bins.
     if wsize <= 8 {
         return if wsize <= 1 { 1 } else { (wsize + 1) & !1 };
     }
@@ -242,9 +234,7 @@ pub const fn bin(size: usize) -> usize {
         return MI_BIN_HUGE;
     }
     wsize -= 1;
-    // highest set bit index (wsize != 0 here)
     let b = MI_SIZE_BITS - 1 - mi_clz(wsize);
-    // top 3 bits select the bin; subtract 3 because the first 8 sizes are exact.
     ((b << 2) + ((wsize >> (b - 2)) & 0x03)) - 3
 }
 
@@ -268,7 +258,6 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn size_class_constants_64bit() {
-        // Errata note: the planning digest said 10880 — the correct value is 10240.
         assert_eq!(MI_SMALL_MAX_OBJ_SIZE, 10240);
         assert_eq!(MI_MEDIUM_MAX_OBJ_SIZE, (512 * MI_KIB - 4 * MI_KIB) / 6);
         assert_eq!(MI_LARGE_MAX_OBJ_SIZE, 512 * MI_KIB);

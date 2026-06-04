@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! Process/thread initialization and the thread-local default heap
-//! (ports the lifecycle core of `src/init.c`).
-//!
-//! v1 bootstraps lazily: process-wide free-list encoding keys are computed once
-//! (from OS randomness), and each thread gets its own [`Heap`] in thread-local
-//! storage on first use. The richer lifecycle — `pthread_key` thread-exit page
-//! handoff, reentrancy guards for `#[global_allocator]` init-before-main — is
-//! follow-up work.
-//!
-//! The thread-local default heap requires the `std` feature; `no_std` embedders
-//! drive their own [`Heap`] instances directly.
+//! Process/thread initialization and the thread-local default heap (ports the
+//! lifecycle core of `src/init.c`). Process-wide encoding keys are computed once
+//! and each thread gets its own [`Heap`] in TLS. `std`-only; `no_std` embedders
+//! drive [`Heap`] instances directly.
 
 use crate::prim::{DefaultPrim, Prim};
 use crate::sync::OnceBox;
@@ -40,12 +33,9 @@ pub fn process_keys() -> [usize; 2] {
 /// to stamp page ownership and route cross-thread frees.
 #[cfg(feature = "std")]
 pub fn current_tid() -> usize {
-    // Plain process-global counter (not part of any modeled concurrency), so we
-    // use core atomics directly — they are usable in `static` (and under loom).
     use core::sync::atomic::{AtomicUsize, Ordering};
-    // Start at 2 so the first thread id is `2 << 2 == 8`, strictly greater than
-    // `MI_THREADID_ABANDONED_MAPPED` (4): the abandoned-page state encoding uses
-    // `owner_tid <= 4` to mean "abandoned", so a real owner tid must exceed it.
+    // Start at 2 so the first id is `2 << 2 == 8`, above the abandoned-state
+    // sentinels (`owner_tid <= MI_THREADID_ABANDONED_MAPPED == 4`).
     static NEXT: AtomicUsize = AtomicUsize::new(2);
     std::thread_local! {
         static TID: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
@@ -55,7 +45,7 @@ pub fn current_tid() -> usize {
         if v != 0 {
             v
         } else {
-            // shift left by 2 so the low bits stay free for page flags
+            // << 2 leaves the low bits free for page flags
             let id = NEXT.fetch_add(1, Ordering::Relaxed) << 2;
             t.set(id);
             id
@@ -69,9 +59,8 @@ mod tls {
     use crate::heap::Heap;
     use core::ptr::NonNull;
 
-    // Rust-idiomatic: the whole `Heap` lives inline in a std `thread_local!`
-    // (vs C's `__thread mi_heap_t*` pointer). An out-of-line pointer cache was
-    // benchmarked and showed no win, so we keep the simpler inline form.
+    // Rust: the whole `Heap` lives inline in a `thread_local!` (vs C's
+    // `__thread mi_heap_t*`); an out-of-line pointer cache showed no win.
     std::thread_local! {
         /// The calling thread's default heap.
         static DEFAULT_HEAP: Heap = Heap::new(process_keys(), current_tid());
@@ -100,29 +89,20 @@ mod tls {
         Some(p)
     }
 
-    /// Reclaim memory in the calling thread's default heap (`force` is more
-    /// aggressive — see [`crate::heap::Heap::collect`]).
-    ///
-    /// Documented to run on a live thread (drives `mi_collect`/`init::collect`),
-    /// so it uses `.with` — accessing the TLS during/after destruction would
-    /// panic, which is the correct signal for that misuse.
+    /// Reclaim memory in the calling thread's default heap (see
+    /// [`crate::heap::Heap::collect`]). Uses `.with` — must run on a live thread.
     pub fn collect(force: bool) {
         DEFAULT_HEAP.with(|h| h.collect(force));
     }
 
-    /// Force the calling thread's default heap to be initialized (no-op if it
-    /// already is). Used by the lifecycle wrappers.
-    ///
-    /// Uses `try_with` so a late call (after the thread's TLS destructors have
-    /// begun) is a safe no-op rather than a "TLS during destruction" panic.
+    /// Force-initialize the calling thread's default heap (no-op if already).
+    /// `try_with` makes a call during TLS teardown a safe no-op.
     pub fn touch() {
         let _ = DEFAULT_HEAP.try_with(|_| {});
     }
 
-    /// Like [`collect`], but for the lifecycle wrappers (`thread_done`,
-    /// `process_done`): uses `try_with` so a late call after the thread's TLS
-    /// destructors started is a safe no-op instead of a panic. Full page
-    /// hand-off still happens via the `Heap` `Drop` at real thread exit.
+    /// Like [`collect`] but for the lifecycle wrappers: `try_with` makes a late
+    /// call (TLS teardown) a safe no-op. Page hand-off still happens via `Drop`.
     pub fn collect_lifecycle(force: bool) {
         let _ = DEFAULT_HEAP.try_with(|h| h.collect(force));
     }
@@ -131,11 +111,8 @@ mod tls {
 #[cfg(feature = "std")]
 pub use tls::{collect, malloc, malloc_aligned, zalloc};
 
-// ---------------------------------------------------------------------------
-// Lifecycle / deferred-free registration (ports `mi_register_deferred_free`
-// and the thread/process lifecycle entry points). `std`-only: they drive the
-// thread-local default heap.
-// ---------------------------------------------------------------------------
+// Lifecycle / deferred-free registration (ports `mi_register_deferred_free` and
+// the thread/process lifecycle entry points). `std`-only.
 
 #[cfg(feature = "std")]
 mod lifecycle {
@@ -149,9 +126,8 @@ mod lifecycle {
     static DEFERRED_FN: AtomicUsize = AtomicUsize::new(0); // fn ptr as usize (0 = none)
     static DEFERRED_ARG: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
-    /// Per-thread deferred-free state: a `recurse` reentrancy flag (mirrors the C
-    /// reference's `tld->recurse`, page.c:895) and a per-thread `heartbeat` tick.
-    /// Per-thread, not process-global, matching mimalloc's per-`theap` heartbeat.
+    /// Per-thread deferred-free state: a `recurse` reentrancy flag (ports
+    /// `tld->recurse`, page.c:895) and a per-thread `heartbeat` tick.
     struct DeferredState {
         recurse: Cell<bool>,
         heartbeat: Cell<u64>,
@@ -170,22 +146,15 @@ mod lifecycle {
     }
 
     /// Invoke the registered deferred-free callback (if any), bumping the
-    /// per-thread heartbeat. Called from `collect` — our "heartbeat" point
-    /// (mimalloc also fires it from the generic alloc slow path; we fire on
-    /// collect, which is honest and sufficient).
-    ///
-    /// Bounded to recursion depth 1 (mirrors C's `tld->recurse`): if the callback
-    /// re-enters collection, it is not fired again, so a callback that calls
-    /// `mi_collect` cannot self-recurse into a stack overflow.
+    /// per-thread heartbeat. Bounded to recursion depth 1 (ports `tld->recurse`)
+    /// so a callback that re-enters collection cannot self-recurse.
     pub fn run_deferred_free(force: bool) {
         let addr = DEFERRED_FN.load(Ordering::Acquire);
         if addr == 0 {
             return;
         }
-        // Claim the reentrancy flag and take this thread's heartbeat tick. The
-        // `try_with` makes a call during TLS teardown a safe no-op. A `None`
-        // result means we are already inside a deferred-free callback (recursing)
-        // or the TLS is gone — either way, skip.
+        // Claim the reentrancy flag and take a heartbeat tick; `None` means we are
+        // recursing or the TLS is gone — skip.
         let hb = match STATE.try_with(|s| {
             if s.recurse.get() {
                 return None;
@@ -207,13 +176,8 @@ mod lifecycle {
         }
         let _clear = Clear;
         let arg = DEFERRED_ARG.load(Ordering::Acquire);
-        // SAFETY: `addr` was produced from a valid `DeferredFreeFun` in
-        // `register_deferred_free` (and is non-zero, checked above); transmute
-        // back to call it. Re-registration is not expected to race with
-        // collection (single-registration contract); `arg` is opaque and never
-        // dereferenced here.
-        // SAFETY: `addr` is non-zero and was stored from a valid `DeferredFreeFun`
-        // pointer by `register_deferred_free`.
+        // SAFETY: `addr` is non-zero (checked above) and was stored from a valid
+        // `DeferredFreeFun` by `register_deferred_free`; `arg` is opaque here.
         let fun: DeferredFreeFun = unsafe { core::mem::transmute::<usize, DeferredFreeFun>(addr) };
         fun(force, hb, arg);
     }
@@ -224,10 +188,8 @@ mod lifecycle {
         super::tls::touch();
     }
 
-    /// `mi_thread_done`: reclaim the calling thread's pending frees now. Full
-    /// page hand-off (abandoning pages that still hold live blocks) happens
-    /// automatically at real thread exit via the thread_local `Drop`; this just
-    /// drains + retires empties early. Idempotent.
+    /// `mi_thread_done`: drain + retire empties early. Full page hand-off happens
+    /// at real thread exit via the thread_local `Drop`. Idempotent.
     pub fn thread_done() {
         super::tls::collect_lifecycle(true);
     }
@@ -239,10 +201,8 @@ mod lifecycle {
         thread_init();
     }
 
-    /// `mi_process_done`: best-effort process cleanup. The OS reclaims all
-    /// mappings at exit, so this only drains the calling thread; it does NOT
-    /// tear down global state (other threads may still be running). Idempotent
-    /// and safe to call more than once.
+    /// `mi_process_done`: best-effort cleanup — only drains the calling thread
+    /// (the OS reclaims mappings at exit; other threads may still run). Idempotent.
     pub fn process_done() {
         super::tls::collect_lifecycle(true);
     }
@@ -375,12 +335,8 @@ mod tests {
         use core::ffi::c_void;
         use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-        // Process-global counters; key the callback to its own `arg` sentinel so
-        // collects driven by other (parallel) tests' threads never bump them.
-        // The heartbeat is *per-thread* and only globally meaningful on this
-        // test's own thread, so also gate updates to the registering thread:
-        // a `collect` driven by a parallel test's thread would otherwise store
-        // that thread's (unrelated, non-monotonic) heartbeat into `LAST_HB`.
+        // Key the callback to its own `arg` sentinel and the registering thread,
+        // so parallel tests' collects never bump these process-global counters.
         static FIRED: AtomicUsize = AtomicUsize::new(0);
         static LAST_HB: AtomicU64 = AtomicU64::new(0);
         static OWNER_TID: AtomicU64 = AtomicU64::new(0);
@@ -428,11 +384,8 @@ mod tests {
         use core::ffi::c_void;
         use core::sync::atomic::{AtomicUsize, Ordering};
 
-        // A callback that re-enters collection must NOT be fired again (the
-        // recurse guard bounds it to depth 1), so this cannot stack-overflow.
-        // The recurse guard is *per-thread*, so `DEPTH` is only meaningful on
-        // this test's own thread; gate updates to the registering thread so a
-        // `collect` driven by a parallel test's thread cannot inflate `DEPTH`.
+        // A callback that re-enters collection must not fire again (recurse guard
+        // bounds it to depth 1). Gate to the registering thread for `DEPTH`.
         static DEPTH: AtomicUsize = AtomicUsize::new(0);
         static MAX_DEPTH: AtomicUsize = AtomicUsize::new(0);
         static OWNER_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

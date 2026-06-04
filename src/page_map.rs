@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! Address → page reverse map (ports `src/page-map.c`, the 2-level variant).
 //!
-//! Every 64 KiB arena slice maps to the [`crate::page::Page`] that owns it, so
-//! `free(p)` can recover the page in O(1). On x64 (`MI_MAX_VABITS == 47`) the
-//! map is **two-level**: a fixed top table of `2^18` entries, each lazily
-//! pointing at a 64 KiB submap of `2^13` slice entries.
-//!
-//! Stored page pointers are kept as raw `*mut u8`; the [`crate::page`] layer
-//! casts to its concrete type. Entries are published with `Release` and read
-//! with `Acquire`, so a thread that observes a page pointer also observes the
-//! page's initialized (const) fields.
+//! Maps every 64 KiB slice to its owning [`crate::page::Page`] so `free(p)` is
+//! O(1). On x64 (`MI_MAX_VABITS == 47`): a `2^18` top table, each entry lazily
+//! pointing at a `2^13`-entry submap. Entries are published `Release` / read
+//! `Acquire`, so observing a page pointer also observes its const fields.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -37,14 +32,10 @@ static TOP: AtomicPtr<TopEntry> = AtomicPtr::new(core::ptr::null_mut());
 static INIT_LOCK: SpinLock = SpinLock::new();
 
 /// A single shared, read-only, all-null submap. Every *unregistered* top-table
-/// entry points here instead of being null, so [`lookup`] never has to branch
-/// on a null submap on the hot path: reading any slot of it yields a null page
-/// (the address is unmapped / not ours). This generalizes mimalloc's committed
-/// entry-0 `sub0` NULL-resolution trick (`page-map.c:273-288`, where the C 2-level
-/// map keeps one zeroed submap so `_mi_ptr_page(NULL) == NULL`) to the *whole*
-/// table — turning C's `if (sub==NULL) return NULL` guard into "always read a
-/// valid submap", which is what makes the unchecked fast path safe by
-/// construction rather than by relying on the caller's pointer being mapped.
+/// entry points here (not null), so [`lookup`] always reads a valid submap with
+/// no null-submap branch — an unmapped address resolves to a null page.
+/// Generalizes mimalloc's `sub0` NULL-resolution trick (page-map.c:273-288) to
+/// the whole table, which is what makes the unchecked fast path sound.
 static ZERO_SUBMAP: Submap = [const { AtomicPtr::new(core::ptr::null_mut()) }; SUB_COUNT];
 
 /// Address of the shared zero-submap as a `*mut Submap`.
@@ -81,6 +72,7 @@ fn ensure_top() -> *mut TopEntry {
             // Point every entry at the shared zero-submap so a lookup never sees
             // a null submap (see [`ZERO_SUBMAP`]). One-time, before the table is
             // published, so no other thread can observe a half-filled table.
+            // Point every entry at the shared zero-submap (see [`ZERO_SUBMAP`]).
             let zs = zero_submap();
             for i in 0..TOP_COUNT {
                 // SAFETY: `i < TOP_COUNT`; `base` is the freshly allocated table.
@@ -184,15 +176,9 @@ pub unsafe fn unregister(addr: usize, slice_count: usize) {
     }
 }
 
-/// Look up the page owning address `addr`, or null if unmapped.
-///
-/// Once the top table exists, every entry points at a valid submap (a real one
-/// or the shared all-null [`ZERO_SUBMAP`]), so the hot path is two dependent
-/// loads and **no submap-null branch** — an unmapped/foreign address resolves
-/// to a null page through the zero-submap. Only the `TOP`-null guard (before the
-/// first registration) and the canonical-range guard remain. Mirrors C's
-/// 2-level `_mi_checked_ptr_page` (`internal.h`), minus the per-lookup
-/// submap-null test that the zero-submap makes unnecessary.
+/// Look up the page owning address `addr`, or null if unmapped (mirrors C's
+/// 2-level `_mi_checked_ptr_page`). The hot path is two dependent loads with no
+/// submap-null branch (the zero-submap makes it unnecessary).
 #[inline]
 pub fn lookup(addr: usize) -> *mut u8 {
     let top = TOP.load(Ordering::Acquire);

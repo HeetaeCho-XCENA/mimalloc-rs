@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: MIT
 //! Concurrent atomic bitmap (ports `src/bitmap.c` / `bitmap.h`).
 //!
-//! Layout, bottom-up:
-//! * **bfield** — one `usize` word (64 bits) with atomic set/clear/scan.
-//! * **[`BChunk`]** — `MI_BCHUNK_BITS` bits (512) across 8 cache-aligned fields.
-//! * **chunkmap** — one [`BChunk`] whose bit *c* is set iff chunk *c* *may* have
-//!   a set bit; a two-level search skips empty chunks.
-//! * **[`Bitmap`]** — a chunkmap plus `N` chunks (a borrowed view over storage
-//!   that may live in arena memory or, in tests, a `Vec`).
+//! Layout, bottom-up: **bfield** (one `usize`), **[`BChunk`]** (512 bits over 8
+//! cache-aligned fields), **chunkmap** (one [`BChunk`], bit *c* set iff chunk *c*
+//! may be non-empty), **[`Bitmap`]** (a chunkmap + `N` chunks, borrowed view).
 //!
-//! Convention (matching v3 arenas): for the *free-slices* bitmap a **set bit
-//! means free**, so allocation is *find-and-clear* and freeing is *set*.
+//! Convention (matching v3 arenas): for the free-slices bitmap a **set bit means
+//! free** — allocation is find-and-clear, freeing is set. Multi-field ranges
+//! clear field-by-field with rollback (no half-claimed run).
 //!
-//! All mutating operations use the mimalloc ordering discipline: relaxed reads
-//! in CAS retry loops with acquire-release compare-exchanges (see [`crate::atomic`]).
-//! Multi-field ranges are cleared field-by-field with rollback so a partial
-//! failure never leaves a half-claimed run (no double-allocation).
-//!
-//! Not yet ported (optimizations, tracked for later milestones): the *binned*
-//! `mi_bbitmap_t` (per-size-class chunk reservation) and SIMD field scanning.
+//! Not yet ported: the binned `mi_bbitmap_t` and SIMD field scanning.
 
 use crate::atomic::{cas_weak_acq_rel, load_acquire, load_relaxed, AtomicUsize};
 use crate::bits::{MI_BCHUNK_BITS, MI_SIZE_BITS};
@@ -474,14 +465,9 @@ impl<'a> Bitmap<'a> {
     }
 
     /// Find a set bit whose `claim(idx)` returns true, clear it, and return its
-    /// index; bits for which `claim` returns false are left set and skipped.
-    ///
-    /// This is the ownership-gated reclaim primitive (ports
-    /// `mi_bitmap_try_find_and_claim`): the `claim` callback (a page-ownership
-    /// CAS) is the single serialization point, so a registered page is removed
-    /// from the bitmap only by the thread that wins its ownership — a concurrent
-    /// freer that already owns the page makes `claim` fail, leaving the bit for a
-    /// later attempt. `tseq` rotates the starting chunk to spread contention.
+    /// index (ports `mi_bitmap_try_find_and_claim`). The `claim` callback (a
+    /// page-ownership CAS) is the serialization point; bits where it fails are
+    /// left set. `tseq` rotates the starting chunk.
     pub fn try_find_and_claim(
         &self,
         tseq: usize,
@@ -746,11 +732,8 @@ mod loom_tests {
         });
     }
 
-    /// The arena purge claim protocol: a purger atomically claims a free slot
-    /// (`clear_n`), "purges" it, then releases it (`set_n`), while an allocator
-    /// races to claim slots (`try_find_and_clear`). The slot must never be owned
-    /// by both at once — i.e. a purge can never `madvise` memory an allocation
-    /// is handing out. `owner0` (guarded by the claim) detects any double-owner.
+    /// Arena purge claim protocol: a purger (`clear_n` → purge → `set_n`) and an
+    /// allocator (`try_find_and_clear`) must never own the same slot at once.
     #[test]
     fn purge_claim_never_overlaps_alloc() {
         use crate::atomic::{AtomicUsize, Ordering};
