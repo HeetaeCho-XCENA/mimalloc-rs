@@ -81,12 +81,13 @@ mod tls {
     /// Allocate zeroed memory of `size` bytes.
     #[inline]
     pub fn zalloc(size: usize) -> Option<NonNull<u8>> {
-        let p = DEFAULT_HEAP.with(|h| h.alloc(size))?;
-        // SAFETY: `p` points to at least `size` writable bytes.
-        unsafe {
-            core::ptr::write_bytes(p.as_ptr(), 0, size);
-        }
-        Some(p)
+        DEFAULT_HEAP.with(|h| h.alloc_zeroed(size))
+    }
+
+    /// Allocate `size` zeroed bytes aligned to `align` from the default heap.
+    #[inline]
+    pub fn zalloc_aligned(size: usize, align: usize) -> Option<NonNull<u8>> {
+        DEFAULT_HEAP.with(|h| h.alloc_zeroed_aligned(size, align))
     }
 
     /// Reclaim memory in the calling thread's default heap (see
@@ -109,7 +110,7 @@ mod tls {
 }
 
 #[cfg(feature = "std")]
-pub use tls::{collect, malloc, malloc_aligned, zalloc};
+pub use tls::{collect, malloc, malloc_aligned, zalloc, zalloc_aligned};
 
 // Lifecycle / deferred-free registration (ports `mi_register_deferred_free` and
 // the thread/process lifecycle entry points). `std`-only.

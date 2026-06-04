@@ -114,8 +114,8 @@ mod tests {
             let a = arena.as_ref();
             let mut pages = alloc::vec::Vec::new();
             for _ in 0..3 {
-                let (idx, p) = a.alloc_slices(1, 0).unwrap();
-                pages.push(Page::init(p, idx, 1, 64, [1, 2]).as_ptr());
+                let (idx, p, _z) = a.alloc_slices(1, 0).unwrap();
+                pages.push(Page::init(p, idx, 1, 64, [1, 2], true).as_ptr());
             }
             let q = PageQueue::new();
             for &pg in &pages {

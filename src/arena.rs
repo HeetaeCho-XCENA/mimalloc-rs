@@ -43,6 +43,11 @@ pub struct Arena {
     /// still-free ranges to the OS.
     purge_chunkmap: NonNull<BChunk>,
     purge_chunks: NonNull<BChunk>,
+    /// `set = has been handed out at least once` (ports v3's `slices_dirty`). A
+    /// clean slice of a zero-initialized arena is still OS-zero, so a fresh
+    /// allocation can skip re-zeroing; purging a decommitted range clears it.
+    dirty_chunkmap: NonNull<BChunk>,
+    dirty_chunks: NonNull<BChunk>,
     /// Per-bin abandoned-page registry (ports v3's `pages_abandoned[bin]`),
     /// **lazily allocated** on first abandon: an OS block of `MI_BIN_COUNT`
     /// `[chunkmap][chunks; chunk_count]` bitmaps (bin `b` at `+ b*(chunk_count+1)`).
@@ -85,7 +90,7 @@ impl Arena {
         // Hot bitmaps (free + commit + purge), each `[chunkmap][chunks]`, laid out
         // contiguously in the compact meta region (touched on every slice op).
         let stride = chunk_count + 1;
-        let hot_bchunks = 3 * stride;
+        let hot_bchunks = 4 * stride;
         let hot_bytes = hot_bchunks * core::mem::size_of::<BChunk>();
         let bm_mem = match meta_zalloc(hot_bytes) {
             Some(p) => p,
@@ -104,6 +109,8 @@ impl Arena {
             commit_chunks,
             purge_chunkmap,
             purge_chunks,
+            dirty_chunkmap,
+            dirty_chunks,
         ) = unsafe {
             (
                 NonNull::new_unchecked(bm_base),
@@ -112,6 +119,8 @@ impl Arena {
                 NonNull::new_unchecked(bm_base.add(stride + 1)),
                 NonNull::new_unchecked(bm_base.add(2 * stride)),
                 NonNull::new_unchecked(bm_base.add(2 * stride + 1)),
+                NonNull::new_unchecked(bm_base.add(3 * stride)),
+                NonNull::new_unchecked(bm_base.add(3 * stride + 1)),
             )
         };
 
@@ -142,6 +151,8 @@ impl Arena {
                 commit_chunks,
                 purge_chunkmap,
                 purge_chunks,
+                dirty_chunkmap,
+                dirty_chunks,
                 abandoned_base: AtomicPtr::new(core::ptr::null_mut()),
                 abandoned_memid: UnsafeCell::new(None),
                 abandoned_lock: SpinLock::new(),
@@ -153,6 +164,11 @@ impl Arena {
             // alloc path does no per-slice commit. Lazy arenas commit on demand.
             if commit {
                 a.commit_bitmap().unsafe_set_n(0, slice_count);
+            }
+            // A region the OS did not hand us zeroed is dirty everywhere, so no
+            // allocation from it may claim zero memory (ports arena.c:1575).
+            if !a.memid.initially_zero {
+                a.dirty_bitmap().unsafe_set_n(0, slice_count);
             }
         }
         NonNull::new(arena)
@@ -187,6 +203,17 @@ impl Arena {
             Bitmap::from_parts(
                 self.purge_chunkmap.as_ref(),
                 core::slice::from_raw_parts(self.purge_chunks.as_ptr(), self.chunk_count),
+            )
+        }
+    }
+
+    #[inline]
+    fn dirty_bitmap(&self) -> Bitmap<'_> {
+        // SAFETY: same layout as `free_bitmap`.
+        unsafe {
+            Bitmap::from_parts(
+                self.dirty_chunkmap.as_ref(),
+                core::slice::from_raw_parts(self.dirty_chunks.as_ptr(), self.chunk_count),
             )
         }
     }
@@ -343,17 +370,23 @@ impl Arena {
         true
     }
 
-    /// Allocate `n` contiguous slices. Returns the slice index and pointer.
+    /// Allocate `n` contiguous slices. Returns the slice index, pointer, and
+    /// whether the slices are guaranteed OS-zeroed — true only for a run of a
+    /// zero-initialized arena that has never been handed out (clean) since its
+    /// last fresh commit (ports the `slices_dirty` check, arena.c:228-230).
     ///
     /// `tseq` spreads concurrent allocators across the bitmap.
-    pub fn alloc_slices(&self, n: usize, tseq: usize) -> Option<(usize, NonNull<u8>)> {
+    pub fn alloc_slices(&self, n: usize, tseq: usize) -> Option<(usize, NonNull<u8>, bool)> {
         let idx = self.free_bitmap().try_find_and_clear_n(n, tseq)?;
         if !self.ensure_committed(idx, n) {
             // Commit failed: return the slices to the free bitmap.
             self.free_slices(idx, n);
             return None;
         }
-        Some((idx, self.slice_ptr(idx)))
+        // A clean slice of a zero arena is still OS-zero; mark it dirty now.
+        let was_clean = self.memid.initially_zero && self.dirty_bitmap().is_clear_n(idx, n);
+        self.dirty_bitmap().set_n(idx, n);
+        Some((idx, self.slice_ptr(idx), was_clean))
     }
 
     /// Free `n` slices at `idx` (immediately reusable) and schedule a delayed
@@ -456,6 +489,9 @@ impl Arena {
                 };
                 if needs_recommit {
                     self.commit_bitmap().clear_n(idx, n);
+                    // Decommit zeroes the range on its next commit, so it is
+                    // clean again (reset-mode purge gives no such guarantee).
+                    self.dirty_bitmap().clear_n(idx, n);
                 }
                 self.free_bitmap().set_n(idx, n);
                 purged = true;
@@ -503,9 +539,9 @@ mod tests {
             assert_eq!(a.free_slice_count(), 64);
 
             // allocate 1 + 8 + 16 slices
-            let (i1, p1) = a.alloc_slices(1, 0).unwrap();
-            let (i8, p8) = a.alloc_slices(8, 0).unwrap();
-            let (i16, _p16) = a.alloc_slices(16, 0).unwrap();
+            let (i1, p1, _z) = a.alloc_slices(1, 0).unwrap();
+            let (i8, p8, _z) = a.alloc_slices(8, 0).unwrap();
+            let (i16, _p16, _z) = a.alloc_slices(16, 0).unwrap();
             assert_eq!(a.free_slice_count(), 64 - 1 - 8 - 16);
 
             // committed slices are writable
@@ -534,7 +570,7 @@ mod tests {
         // SAFETY: fresh arena; single-threaded test.
         unsafe {
             let a = arena.as_ref();
-            let (i, p) = a.alloc_slices(4, 0).unwrap();
+            let (i, p, _z) = a.alloc_slices(4, 0).unwrap();
             assert_eq!(i, 0);
             core::ptr::write_bytes(p.as_ptr(), 0xCC, 4 * MI_ARENA_SLICE_SIZE);
             a.free_slices(0, 4);
@@ -549,7 +585,7 @@ mod tests {
             );
 
             // Reuse must recommit before handing the slices back.
-            let (j, q) = a.alloc_slices(4, 0).unwrap();
+            let (j, q, _z) = a.alloc_slices(4, 0).unwrap();
             assert_eq!(j, 0);
             core::ptr::write_bytes(q.as_ptr(), 0x99, 4 * MI_ARENA_SLICE_SIZE);
             assert_eq!(*q.as_ptr(), 0x99, "recommitted slice is writable");
@@ -582,7 +618,7 @@ mod tests {
         unsafe {
             let a = arena.as_ref();
             assert_eq!(a.committed_slice_count(), 16);
-            let (i, p) = a.alloc_slices(8, 0).unwrap();
+            let (i, p, _z) = a.alloc_slices(8, 0).unwrap();
             core::ptr::write_bytes(p.as_ptr(), 0xAB, 8 * MI_ARENA_SLICE_SIZE);
             a.free_slices(i, 8); // schedules a purge ~1s out
 
@@ -601,7 +637,7 @@ mod tests {
             assert_eq!(a.committed_slice_count(), 8, "force decommitted the range");
 
             // Reuse must recommit (if needed) and hand back usable, zeroed memory.
-            let (_j, q) = a.alloc_slices(8, 0).unwrap();
+            let (_j, q, _z) = a.alloc_slices(8, 0).unwrap();
             core::ptr::write_bytes(q.as_ptr(), 0xCD, 8 * MI_ARENA_SLICE_SIZE);
             assert_eq!(*q.as_ptr(), 0xCD, "reused slice is writable");
             assert_eq!(*q.as_ptr().add(8 * MI_ARENA_SLICE_SIZE - 1), 0xCD);
@@ -619,7 +655,7 @@ mod tests {
         // SAFETY: fresh arena.
         unsafe {
             let a = arena.as_ref();
-            let (_i, _p) = a.alloc_slices(8, 0).unwrap(); // takes all 8
+            let (_i, _p, _z) = a.alloc_slices(8, 0).unwrap(); // takes all 8
             assert!(a.alloc_slices(1, 0).is_none());
             assert_eq!(a.free_slice_count(), 0);
             Arena::destroy(arena);

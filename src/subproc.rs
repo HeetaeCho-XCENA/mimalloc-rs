@@ -104,21 +104,22 @@ impl Subproc {
 
     /// Allocate `n` contiguous slices from any arena, growing the pool if needed.
     ///
-    /// Returns the owning arena, the slice index within it, and the slice pointer.
+    /// Returns the owning arena, the slice index within it, the slice pointer,
+    /// and whether the slices are guaranteed OS-zeroed.
     pub fn alloc_slices(
         &self,
         n: usize,
         commit: bool,
         tseq: usize,
-    ) -> Option<(NonNull<Arena>, usize, NonNull<u8>)> {
+    ) -> Option<(NonNull<Arena>, usize, NonNull<u8>, bool)> {
         // Try existing arenas.
         let count = self.arena_count();
         for i in 0..count {
             if let Some(arena) = self.arena_at(i) {
                 // SAFETY: registered arenas stay live for the process.
                 let a = unsafe { arena.as_ref() };
-                if let Some((idx, p)) = a.alloc_slices(n, tseq) {
-                    return Some((arena, idx, p));
+                if let Some((idx, p, is_zero)) = a.alloc_slices(n, tseq) {
+                    return Some((arena, idx, p, is_zero));
                 }
             }
         }
@@ -126,8 +127,8 @@ impl Subproc {
         let arena = self.reserve_arena(n, commit)?;
         // SAFETY: freshly registered arena.
         let a = unsafe { arena.as_ref() };
-        let (idx, p) = a.alloc_slices(n, tseq)?;
-        Some((arena, idx, p))
+        let (idx, p, is_zero) = a.alloc_slices(n, tseq)?;
+        Some((arena, idx, p, is_zero))
     }
 
     /// Register a non-empty page in its arena's abandoned registry for `bin`
@@ -187,7 +188,7 @@ mod tests {
     fn alloc_from_subproc_and_page_map_roundtrip() {
         let sp = subproc_main();
         // Allocate an 8-slice run from the (possibly freshly reserved) pool.
-        let (arena, idx, p) = sp.alloc_slices(8, false, 0).unwrap();
+        let (arena, idx, p, _z) = sp.alloc_slices(8, false, 0).unwrap();
         // SAFETY: live arena.
         let a = unsafe { arena.as_ref() };
 

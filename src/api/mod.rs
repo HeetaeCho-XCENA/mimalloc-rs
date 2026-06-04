@@ -142,6 +142,29 @@ mod tests {
         }
     }
 
+    // The large/huge `alloc_zeroed` fast path skips the body memset when the
+    // serving slices are OS-zero (clearing only the free-list link word). Churn
+    // a large block through dirty→free→purge→reuse and require every byte zero
+    // each round — a reused-but-dirty block wrongly flagged zero would fail here.
+    #[test]
+    fn alloc_zeroed_large_stays_zero_across_reuse() {
+        let mm = MiMalloc;
+        let size = 2 * 1024 * 1024; // > MI_MEDIUM_MAX_OBJ_SIZE: the page fast path
+        let l = Layout::from_size_align(size, 16).unwrap();
+        // SAFETY: matched alloc_zeroed / dealloc with one layout.
+        unsafe {
+            for _ in 0..32 {
+                let p = mm.alloc_zeroed(l);
+                assert!(!p.is_null());
+                let s = core::slice::from_raw_parts(p, size);
+                assert!(s.iter().all(|&b| b == 0), "alloc_zeroed returned non-zero");
+                core::ptr::write_bytes(p, 0xFF, size); // dirty before freeing
+                mm.dealloc(p, l);
+                crate::init::collect(true); // force the delayed purge to run
+            }
+        }
+    }
+
     #[test]
     fn allocator_api2_box_and_vec() {
         use allocator_api2::boxed::Box;

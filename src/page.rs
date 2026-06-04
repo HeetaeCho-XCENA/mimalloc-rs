@@ -84,6 +84,11 @@ pub struct Page {
     arena: Cell<*mut crate::arena::Arena>,
     /// Size-class bin index this page belongs to (set after init).
     bin: Cell<u32>,
+    /// `true` while the blocks reachable from `free` are still OS-zero (apart
+    /// from their encoded link word) — set from the slices' `initially_zero` at
+    /// carve, cleared once any recycled block is collected back into `free`
+    /// (ports `mi_page_t.free_is_zero`, types.h:390).
+    free_is_zero: Cell<bool>,
 }
 
 impl Page {
@@ -99,6 +104,7 @@ impl Page {
         slice_count: usize,
         block_size: usize,
         keys: [usize; 2],
+        is_zero: bool,
     ) -> NonNull<Page> {
         debug_assert!(block_size >= MI_INTPTR_SIZE);
         let region = slice_count * MI_ARENA_SLICE_SIZE;
@@ -132,6 +138,7 @@ impl Page {
                 heap: Cell::new(core::ptr::null_mut()),
                 arena: Cell::new(core::ptr::null_mut()),
                 bin: Cell::new(0),
+                free_is_zero: Cell::new(is_zero),
             });
             NonNull::new_unchecked(hdr)
         }
@@ -191,6 +198,8 @@ impl Page {
             {
                 continue;
             }
+            // Recycled blocks carry the previous owner's bytes — no longer zero.
+            self.free_is_zero.set(false);
             // We now exclusively own the captured `tf` list; splice it into `free`.
             while !tf.is_null() {
                 // SAFETY: `tf` blocks were published via `set_next` (same encoding).
@@ -209,6 +218,8 @@ impl Page {
         // adopt the whole list head in O(1) with no traversal.
         let lf = self.local_free.get();
         if !lf.is_null() {
+            // Recycled blocks carry the previous owner's bytes — no longer zero.
+            self.free_is_zero.set(false);
             if self.free.get().is_null() {
                 self.free.set(lf);
             } else {
@@ -507,6 +518,32 @@ impl Page {
         self.used.set(self.used.get().saturating_sub(1));
     }
 
+    /// Zero a just-popped block `p` (at the block start). When the page's free
+    /// blocks are still OS-zero, only the encoded free-list link in the first
+    /// word was dirtied, so clearing it suffices; otherwise zero the whole
+    /// block (ports `_mi_page_malloc_zero`, alloc.c:88-94).
+    ///
+    /// # Safety
+    /// `p` must be a block just returned by `self.alloc()` (block start).
+    #[inline]
+    pub unsafe fn zero_block(&self, p: NonNull<u8>) {
+        let n = if self.free_is_zero.get() {
+            core::mem::size_of::<Block>()
+        } else {
+            self.block_size
+        };
+        // SAFETY: `p` is a live block spanning at least `block_size` bytes, and
+        // `n <= block_size`.
+        unsafe { core::ptr::write_bytes(p.as_ptr(), 0, n) };
+    }
+
+    /// Mark this page's free blocks as no longer guaranteed-zero (e.g. after a
+    /// page is reclaimed from the abandoned set — it has been used).
+    #[inline]
+    pub fn mark_reused(&self) {
+        self.free_is_zero.set(false);
+    }
+
     /// Record the owning heap, arena, and bin (once after init, owner thread).
     #[inline]
     pub fn set_provenance(
@@ -703,8 +740,8 @@ mod tests {
         // SAFETY: fresh arena.
         unsafe {
             let a = arena.as_ref();
-            let (idx, p) = a.alloc_slices(1, 0).unwrap();
-            let page = Page::init(p, idx, 1, block_size, [0x1234_5678, 0x9abc_def0]);
+            let (idx, p, _z) = a.alloc_slices(1, 0).unwrap();
+            let page = Page::init(p, idx, 1, block_size, [0x1234_5678, 0x9abc_def0], true);
             let r = f(page.as_ref());
             a.free_slices(idx, 1);
             Arena::destroy(arena);
