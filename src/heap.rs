@@ -6,9 +6,10 @@ use core::ptr::NonNull;
 
 use crate::arena_meta::{meta_free, meta_zalloc};
 use crate::bits::{
-    bin, wsize_from_size, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_HUGE, MI_INTPTR_SIZE,
-    MI_LARGE_MAX_OBJ_SIZE, MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE, MI_PAGES_DIRECT,
-    MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX, MI_THREADID_ABANDONED, MI_THREADID_ABANDONED_MAPPED,
+    bin, wsize_from_size, MI_ARENA_SLICE_SIZE, MI_BIN_COUNT, MI_BIN_FULL, MI_BIN_HUGE,
+    MI_INTPTR_SIZE, MI_LARGE_MAX_OBJ_SIZE, MI_MAX_ALIGN_SIZE, MI_MEDIUM_MAX_OBJ_SIZE,
+    MI_PAGES_DIRECT, MI_RETIRE_CYCLES, MI_SMALL_MAX_OBJ_SIZE, MI_SMALL_WSIZE_MAX,
+    MI_THREADID_ABANDONED, MI_THREADID_ABANDONED_MAPPED,
 };
 // Used only by the std free path (the no_std path is single-owner and never
 // takes the XOR dispatch or the cross-thread claim/`collect_partly` path).
@@ -87,6 +88,11 @@ pub struct Heap {
     /// served it. Invariant: a non-null entry points at a live page owned by
     /// this heap (entries are cleared in `retire_page` before slices are freed).
     pages_free_direct: [Cell<*mut Page>; MI_PAGES_DIRECT],
+    /// Inclusive bin range that may hold a retired (emptied-but-kept) sole page,
+    /// so `collect_retired` scans only the touched bins (`mi_theap_t`'s
+    /// `page_retired_min/max`, types.h:512-513). Empty when `min > max`.
+    page_retired_min: Cell<usize>,
+    page_retired_max: Cell<usize>,
 }
 
 impl Heap {
@@ -100,6 +106,9 @@ impl Heap {
             tseq: Cell::new(0),
             pages: [const { PageQueue::new() }; MI_BIN_COUNT],
             pages_free_direct: [const { Cell::new(core::ptr::null_mut()) }; MI_PAGES_DIRECT],
+            // Empty retired range: min > max.
+            page_retired_min: Cell::new(MI_BIN_FULL),
+            page_retired_max: Cell::new(0),
         }
     }
 
@@ -205,7 +214,13 @@ impl Heap {
         let bs = bin_block_size(b);
         let mut pg = match self.find_free_page(b) {
             Some(p) => p,
-            None => self.new_page(b, bs, page_slices_for(bs))?,
+            None => {
+                // No existing page had room. Sweep retired pages first (this also
+                // drives delayed purge on the cadence) so an idle size class can
+                // return its kept page before we carve a fresh one (page.c:834).
+                self.collect_retired(false);
+                self.new_page(b, bs, page_slices_for(bs))?
+            }
         };
         // SAFETY: `pg` is a live page owned by this heap.
         let mut blk = unsafe { (*pg).alloc() };
@@ -231,11 +246,76 @@ impl Heap {
             // mutable, so a shared borrow suffices.
             let p = unsafe { &*cur };
             if !p.is_full() {
+                // Reusing a page from the queue cancels any pending retire so a
+                // churned sole page is never released out from under us
+                // (ports page.c:847,872).
+                if p.retire_expire() != 0 {
+                    p.set_retire_expire(0);
+                }
                 return Some(cur);
             }
             cur = p.next.get();
         }
         self.try_reclaim(b)
+    }
+
+    /// Sweep the bins that hold a retired (emptied-but-kept) sole page: decrement
+    /// each one's countdown and release it once the countdown elapses (or on
+    /// `force`). Reused pages have their countdown cancelled. Runs on the
+    /// alloc-generic cadence and is where delayed purge is now driven, replacing
+    /// the old per-retire `try_purge` (ports `_mi_theap_collect_retired`,
+    /// page.c:471-496).
+    fn collect_retired(&self, force: bool) {
+        let lo = self.page_retired_min.get();
+        let hi = self.page_retired_max.get();
+        // Recompute the touched range as we go; empty when min > max.
+        let mut min = MI_BIN_FULL;
+        let mut max = 0;
+        for b in lo..=hi {
+            let page_ptr = self.pages[b].first();
+            if page_ptr.is_null() {
+                continue;
+            }
+            // SAFETY: a queue head is a live page owned by this heap.
+            let page = unsafe { &*page_ptr };
+            let expire = page.retire_expire();
+            if expire == 0 {
+                continue;
+            }
+            if !page.is_all_free() {
+                // Reused since it was retired — cancel the countdown.
+                page.set_retire_expire(0);
+                continue;
+            }
+            let remaining = expire - 1;
+            page.set_retire_expire(remaining);
+            if remaining == 0 || force {
+                // Countdown elapsed: release the page like an immediate retire.
+                for slot in self.pages_free_direct.iter() {
+                    if slot.get() == page_ptr {
+                        slot.set(core::ptr::null_mut());
+                    }
+                }
+                // SAFETY: empty, owner-held page linked in this bin queue; its
+                // slice range was registered for it at creation.
+                unsafe {
+                    self.pages[b].remove(page_ptr);
+                    release_page_slices(page_ptr);
+                }
+            } else {
+                // Still counting down: keep tracking this bin.
+                if b < min {
+                    min = b;
+                }
+                if b > max {
+                    max = b;
+                }
+            }
+        }
+        self.page_retired_min.set(min);
+        self.page_retired_max.set(max);
+        // Drive delayed purge on the cadence (replaces the per-retire try_purge).
+        self.subproc.try_purge(false);
     }
 
     /// Adopt an abandoned page of `bin` (left by an exited thread).
@@ -453,6 +533,12 @@ impl Heap {
                 cur = next;
             }
         }
+        if force {
+            // Force released every page, including retired sole pages — the
+            // retired-bin range is now empty.
+            self.page_retired_min.set(MI_BIN_FULL);
+            self.page_retired_max.set(0);
+        }
         // Heartbeat that drives delayed purging back to the OS.
         self.subproc.try_purge(force);
     }
@@ -655,11 +741,32 @@ unsafe fn retire_page(page_ptr: *mut Page) {
     }
     // SAFETY: heap is this thread's heap (owner-only access is safe here).
     let heap = unsafe { &*heap };
-    // Keep the last page of a normal bin; always retire huge pages.
-    if bin != MI_BIN_HUGE && heap.pages[bin].len() <= 1 {
+    // Already retired (countdown running): keep it retired (ports page.c:437).
+    if page.retire_expire() != 0 {
         return;
     }
-    // Clear fast-path entries pointing at this page before release.
+    // Sole page of a normal bin: don't release it yet. Arm the retire countdown
+    // and keep it for reuse — `collect_retired` releases it later only if the
+    // size class stays idle. This avoids retire/re-allocate churn when a workload
+    // empties a bin then immediately allocates from it again (ports page.c:446-463).
+    // Huge pages have no size class to keep, so they always release.
+    if bin != MI_BIN_HUGE && heap.pages[bin].len() <= 1 {
+        let cycles = if page.block_size() <= MI_SMALL_MAX_OBJ_SIZE {
+            MI_RETIRE_CYCLES
+        } else {
+            MI_RETIRE_CYCLES / 4
+        };
+        page.set_retire_expire(cycles);
+        if bin < heap.page_retired_min.get() {
+            heap.page_retired_min.set(bin);
+        }
+        if bin > heap.page_retired_max.get() {
+            heap.page_retired_max.set(bin);
+        }
+        return;
+    }
+    // Otherwise release immediately. Clear fast-path entries pointing at this
+    // page before release.
     for slot in heap.pages_free_direct.iter() {
         if slot.get() == page_ptr {
             slot.set(core::ptr::null_mut());
@@ -670,8 +777,10 @@ unsafe fn retire_page(page_ptr: *mut Page) {
         heap.pages[bin].remove(page_ptr);
         release_page_slices(page_ptr);
     }
-    // Mirrors v3 retire → `_mi_arenas_collect` → try-purge.
-    heap.subproc.try_purge(false);
+    // Purge is no longer driven here. The old per-retire `try_purge` scanned
+    // every arena on each free; v3 drives purge from collect, so `collect_retired`
+    // runs it on the alloc-generic cadence instead. `free_slices` already
+    // scheduled the decommit and armed the delay timer, so nothing is dropped.
 }
 
 /// Return a page's slices to its arena and drop its address→page mappings.
@@ -980,6 +1089,56 @@ mod tests {
             free(p);
             let after = crate::stats::snapshot();
             assert!(after.frees > before.frees, "free count must rise");
+        }
+    }
+
+    #[test]
+    fn retired_sole_page_released_after_countdown() {
+        // A bin's emptied sole page is kept (not released) and only returned to
+        // the arena once `collect_retired` has counted the retire timer down to
+        // zero — modelling an idle size class eventually giving its page back.
+        let h = test_heap();
+        let b = bin(200);
+        // SAFETY: pointer comes from this heap and is freed on this thread.
+        unsafe {
+            let p = h.alloc(200).unwrap();
+            assert_eq!(h.pages[b].len(), 1);
+            free(p);
+            // Sole page kept on retire, countdown armed (small bin => full cycles).
+            assert_eq!(h.pages[b].len(), 1, "sole page kept on retire");
+            // Idle collects count down; the page survives until the last one.
+            for _ in 0..(MI_RETIRE_CYCLES - 1) {
+                h.collect_retired(false);
+                assert_eq!(h.pages[b].len(), 1, "kept while counting down");
+            }
+            h.collect_retired(false);
+            assert_eq!(h.pages[b].len(), 0, "released when the countdown elapses");
+            // Heap remains usable afterwards.
+            let q = h.alloc(200).unwrap();
+            free(q);
+        }
+    }
+
+    #[test]
+    fn churned_sole_page_survives_collect() {
+        // A size class that keeps allocating and freeing its sole page must never
+        // have that page released out from under it: reuse cancels the retire
+        // countdown, so the page stays put across many collect cadences.
+        let h = test_heap();
+        let b = bin(200);
+        // SAFETY: pointers come from this heap and are freed on this thread.
+        unsafe {
+            for _ in 0..(3 * MI_RETIRE_CYCLES as usize) {
+                let p = h.alloc(200).unwrap();
+                h.collect_retired(false); // page in use -> countdown cancelled
+                free(p);
+                h.collect_retired(false); // all-free -> ticks down, but reuse resets
+            }
+            assert_eq!(
+                h.pages[b].len(),
+                1,
+                "an actively churned sole page is never released"
+            );
         }
     }
 

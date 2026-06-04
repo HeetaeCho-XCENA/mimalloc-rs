@@ -137,6 +137,13 @@ pub const MI_BIN_FULL: usize = MI_BIN_HUGE + 1; // 74
 /// `MI_BIN_COUNT`: total number of bins (including full queue).
 pub const MI_BIN_COUNT: usize = MI_BIN_FULL + 1; // 75
 
+/// `MI_RETIRE_CYCLES` (page.c:423): how many collect cadences an emptied *sole*
+/// page of a bin lingers before its slices are returned. Delaying the release
+/// avoids retire/re-allocate churn when a workload frees a size class then
+/// immediately allocates from it again. Small bins use the full count; larger
+/// bins use `MI_RETIRE_CYCLES / 4` (their pages cost more to keep resident).
+pub const MI_RETIRE_CYCLES: u8 = 16;
+
 /// Padding struct size (`mi_padding_t` = canary u32 + delta u32 = 8 bytes).
 pub const MI_PADDING_SIZE: usize = if MI_PADDING { 8 } else { 0 };
 /// Padding size rounded up to whole words.
