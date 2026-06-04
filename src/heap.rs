@@ -234,9 +234,9 @@ impl Heap {
             return self.alloc_huge(size);
         }
         let bs = bin_block_size(b);
-        // Pick the page that will serve this request: scan the bin queue (evicting
-        // full pages as we pass them so the queue stays short), else reclaim an
-        // abandoned page, else carve a fresh one. Then record it for the fast path.
+        // Pick the page that will serve this request: scan the bin queue, else
+        // reclaim an abandoned page, else carve a fresh one; record it for the
+        // fast path.
         let mut pg = match self.find_free_page(b) {
             Some(p) => p,
             None => self.new_page(b, bs, page_slices_for(bs))?,
@@ -797,10 +797,8 @@ unsafe fn unabandon_if_mapped(page_ptr: *mut Page) {
 
 /// We just claimed a previously-abandoned page by freeing a block into it
 /// (ports `mi_free_try_collect_mt`). With the page exclusively ours: collect, then
-/// (1) free it if now empty, else (2) **reclaim** it into the calling thread's
-/// heap if it originated there or still has plenty of free space (preload/`test`
-/// builds only — `reclaim_on_free`, ports `mi_abandoned_page_try_reclaim`), else
-/// (3) reabandon-to-mapped if it has space again, else (4) release ownership.
+/// (1) free it if now empty, else (2) reabandon-to-mapped if it has space again,
+/// else (3) release ownership.
 ///
 /// `mt_free` is the block the caller just pushed onto `xthread_free` (its head),
 /// letting the first collect use the no-atomic [`Page::collect_partly`] for small
@@ -866,8 +864,8 @@ unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_lis
     }
 }
 
-/// Hand a page we own off to the abandoned state (shared by full-page eviction
-/// [`Heap::page_to_full`] and [`Heap`]'s `Drop`). Collect it, then: empty →
+/// Hand a page we own off to the abandoned state (on thread exit, from
+/// [`Heap`]'s `Drop`). Collect it, then: empty →
 /// return its slices to the arena; full → abandoned **unmapped** (resurrected
 /// only by a later free-claim); otherwise → abandoned **mapped** (registered in
 /// `pages_abandoned[bin]`, findable for reclaim-on-alloc). Ownership is released
