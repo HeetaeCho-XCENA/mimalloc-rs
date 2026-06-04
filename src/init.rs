@@ -217,6 +217,8 @@ mod lifecycle {
         // back to call it. Re-registration is not expected to race with
         // collection (single-registration contract); `arg` is opaque and never
         // dereferenced here.
+        // SAFETY: `addr` is non-zero and was stored from a valid `DeferredFreeFun`
+        // pointer by `register_deferred_free`.
         let fun: DeferredFreeFun = unsafe { core::mem::transmute::<usize, DeferredFreeFun>(addr) };
         fun(force, hb, arg);
     }

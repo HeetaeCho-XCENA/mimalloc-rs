@@ -157,8 +157,10 @@ impl Heap {
         for b in 0..MI_BIN_COUNT {
             let mut cur = h.pages[b].first();
             while !cur.is_null() {
-                // SAFETY: queue holds valid pages owned by this heap.
-                let next = unsafe { (*cur).next.get() };
+                // SAFETY: queue holds valid pages owned by this heap; interior-
+                // mutable, so a shared borrow suffices.
+                let p = unsafe { &*cur };
+                let next = p.next.get();
                 // SAFETY: bulk free — return the slices regardless of `used`.
                 unsafe {
                     h.pages[b].remove(cur);
@@ -258,11 +260,13 @@ impl Heap {
     fn find_free_page(&self, b: usize) -> Option<*mut Page> {
         let mut cur = self.pages[b].first();
         while !cur.is_null() {
-            // SAFETY: queue holds valid pages owned by this heap.
-            if !unsafe { (*cur).is_full() } {
+            // SAFETY: queue holds valid pages owned by this heap; interior-
+            // mutable, so a shared borrow suffices.
+            let p = unsafe { &*cur };
+            if !p.is_full() {
                 return Some(cur);
             }
-            cur = unsafe { (*cur).next.get() };
+            cur = p.next.get();
         }
         self.try_reclaim(b)
     }
@@ -271,17 +275,20 @@ impl Heap {
     /// ownership, drain the cross-thread frees that accumulated while it was
     /// abandoned, re-home it into this heap, and return it.
     fn try_reclaim(&self, bin: usize) -> Option<*mut Page> {
-        let page = self.subproc.reclaim_page(bin, self.next_tseq())?;
+        let page_ptr = self.subproc.reclaim_page(bin, self.next_tseq())?;
         // SAFETY: popped from the abandoned stack — exclusively ours now.
+        let page = unsafe { &*page_ptr };
+        let arena = page.owning_arena();
+        page.set_owner(self.tid);
+        page.set_provenance(self as *const Heap as *mut Heap, arena, bin as u32);
+        // Collect blocks freed cross-thread while the page was abandoned.
+        // SAFETY: owner now; drains the cross-thread frees accumulated while
+        // abandoned, then links the now-owned page into our bin queue.
         unsafe {
-            let arena = (*page).owning_arena();
-            (*page).set_owner(self.tid);
-            (*page).set_provenance(self as *const Heap as *mut Heap, arena, bin as u32);
-            // Collect blocks freed cross-thread while the page was abandoned.
-            (*page).collect_free();
-            self.pages[bin].push_front(page);
+            page.collect_free();
+            self.pages[bin].push_front(page_ptr);
         }
-        Some(page)
+        Some(page_ptr)
     }
 
     /// Allocate `size` bytes aligned to `align` (a power of two).
@@ -419,12 +426,14 @@ impl Heap {
         for b in 0..MI_BIN_COUNT {
             let mut cur = self.pages[b].first();
             while !cur.is_null() {
-                // SAFETY: the bin queue holds valid pages owned by this heap.
-                let next = unsafe { (*cur).next.get() };
+                // SAFETY: the bin queue holds valid pages owned by this heap;
+                // interior-mutable, so a shared borrow suffices.
+                let p = unsafe { &*cur };
+                let next = p.next.get();
                 // SAFETY: owner thread; draining our own page's free lists.
-                unsafe { (*cur).collect_free() };
-                // SAFETY: owner thread; reading our own page's used count.
-                if unsafe { (*cur).is_all_free() } {
+                unsafe { p.collect_free() };
+                // Owner thread; reading our own page's used count.
+                if p.is_all_free() {
                     if force {
                         // Aggressive: release even the sole kept page. Clear any
                         // fast-path entries pointing at it first so the direct
@@ -783,6 +792,8 @@ unsafe fn unabandon_if_mapped(page_ptr: *mut Page) {
 /// `mt_free` is the block it just pushed onto `page_ptr`'s `xthread_free`.
 #[cfg(feature = "std")]
 unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_list::Block) {
+    // SAFETY: exclusively ours; interior-mutable, so a shared borrow suffices.
+    let page = unsafe { &*page_ptr };
     // SAFETY: const field; small blocks may use the no-atomic partial collect.
     let small = unsafe { Page::raw_block_size(page_ptr) } <= MI_SMALL_SIZE_MAX;
     let mut first = true;
@@ -791,18 +802,18 @@ unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_lis
             // First pass: collect the rest of the thread-free list without the
             // atomic swap (we already hold `mt_free`, the current head).
             // SAFETY: owner; `mt_free` is the just-pushed head.
-            unsafe { (*page_ptr).collect_partly(mt_free) };
+            unsafe { page.collect_partly(mt_free) };
         } else {
             // SAFETY: we own the page; drain cross-thread + local frees (used).
-            unsafe { (*page_ptr).collect_free() };
+            unsafe { page.collect_free() };
         }
         first = false;
 
         // 1. All blocks free → unabandon (clear any registry bit) and return the
         //    slices to the arena.
-        // SAFETY: owner.
-        if unsafe { (*page_ptr).is_all_free() } {
-            // SAFETY: owner; provenance set at creation.
+        if page.is_all_free() {
+            // SAFETY: owner; provenance set at creation. (`page` is dead after
+            // `release_page_slices` returns the header's slice to the arena.)
             unsafe {
                 unabandon_if_mapped(page_ptr);
                 release_page_slices(page_ptr);
@@ -814,15 +825,14 @@ unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_lis
         //    becomes findable for reclaim-on-alloc. Register it (set the bitmap
         //    bit) and stamp the mapped state *before* releasing ownership, so a
         //    concurrent reclaimer that finds the bit must lose the ownership race.
-        // SAFETY: owner; provenance set at creation.
-        if unsafe { !(*page_ptr).is_full() && !(*page_ptr).is_abandoned_mapped() } {
-            // SAFETY: owner; the page's slices belong to this arena.
-            unsafe {
-                let bin = (*page_ptr).bin() as usize;
-                let arena = (*page_ptr).owning_arena();
-                if !arena.is_null() {
-                    (*arena).page_abandon((*page_ptr).slice_index, bin);
-                    (*page_ptr).set_owner(MI_THREADID_ABANDONED_MAPPED);
+        if !page.is_full() && !page.is_abandoned_mapped() {
+            let bin = page.bin() as usize;
+            let arena = page.owning_arena();
+            if !arena.is_null() {
+                // SAFETY: owner; the page's slices belong to this arena.
+                unsafe {
+                    (*arena).page_abandon(page.slice_index, bin);
+                    page.set_owner(MI_THREADID_ABANDONED_MAPPED);
                 }
             }
         }
@@ -831,7 +841,7 @@ unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_lis
         //    window, `try_unown` fails — loop to re-collect and re-evaluate (the
         //    page may now be freeable, or already mapped).
         // SAFETY: owner; just collected.
-        if unsafe { (*page_ptr).try_unown() } {
+        if unsafe { page.try_unown() } {
             return;
         }
     }
@@ -849,26 +859,29 @@ unsafe fn free_try_collect_mt(page_ptr: *mut Page, mt_free: *mut crate::free_lis
 /// `page_ptr` is a live page owned by the caller, already unlinked from any bin
 /// queue, with provenance set.
 unsafe fn abandon_owned_page(subproc: &Subproc, page_ptr: *mut Page, bin: usize) {
+    // SAFETY: owner-only access to our own page; interior-mutable, so a shared
+    // borrow suffices.
+    let page = unsafe { &*page_ptr };
     // SAFETY: owner-only access to our own page.
-    unsafe { (*page_ptr).collect_free() };
-    // SAFETY: owner.
-    if unsafe { (*page_ptr).is_all_free() } {
-        // SAFETY: empty + unlinked.
+    unsafe { page.collect_free() };
+    if page.is_all_free() {
+        // SAFETY: empty + unlinked. (`page` is dead after `release_page_slices`
+        // returns the header's slice to the arena.)
         unsafe { release_page_slices(page_ptr) };
-    } else if unsafe { (*page_ptr).is_full() } {
+    } else if page.is_full() {
         // Full ⇒ abandoned but unmapped (kept out of the registry).
         // SAFETY: owner.
         unsafe {
-            (*page_ptr).set_owner(MI_THREADID_ABANDONED);
-            (*page_ptr).set_unowned();
+            page.set_owner(MI_THREADID_ABANDONED);
+            page.set_unowned();
         }
     } else {
         // Has free space ⇒ abandoned mapped: register, stamp, then release.
         // SAFETY: owner; the page's slices belong to its arena.
         unsafe {
             subproc.abandon_page(page_ptr, bin);
-            (*page_ptr).set_owner(MI_THREADID_ABANDONED_MAPPED);
-            (*page_ptr).set_unowned();
+            page.set_owner(MI_THREADID_ABANDONED_MAPPED);
+            page.set_unowned();
         }
     }
 }
@@ -882,8 +895,9 @@ impl Drop for Heap {
         for b in 0..MI_BIN_COUNT {
             let mut cur = self.pages[b].first();
             while !cur.is_null() {
-                // SAFETY: the bin queue holds valid pages owned by this heap.
-                let next = unsafe { (*cur).next.get() };
+                // SAFETY: the bin queue holds valid pages owned by this heap;
+                // interior-mutable, so a shared borrow suffices.
+                let next = unsafe { &*cur }.next.get();
                 // SAFETY: owner thread; draining our own queue, then hand off.
                 unsafe {
                     self.pages[b].remove(cur);
