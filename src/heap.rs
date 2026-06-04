@@ -266,6 +266,15 @@ impl Heap {
     /// the old per-retire `try_purge` (ports `_mi_theap_collect_retired`,
     /// page.c:471-496).
     fn collect_retired(&self, force: bool) {
+        // Owner-only: touches owner-thread `Cell` state. Today the only callers
+        // are the owner's alloc-generic path and `collect`, but guard it like
+        // `collect` so a future caller can't regress this silently.
+        #[cfg(all(feature = "std", any(debug_assertions, feature = "secure")))]
+        debug_assert_eq!(
+            self.tid,
+            crate::init::current_tid(),
+            "Heap::collect_retired called from a non-owning thread"
+        );
         let lo = self.page_retired_min.get();
         let hi = self.page_retired_max.get();
         // Recompute the touched range as we go; empty when min > max.
