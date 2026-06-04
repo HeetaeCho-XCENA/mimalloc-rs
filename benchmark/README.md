@@ -57,13 +57,25 @@ same ranges (documented in each file's header).
 ## Run
 
 ```sh
-# rs vs system, individually:
+# Portable: run the WHOLE suite anywhere (only needs cargo + this repo).
+# Builds rs + system(glibc) and prints an rs-vs-glibc table.
+bash bench-all.sh
+
+# Tune it (all optional); add a mimalloc-c column with a prebuilt .so or a checkout:
+T=8 REPS=5 SCALE=1 PIN="taskset -c 2-9" \
+  MI_SO=/path/to/libmimalloc.so bash bench-all.sh
+MI_SRC=~/repos/mimalloc bash bench-all.sh     # builds the .so via cmake
+
+# rs vs system, a single workload by hand:
 cargo build --release && ./target/release/xmalloc_test
 cargo build --release --features bench-system && ./target/release/xmalloc_test
-
-# full 3-way table (builds rs + system + the C-peak variants, medians):
-MI_SRC=~/repos/mimalloc-v3 CBENCH=/path/to/mimalloc-bench/bench REPS=5 bash run.sh
 ```
+
+`bench-all.sh` is the cross-machine runner (no external benchmarks needed —
+the mimalloc-c column comes from `LD_PRELOAD`-ing a real mimalloc `.so` over the
+*same* system binary). `run.sh` is the stricter cross-check that compares against
+the **original** mimalloc-bench C binaries (needs them built); use it on the
+reference box.
 
 ## Sample results (pinned i7-14700K, cores 2–9, interleaved median, 8T)
 
